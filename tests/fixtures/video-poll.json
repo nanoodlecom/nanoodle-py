@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "tvideo", "fields": { "model": "seedance-2.0", "prompt": "a drifting paper boat", "duration": "5", "aspect": "16:9", "resolution": "720p", "modelOpts": { "seed": 7 } } }
+  ],
+  "links": []
+}

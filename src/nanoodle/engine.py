@@ -1,0 +1,742 @@
+"""Node execution engine — server-side re-implementation of play.html RUNTIME_JS.
+
+Endpoints, payloads, polling and error mapping follow SPEC-engine.md verbatim.
+The catalog is never fetched: model ids pass through as typed, endpoint choice
+is by node TYPE only.
+"""
+
+import json
+import re
+import time
+import urllib.parse
+
+from .errors import NanoodleError
+from .graph import EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name
+from .media import (MEDIA_INLINE_MAX, TRANSCRIBE_MAX_BYTES, MediaRef,
+                    b64_image_mime, make_data_url, parse_data_url)
+from .transport import encode_multipart
+
+IMG_ENDPOINT = "/v1/images/generations"          # note: NOT /api/v1
+CHAT_ENDPOINT = "/api/v1/chat/completions"
+VIDEO_SUBMIT = "/api/generate-video"
+VIDEO_STATUS = "/api/video/status"
+AUDIO_ENDPOINT = "/api/v1/audio/speech"
+AUDIO_STATUS = "/api/tts/status"
+TRANSCRIBE_ENDPOINT = "/api/v1/audio/transcriptions"
+
+_FUNDS_RE = re.compile(r"insufficient|balance|funds|not enough|payment required", re.I)
+_AUDIO_MIME = {"mp3": "audio/mpeg", "opus": "audio/ogg", "aac": "audio/aac",
+               "flac": "audio/flac", "wav": "audio/wav", "pcm": "audio/wav"}
+_SONG_COUNT_RE = re.compile(
+    r"^(number_of_songs|n|num_songs|song_count|generation_count|generation_count_parameter)$", re.I)
+_SONG_COUNT_LOOSE_RE = re.compile(r"generation_count|num_?songs|song_?count", re.I)
+
+
+def _as_url(value):
+    """Accept str or MediaRef for a media value; return the URL string."""
+    if isinstance(value, MediaRef):
+        return value.url
+    return value
+
+
+class NodeCancelled(NanoodleError):
+    pass
+
+
+class Engine(object):
+    def __init__(self, api_key, base_url, http, poll_intervals=None, timeouts=None,
+                 on_progress=None):
+        self._api_key = api_key
+        self.base_url = (base_url or "https://nano-gpt.com").rstrip("/")
+        self.http = http
+        pi = poll_intervals or {}
+        to = timeouts or {}
+        self.poll_video = pi.get("video", 5.0)
+        self.poll_audio = pi.get("audio", 3.0)
+        self.timeout_video = to.get("video", 600.0)
+        self.timeout_audio = to.get("audio", 300.0)
+        self.http_timeout = to.get("http", 120.0)
+        self.on_progress = on_progress
+
+    # ---- transport helpers -------------------------------------------------
+
+    def _auth_headers(self):
+        # Every JSON call carries BOTH headers. The key must never be logged
+        # or echoed into error messages.
+        return {"Authorization": "Bearer " + (self._api_key or ""),
+                "x-api-key": self._api_key or ""}
+
+    def _raise_http(self, resp):
+        body = resp.text()
+        if resp.status in (401, 403):
+            raise NanoodleError("API key rejected (HTTP %d) — sign in at nano-gpt.com and use a valid key"
+                                % resp.status)
+        if resp.status == 402 or _FUNDS_RE.search(body or ""):
+            raise NanoodleError("out of balance — this run needs more credit. "
+                                "Top up at nano-gpt.com, then run again.")
+        raise NanoodleError("%d: %s" % (resp.status, (body or "")[:160]))
+
+    def _post_json(self, path, body):
+        payload = json.dumps(body)
+        if len(payload) > MEDIA_INLINE_MAX:
+            raise NanoodleError(
+                "request media is too large (~4 MB inline limit) — nanoodle sends media "
+                "inline rather than uploading it; use smaller/shorter media")
+        headers = self._auth_headers()
+        headers["Content-Type"] = "application/json"
+        resp = self.http("POST", self.base_url + path, headers=headers, body=payload,
+                         timeout=self.http_timeout)
+        if not (200 <= resp.status < 300):
+            self._raise_http(resp)
+        return resp
+
+    def _get(self, path):
+        return self.http("GET", self.base_url + path, headers=self._auth_headers(),
+                         timeout=self.http_timeout)
+
+    def fetch_media(self, url):
+        """Download bytes of an https media URL (no auth headers — provider CDNs)."""
+        resp = self.http("GET", url, headers={}, timeout=self.http_timeout)
+        if not (200 <= resp.status < 300):
+            raise NanoodleError("could not download media (%d)" % resp.status)
+        return resp.body, resp.header("content-type") or ""
+
+    def _media_ref(self, url, mime=None):
+        return MediaRef(url, mime=mime, fetcher=self.fetch_media)
+
+    # ---- cost extraction (play.html costFromJson / costFromHeaders) --------
+
+    @staticmethod
+    def _cost_from_json(j):
+        if not isinstance(j, dict):
+            return None, None
+        usd = None
+        p = j.get("x_nanogpt_pricing") or None
+        p_usd = None
+        if isinstance(p, dict):
+            for k in ("costUsd", "cost", "amount"):
+                if p.get(k) is not None:
+                    p_usd = p[k]
+                    break
+        m_usd = (j.get("metadata") or {}).get("cost") if isinstance(j.get("metadata"), dict) else None
+        jc = j.get("cost")
+        if isinstance(jc, (int, float)) and not isinstance(jc, bool) and jc > 0:
+            usd = float(jc)
+        elif p_usd is not None and _is_num(p_usd):
+            usd = float(p_usd)
+        elif m_usd is not None and _is_num(m_usd):
+            usd = float(m_usd)
+        elif isinstance(jc, (int, float)) and not isinstance(jc, bool):
+            usd = float(jc)  # present-but-zero = known-free, keep 0
+        balance = None
+        if isinstance(j.get("remainingBalance"), (int, float)) and not isinstance(j.get("remainingBalance"), bool):
+            balance = float(j["remainingBalance"])
+        elif isinstance(p, dict) and isinstance(p.get("remainingBalance"), (int, float)):
+            balance = float(p["remainingBalance"])
+        return usd, balance
+
+    @staticmethod
+    def _cost_from_headers(resp):
+        def num(name):
+            v = resp.header(name)
+            try:
+                return float(v) if v not in (None, "") else None
+            except ValueError:
+                return None
+        return (num("x-cost") if num("x-cost") is not None else num("x-nano-cost"),
+                num("x-remaining-balance"))
+
+    def _cost_with_headers(self, j, resp):
+        usd, balance = self._cost_from_json(j)
+        h_usd, h_balance = self._cost_from_headers(resp)
+        if h_balance is not None:
+            balance = h_balance  # header wins
+        if usd is None and h_usd is not None:
+            usd = h_usd
+        return usd, balance
+
+    # ---- progress ----------------------------------------------------------
+
+    def _progress(self, evt):
+        if self.on_progress:
+            try:
+                self.on_progress(evt)
+            except Exception:
+                pass  # a broken progress callback must never kill the run
+
+    # ---- node dispatch -----------------------------------------------------
+
+    def run_node(self, node, inp, on_cost):
+        """Execute one node. ``inp`` = declared/dynamic port values; field
+        overrides are already merged into node.fields by the workflow layer.
+        Returns the node's out dict (primary output under its port name)."""
+        fn = _EXECUTORS.get(node.type)
+        if fn is None:
+            raise NanoodleError("node type %r cannot be executed" % node.type)
+        return fn(self, node, inp, on_cost)
+
+
+def _is_num(v):
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _mdl(node):
+    m = node.fields.get("model")
+    if not m:
+        raise NanoodleError("pick a model first")
+    return m
+
+
+def _fstr(node, field, default=""):
+    v = node.fields.get(field)
+    return default if v is None else str(v)
+
+
+def _prompt_of(node, required=True, err="no prompt"):
+    p = _fstr(node, "prompt").strip()
+    if required and not p:
+        raise NanoodleError(err)
+    return p
+
+
+def _collect_ports(inp, rx):
+    def idx(name):
+        m = re.search(r"(\d+)$", name)
+        return int(m.group(1)) if m else 1
+    keys = sorted((k for k in inp if rx.match(k)), key=idx)
+    return [_as_url(inp[k]) for k in keys if inp[k]]
+
+
+def _audio_input_part(url):
+    """Wired audio data: URL -> OpenAI-style input_audio part (play.html audioInputPart)."""
+    url = _as_url(url)
+    if not url:
+        return None
+    if len(url) > MEDIA_INLINE_MAX:
+        raise NanoodleError("audio clip is too large to inline (~4 MB send limit) — use a shorter clip")
+    comma = url.find(",")
+    head = url[:comma] if comma >= 0 else ""
+    data = url[comma + 1:] if comma >= 0 else url
+    m = re.match(r"data:([^;]+)", head)
+    fmt = ((m.group(1).split("/")[1] if m else "") or "wav").lower()
+    if fmt in ("mpeg", "mp3"):
+        fmt = "mp3"
+    elif fmt in ("x-wav", "wave"):
+        fmt = "wav"
+    return {"type": "input_audio", "input_audio": {"data": data, "format": fmt}}
+
+
+# ---- chat family -----------------------------------------------------------
+
+def _chat_body(node, messages):
+    f = node.fields
+    body = {"model": _mdl(node), "messages": messages}
+    t = f.get("temperature")
+    body["temperature"] = float(t) if (t is not None and str(t) != "") else 0.8
+    return body
+
+
+def _build_user_message(prompt, imgs, audio_part=None):
+    parts_needed = bool(imgs) or audio_part is not None
+    if not parts_needed:
+        return {"role": "user", "content": prompt}
+    content = [{"type": "text", "text": prompt}]
+    content += [{"type": "image_url", "image_url": {"url": u}} for u in imgs]
+    if audio_part is not None:
+        content.append(audio_part)
+    return {"role": "user", "content": content}
+
+
+def _parse_chat_text(j, show_thinking=False):
+    msg = ((j.get("choices") or [{}])[0] or {}).get("message") or {}
+    txt = msg.get("content")
+    if txt is None:
+        raise NanoodleError("no text in response")
+    if isinstance(txt, list):
+        txt = "".join(p.get("text") or "" for p in txt)
+    if show_thinking and msg.get("reasoning"):
+        txt = "```thinking\n%s\n```\n\n%s" % (msg["reasoning"], txt)
+    return txt
+
+
+def _run_llm(engine, node, inp, on_cost):
+    f = node.fields
+    prompt = _prompt_of(node)
+    imgs = _collect_ports(inp, IMG_PORT_RE)
+    audio_part = _audio_input_part(inp["audio"]) if inp.get("audio") else None
+    messages = []
+    if _fstr(node, "system").strip():
+        messages.append({"role": "system", "content": _fstr(node, "system").strip()})
+    messages.append(_build_user_message(prompt, imgs, audio_part))
+    body = _chat_body(node, messages)
+    if f.get("maxTokens"):
+        body["max_tokens"] = int(float(f["maxTokens"]))
+    if f.get("format") == "JSON":
+        body["response_format"] = {"type": "json_object"}
+    if f.get("reasoningEffort") and f["reasoningEffort"] != "default":
+        body["reasoning_effort"] = f["reasoningEffort"]
+    resp = engine._post_json(CHAT_ENDPOINT, body)
+    j = json.loads(resp.text())
+    on_cost(*engine._cost_with_headers(j, resp))
+    show = f.get("showThinking") in (True, "true")
+    return {"text": _parse_chat_text(j, show_thinking=show)}
+
+
+def _run_vision(engine, node, inp, on_cost):
+    if not inp.get("image"):
+        raise NanoodleError("no image input")
+    q = (_fstr(node, "q") or "Describe this image.").strip() or "Describe this image."
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": q},
+        {"type": "image_url", "image_url": {"url": _as_url(inp["image"])}},
+    ]}]
+    resp = engine._post_json(CHAT_ENDPOINT, _chat_body(node, messages))
+    j = json.loads(resp.text())
+    on_cost(*engine._cost_with_headers(j, resp))
+    return {"text": _parse_chat_text(j)}
+
+
+def _run_draw(engine, node, inp, on_cost):
+    prompt = _prompt_of(node)
+    imgs = _collect_ports(inp, IMG_PORT_RE)
+    if sum(len(u) for u in imgs) > MEDIA_INLINE_MAX:
+        raise NanoodleError("reference images too large (~4 MB combined limit) — use fewer or smaller images")
+    messages = []
+    if _fstr(node, "system").strip():
+        messages.append({"role": "system", "content": _fstr(node, "system").strip()})
+    messages.append(_build_user_message(prompt, imgs))
+    resp = engine._post_json(CHAT_ENDPOINT, _chat_body(node, messages))
+    j = json.loads(resp.text())
+    msg = ((j.get("choices") or [{}])[0] or {}).get("message") or {}
+    images = []
+    for im in (msg.get("images") or []):
+        if isinstance(im, dict):
+            u = (im.get("image_url") or {}).get("url") or im.get("url")
+        else:
+            u = im if isinstance(im, str) else None
+        if u:
+            images.append(u)
+    content = msg.get("content")
+    if isinstance(content, list):
+        text = "".join(p.get("text") or "" for p in content)
+    else:
+        text = content or ""
+    if not images:
+        raise NanoodleError(
+            "this model replied with text, not an image — pick an image-output model"
+            if text else "no image in response")
+    on_cost(*engine._cost_with_headers(j, resp))
+    show = node.fields.get("showThinking") not in (False, "false")
+    if show and msg.get("reasoning"):
+        text = "```thinking\n%s\n```\n\n%s" % (msg["reasoning"], text)
+    refs = [engine._media_ref(u) for u in images]
+    return {"image": refs[0], "images": refs, "text": text}
+
+
+# ---- image family (/v1/images/generations) ---------------------------------
+
+def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_data_url=None):
+    f = node.fields
+    body = {"model": _mdl(node), "size": f.get("size") or "1024x1024",
+            "n": n, "response_format": "b64_json"}
+    if prompt:
+        body["prompt"] = prompt  # omit when blank — upscalers run with no instruction
+    if image_data_url:
+        body["imageDataUrl"] = image_data_url
+    if mask_data_url:
+        body["maskDataUrl"] = mask_data_url
+    seed = f.get("seed")
+    if seed is not None and str(seed).strip() != "" and _is_num(seed):
+        body["seed"] = float(seed) if "." in str(seed) else int(float(seed))
+    if f.get("model") == "custom-civitai" and f.get("customCivitaiAir"):
+        body["customCivitaiAir"] = f["customCivitaiAir"]
+    resp = engine._post_json(IMG_ENDPOINT, body)
+    j = json.loads(resp.text())
+    urls = []
+    for d in (j.get("data") or []):
+        if d.get("b64_json"):
+            urls.append("data:%s;base64,%s" % (b64_image_mime(d["b64_json"]), d["b64_json"]))
+        elif d.get("url"):
+            urls.append(d["url"])
+    if not urls:
+        raise NanoodleError("no image in response")
+    on_cost(*engine._cost_with_headers(j, resp))
+    return [engine._media_ref(u) for u in urls]
+
+
+def _run_image(engine, node, inp, on_cost):
+    prompt = _prompt_of(node)
+    try:
+        want = max(1, int(float(node.fields.get("variations") or 1)))
+    except (TypeError, ValueError):
+        want = 1
+    urls = _gen_image(engine, node, on_cost, prompt, n=want)
+    return {"image": urls[0], "images": urls}
+
+
+def _run_edit(engine, node, inp, on_cost):
+    imgs = _collect_ports(inp, EDIT_IMG_RE)
+    if not imgs:
+        raise NanoodleError("no image input")
+    prompt = _fstr(node, "prompt").strip()
+    if not prompt and not re.search(r"upscal", node.fields.get("model") or "", re.I):
+        raise NanoodleError("no edit instruction")
+    if sum(len(u) for u in imgs) > MEDIA_INLINE_MAX:
+        raise NanoodleError("reference images too large (~4 MB combined limit) — use fewer or smaller images")
+    src = imgs if len(imgs) > 1 else imgs[0]
+    urls = _gen_image(engine, node, on_cost, prompt, image_data_url=src)
+    return {"image": urls[0]}
+
+
+def _run_inpaint(engine, node, inp, on_cost):
+    source = _as_url(inp.get("image")) or node.fields.get("image")
+    mask = _as_url(inp.get("mask")) or node.fields.get("mask")
+    if not source:
+        raise NanoodleError("no image — upload one, then brush the area to repaint")
+    if not mask:
+        raise NanoodleError("no mask — brush the area to repaint (white)")
+    prompt = _prompt_of(node, err="no prompt — say what to paint into the brushed area")
+    # v1 caveat: the browser composites the mask onto black at source size; this
+    # library passes the mask through verbatim (white = repaint).
+    urls = _gen_image(engine, node, on_cost, prompt, image_data_url=source, mask_data_url=mask)
+    return {"image": urls[0]}
+
+
+# ---- video family (submit + poll) ------------------------------------------
+
+def _video_dims(node):
+    out = {}
+    f = node.fields
+    if f.get("resolution"):
+        out["resolution"] = f["resolution"]
+    if f.get("aspect"):
+        out["aspect_ratio"] = f["aspect"]
+    if f.get("duration"):
+        out["duration"] = f["duration"]
+    return out
+
+
+def _gen_video(engine, node, on_cost, prompt, extra_body):
+    body = {"model": _mdl(node), "prompt": prompt}
+    dims = _video_dims(node)
+    body.update(dims)
+    body.update(extra_body.pop("_sources", {}))
+    model_opts = node.fields.get("modelOpts") or {}
+    if isinstance(model_opts, dict):
+        body.update(model_opts)
+    body.update(dims)  # node-owned dims win over stale modelOpts keys
+    body.update(extra_body)  # wired refs LAST — a wired port always wins the key
+    resp = engine._post_json(VIDEO_SUBMIT, body)
+    j = json.loads(resp.text())
+    on_cost(*engine._cost_with_headers(j, resp))
+    run_id = j.get("runId") or j.get("id")
+    if not run_id:
+        raise NanoodleError("no runId returned")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < engine.timeout_video:
+        time.sleep(engine.poll_video)
+        resp = engine._get(VIDEO_STATUS + "?requestId=" + urllib.parse.quote(str(run_id)))
+        try:
+            s = json.loads(resp.text())
+        except ValueError:
+            continue  # poll failures: silently continue until timeout
+        if not (200 <= resp.status < 300):
+            continue
+        data = s.get("data") if isinstance(s.get("data"), dict) else None
+        st = str((data or {}).get("status") or s.get("status") or "").upper()
+        engine._progress({"type": "poll", "node_id": node.id, "name": display_name(node),
+                          "status": st, "elapsed": time.monotonic() - t0})
+        if st in ("COMPLETED", "SUCCEEDED"):
+            out = (data or {}).get("output") or s.get("output") or {}
+            url = None
+            video = out.get("video")
+            if isinstance(video, dict):
+                url = video.get("url")
+            if not url:
+                url = out.get("url")
+            if not url and isinstance(video, list) and video:
+                url = (video[0] or {}).get("url")
+            if not url:
+                raise NanoodleError("completed but no video url")
+            return engine._media_ref(url)
+        if st in ("FAILED", "ERROR", "CANCELED"):
+            raise NanoodleError("video failed: " + str((data or {}).get("error") or st))
+    raise NanoodleError("video timed out (%d s) — the job may still be running on NanoGPT's side"
+                        % int(engine.timeout_video))
+
+
+def _run_tvideo(engine, node, inp, on_cost):
+    prompt = _prompt_of(node)
+    extra = {}
+    refs = _collect_ports(inp, REF_PORT_RE)
+    if refs:
+        extra["reference_images"] = refs
+    return {"video": _gen_video(engine, node, on_cost, prompt, extra)}
+
+
+def _run_ivideo(engine, node, inp, on_cost):
+    if not inp.get("image"):
+        raise NanoodleError("no image input")
+    prompt = _fstr(node, "prompt").strip()
+    extra = {"_sources": {"imageDataUrl": _as_url(inp["image"])}}
+    if inp.get("endframe"):
+        extra["_sources"]["last_image"] = _as_url(inp["endframe"])
+    return {"video": _gen_video(engine, node, on_cost, prompt, extra)}
+
+
+def _run_vedit(engine, node, inp, on_cost):
+    if not inp.get("video"):
+        raise NanoodleError("no video input")
+    prompt = _fstr(node, "prompt").strip()
+    src = _as_url(inp["video"])
+    sources = {"videoUrl": src} if re.match(r"^https?:", src) else {"videoDataUrl": src}
+    return {"video": _gen_video(engine, node, on_cost, prompt, {"_sources": sources})}
+
+
+def _run_lipsync(engine, node, inp, on_cost):
+    if not inp.get("image"):
+        raise NanoodleError("no image input")
+    if not inp.get("audio"):
+        raise NanoodleError("no audio input")
+    prompt = _fstr(node, "prompt").strip()
+    aud = _as_url(inp["audio"])
+    sources = {"imageDataUrl": _as_url(inp["image"])}
+    sources.update({"audioUrl": aud} if re.match(r"^https?:", aud) else {"audioDataUrl": aud})
+    return {"video": _gen_video(engine, node, on_cost, prompt, {"_sources": sources})}
+
+
+# ---- audio family (music / tts / remix) -------------------------------------
+
+# (field, type, default) — sent only when non-empty and != default (play.html AUDIO_PARAMS)
+_AUDIO_PARAMS = {
+    "music": [("lyrics", "text", None), ("instrumental", "boolean", None),
+              ("duration", "number", None), ("negative_prompt", "text", None),
+              ("seed", "number", None), ("response_format", "text", "mp3")],
+    "tts": [("voice", "text", None), ("speed", "number", 1),
+            ("instructions", "text", None), ("response_format", "text", "mp3")],
+    "remix": [("lyrics", "text", None), ("duration", "number", None),
+              ("response_format", "text", "mp3")],
+}
+
+
+def _collect_audio_params(node):
+    body = {}
+    for (fid, ftype, default) in _AUDIO_PARAMS.get(node.type, []):
+        v = node.fields.get(fid)
+        if ftype == "boolean":
+            if v in (True, "true"):
+                body[fid] = True
+            continue
+        if v is None or v == "":
+            continue
+        if ftype == "number":
+            if not _is_num(v):
+                continue
+            num = float(v)
+            num = int(num) if num == int(num) else num
+            if default is not None and num == default:
+                continue
+            body[fid] = num
+            continue
+        if default is not None and v == default:
+            continue
+        body[fid] = v
+    extra = str(node.fields.get("extraJson") or "").strip()
+    if extra:
+        try:
+            body.update(json.loads(extra))
+        except ValueError:
+            raise NanoodleError("advanced params: invalid JSON")
+    if node.type in ("music", "remix"):
+        # surface-one-track contract: drop every song-count key (omit = one track)
+        for k in list(body.keys()):
+            if _SONG_COUNT_RE.match(k) or _SONG_COUNT_LOOSE_RE.search(k):
+                del body[k]
+    return body
+
+
+def _poll_audio(engine, node, model, submit_json):
+    run_id = submit_json.get("runId") or submit_json.get("id")
+    qs = {"runId": str(run_id), "model": model}
+    if submit_json.get("cost") is not None:
+        qs["cost"] = str(submit_json["cost"])
+    if submit_json.get("paymentSource"):
+        qs["paymentSource"] = str(submit_json["paymentSource"])
+    if submit_json.get("isApiRequest") is not None:
+        v = submit_json["isApiRequest"]
+        qs["isApiRequest"] = "true" if v is True else ("false" if v is False else str(v))
+    query = urllib.parse.urlencode(qs)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < engine.timeout_audio:
+        time.sleep(engine.poll_audio)
+        resp = engine._get(AUDIO_STATUS + "?" + query)
+        try:
+            s = json.loads(resp.text())
+        except ValueError:
+            continue
+        st = str(s.get("status") or "").lower()
+        engine._progress({"type": "poll", "node_id": node.id, "name": display_name(node),
+                          "status": st, "queue": s.get("queuePosition"),
+                          "elapsed": time.monotonic() - t0})
+        if st in ("completed", "succeeded"):
+            data = s.get("data") if isinstance(s.get("data"), dict) else {}
+            url = s.get("audioUrl") or s.get("url") or data.get("audioUrl") or data.get("url")
+            if not url:
+                raise NanoodleError("completed but no audio url")
+            return url
+        if st in ("error", "failed", "content_policy_violation"):
+            raise NanoodleError("audio failed: " + str(s.get("error") or s.get("message") or st))
+    raise NanoodleError("audio timed out (%d s)" % int(engine.timeout_audio))
+
+
+def _gen_audio(engine, node, on_cost, text, extra):
+    body = dict({"model": _mdl(node), "input": text})
+    body.update(extra)
+    resp = engine._post_json(AUDIO_ENDPOINT, body)
+    ctype = (resp.header("content-type") or "").lower()
+    if "application/json" in ctype:
+        j = json.loads(resp.text())
+        on_cost(*engine._cost_with_headers(j, resp))
+        data = j.get("data") if isinstance(j.get("data"), dict) else {}
+        url = j.get("url") or j.get("audioUrl") or data.get("url") or data.get("audioUrl")
+        if not url and (j.get("runId") or j.get("id")):
+            url = _poll_audio(engine, node, body["model"], j)
+        if not url:
+            raise NanoodleError("no audio url in response")
+        return engine._media_ref(url)
+    # binary body: the audio bytes; pin the mime from the requested format when
+    # the response type is missing or generic
+    on_cost(*engine._cost_from_headers(resp))
+    mime = ctype.split(";")[0].strip()
+    if not mime or mime in ("application/octet-stream", "binary/octet-stream"):
+        fmt = str(extra.get("response_format") or "mp3")
+        mime = _AUDIO_MIME.get(fmt, "audio/mpeg")
+    return MediaRef(make_data_url(resp.body, mime), mime=mime, fetcher=engine.fetch_media)
+
+
+def _run_music(engine, node, inp, on_cost):
+    text = _fstr(node, "prompt").strip()
+    if not text:
+        raise NanoodleError("no text")
+    return {"audio": _gen_audio(engine, node, on_cost, text, _collect_audio_params(node))}
+
+
+def _run_tts(engine, node, inp, on_cost):
+    text = _fstr(node, "prompt").strip()
+    if not text:
+        raise NanoodleError("no text")
+    return {"audio": _gen_audio(engine, node, on_cost, text, _collect_audio_params(node))}
+
+
+def _run_remix(engine, node, inp, on_cost):
+    if not inp.get("audio"):
+        raise NanoodleError("no audio — wire a source track into the audio port")
+    text = _fstr(node, "prompt").strip()
+    if not text:
+        raise NanoodleError("no prompt — describe the cover / extension first")
+    extra = _collect_audio_params(node)
+    src = _as_url(inp["audio"])
+    if not re.match(r"^https?:", src) and len(src) > MEDIA_INLINE_MAX:
+        raise NanoodleError("source audio is too large to inline (~4 MB send limit) — use a shorter clip")
+    extra["audio"] = src
+    return {"audio": _gen_audio(engine, node, on_cost, text, extra)}
+
+
+# ---- transcribe --------------------------------------------------------------
+
+def _run_transcribe(engine, node, inp, on_cost):
+    if not inp.get("audio"):
+        raise NanoodleError("no audio input")
+    src = _as_url(inp["audio"])
+    if src.startswith("data:"):
+        mime, data = parse_data_url(src)
+    else:
+        data, ctype = engine.fetch_media(src)
+        mime = (ctype or "audio/mpeg").split(";")[0].strip() or "audio/mpeg"
+    if len(data) > TRANSCRIBE_MAX_BYTES:
+        raise NanoodleError("this clip is too big to transcribe directly (~3 MB max) — use a shorter clip")
+    ext = (mime.split("/")[1] if "/" in mime else "mp3").split(";")[0] or "mp3"
+    fields = {"model": _mdl(node)}
+    language = (_fstr(node, "language") or "auto").strip()
+    if language:
+        fields["language"] = language
+    ctype, body = encode_multipart(fields, "file", "audio." + ext, data, mime)
+    headers = engine._auth_headers()
+    headers["Content-Type"] = ctype  # boundary set by our encoder; no other Content-Type
+    resp = engine.http("POST", engine.base_url + TRANSCRIBE_ENDPOINT, headers=headers,
+                       body=body, timeout=engine.http_timeout)
+    if not (200 <= resp.status < 300):
+        engine._raise_http(resp)
+    j = json.loads(resp.text())
+    on_cost(*engine._cost_with_headers(j, resp))
+    data_obj = j.get("data") if isinstance(j.get("data"), dict) else {}
+    txt = j.get("transcription")
+    if txt is None:
+        txt = j.get("text")
+    if txt is None:
+        txt = data_obj.get("transcription")
+    if txt is None:
+        txt = data_obj.get("text")
+    if txt is None:
+        raise NanoodleError("no transcription in response")
+    return {"text": txt}
+
+
+# ---- local nodes --------------------------------------------------------------
+
+def _run_text(engine, node, inp, on_cost):
+    return {"text": _fstr(node, "text")}
+
+
+def _run_upload(field):
+    def run(engine, node, inp, on_cost):
+        v = node.fields.get(field)
+        if not v:
+            raise NanoodleError("no %s provided — supply it as a run input" % field)
+        url = _as_url(v)
+        return {field: engine._media_ref(url) if not isinstance(v, MediaRef) else v}
+    return run
+
+
+def _run_choice(engine, node, inp, on_cost):
+    opts = [s.strip() for s in _fstr(node, "options").split("\n") if s.strip()]
+    if not opts:
+        raise NanoodleError("no options — this Choice has no options to pick from")
+    sel = node.fields.get("selected")
+    return {"text": sel if sel in opts else opts[0]}
+
+
+def _run_join(engine, node, inp, on_cost):
+    sep = node.fields.get("sep")
+    sep = " " if sep is None else str(sep)
+    sep = sep.replace("\\n", "\n")
+    parts = [v for v in (inp.get("a"), inp.get("b")) if v is not None and v != ""]
+    return {"text": sep.join(str(v) for v in parts)}
+
+
+_EXECUTORS = {
+    "text": _run_text,
+    "upload": _run_upload("image"),
+    "aupload": _run_upload("audio"),
+    "vupload": _run_upload("video"),
+    "choice": _run_choice,
+    "join": _run_join,
+    "llm": _run_llm,
+    "vision": _run_vision,
+    "image": _run_image,
+    "edit": _run_edit,
+    "inpaint": _run_inpaint,
+    "draw": _run_draw,
+    "tvideo": _run_tvideo,
+    "ivideo": _run_ivideo,
+    "vedit": _run_vedit,
+    "lipsync": _run_lipsync,
+    "music": _run_music,
+    "tts": _run_tts,
+    "remix": _run_remix,
+    "transcribe": _run_transcribe,
+}

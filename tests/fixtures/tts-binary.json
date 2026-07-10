@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "tts", "fields": { "model": "kokoro-v1", "prompt": "hello world", "voice": "af_bella", "speed": "1" } }
+  ],
+  "links": []
+}

@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "text", "fields": { "text": "hello" } },
+    { "id": "n2", "type": "choice", "fields": { "options": "red\nblue\ngreen", "selected": "blue" } },
+    { "id": "n3", "type": "join", "fields": { "sep": " - " } }
+  ],
+  "links": [
+    { "id": "l1", "from": { "node": "n1", "port": "text" }, "to": { "node": "n3", "port": "a" } },
+    { "id": "l2", "from": { "node": "n2", "port": "text" }, "to": { "node": "n3", "port": "b" } }
+  ]
+}

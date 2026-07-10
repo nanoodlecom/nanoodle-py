@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "aupload", "fields": { "audio": "data:audio/wav;base64,UklGRgAAAABXQVZF" } },
+    { "id": "n2", "type": "transcribe", "fields": { "model": "whisper-1", "language": "auto" } }
+  ],
+  "links": [
+    { "id": "l1", "from": { "node": "n1", "port": "audio" }, "to": { "node": "n2", "port": "audio" } }
+  ]
+}

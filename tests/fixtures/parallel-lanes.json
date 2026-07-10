@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "text", "fields": { "text": "seed" } },
+    { "id": "n2", "type": "llm", "fields": { "model": "m1" }, "name": "Lane A" },
+    { "id": "n3", "type": "llm", "fields": { "model": "m2" }, "name": "Lane B" }
+  ],
+  "links": [
+    { "id": "l1", "from": { "node": "n1", "port": "text" }, "to": { "node": "n2", "port": "prompt" } },
+    { "id": "l2", "from": { "node": "n1", "port": "text" }, "to": { "node": "n3", "port": "prompt" } }
+  ]
+}

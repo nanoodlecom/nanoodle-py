@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "music", "fields": { "model": "suno-v5", "prompt": "lofi beats", "lyrics": "", "instrumental": "true", "duration": "30" } }
+  ],
+  "links": []
+}

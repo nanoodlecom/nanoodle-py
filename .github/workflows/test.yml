@@ -1,0 +1,19 @@
+# Offline unit tests only — every test runs against the local mock NanoGPT
+# harness. NEVER add live API calls (or secrets) to CI.
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run offline unit tests
+        run: python -m unittest discover -s tests -t . -v
