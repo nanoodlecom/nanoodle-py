@@ -49,6 +49,35 @@ def chat_response(text, cost_usd=None, balance=None, images=None, reasoning=None
     return {"status": 200, "json": j}
 
 
+def binary_response(body, mime="audio/mpeg", cost=None, balance=None, status=200):
+    """Raw-bytes response (the binary-audio branch) with optional x-cost headers."""
+    headers = {"Content-Type": mime}
+    if cost is not None:
+        headers["x-cost"] = str(cost)
+    if balance is not None:
+        headers["x-remaining-balance"] = str(balance)
+    return {"status": status, "body": body, "headers": headers}
+
+
+def video_status(status, url=None, error=None, nested=True, video_list=False):
+    """A /api/video/status poll body. nested=True wraps in {"data": {...}}."""
+    inner = {"status": status}
+    if url is not None:
+        if video_list:
+            inner["output"] = {"video": [{"url": url}]}
+        elif nested:
+            inner["output"] = {"video": {"url": url}}
+        else:
+            inner["output"] = {"url": url}
+    if error is not None:
+        inner["error"] = error
+    return {"status": 200, "json": ({"data": inner} if nested else inner)}
+
+
+def error_response(status, body=b"", headers=None):
+    return {"status": status, "body": body, "headers": headers or {}}
+
+
 def image_response(b64_list=None, urls=None, cost=None, balance=None):
     data = []
     for b in (b64_list or []):
