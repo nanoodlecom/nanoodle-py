@@ -1,10 +1,10 @@
 # Turn a nanoodle workflow into a coding-agent skill
 
 A [nanoodle](https://nanoodle.io) workflow you built visually can become a *skill*: a small
-folder with a markdown playbook that tells a coding agent (Claude Code, or any agent that can
-read markdown and run a shell command) exactly how to execute your workflow. The agent supplies
-the inputs, this package does the API calls, and the outputs land in a directory the agent can
-hand back to the user.
+folder with a markdown playbook that tells a coding agent (Claude Code, Cursor, Grok, or any
+agent that can read markdown and run a shell command) exactly how to execute your workflow.
+The agent supplies the inputs, this package does the API calls, and the outputs land in a
+directory the agent can hand back to the user.
 
 No skill-building experience needed — the whole recipe is five steps.
 
@@ -21,7 +21,9 @@ In the editor, give a custom name to every node an agent will touch:
 - A named **input** node (e.g. a text node named `Idea`) makes the run call read as
   `--input "Idea=..."`.
 - A named **output** node (e.g. an image node named `Poster`) makes the result key `Poster`,
-  and `--out` saves it as `Poster.png`.
+  and `--out` saves it as `Poster.<ext>` where `<ext>` is chosen from the media MIME type
+  (e.g. `jpg`, `png`). Document that agents should use the path the CLI prints, not a
+  hard-coded extension.
 
 Unnamed nodes still work, but the derived keys are generic (`Text`, `Image`, `Image 2`…),
 which makes the skill instructions ambiguous. Name them.
@@ -37,9 +39,34 @@ my-skill/
     └── my-workflow.noodle-graph.json # your saved file
 ```
 
-For Claude Code, place the directory at `.claude/skills/<name>/` (project-level) or
-`~/.claude/skills/<name>/` (user-level). Other agents only need the folder somewhere they can
-read `SKILL.md` and run commands.
+### Install for agents
+
+**Manual (Claude Code and most agents):** place the directory at
+`.claude/skills/<name>/` (project-level) or `~/.claude/skills/<name>/` (user-level). Other
+agents only need the folder somewhere they can read `SKILL.md` and run commands
+(`.agents/skills/`, `~/.grok/skills/`, etc.).
+
+**Via the open skills CLI** (multi-agent install into `~/.agents/skills/` and vendor
+symlinks):
+
+```sh
+npx skills add 255BITS/nanoodle-py@poster-generator -g -y
+```
+
+Replace `poster-generator` with your skill's frontmatter `name` when publishing your own
+repo. The CLI discovers skills nested under `examples/` (or anywhere a `SKILL.md` lives).
+
+### Python vs JavaScript skills
+
+This repo's example skill is named `poster-generator`. The sibling
+[nanoodle-js](https://github.com/255BITS/nanoodle-js) package ships a skill with the **same
+name** (same workflow, Node CLI). Installing both into the same agent skill root
+**overwrites** — pick one runtime:
+
+| Runtime | Install skill | Run command |
+|---------|---------------|-------------|
+| Python (this package) | `npx skills add 255BITS/nanoodle-py@poster-generator -g -y` | `python -m nanoodle run …` |
+| Node | `npx skills add 255BITS/nanoodle-js@poster-generator -g -y` | `npx nanoodle run …` |
 
 ## 4. Inspect the workflow to see its real interface
 
@@ -55,7 +82,8 @@ python -m nanoodle inspect workflows/my-workflow.noodle-graph.json
 
 Check that the input keys and output keys are the names you gave your nodes. If not, go back
 to the editor, rename, re-save, replace the file. What `inspect` prints is exactly what your
-SKILL.md should document.
+SKILL.md should document — including optional inputs (e.g. an LLM `System prompt` field) and
+`--set`table settings.
 
 ## 5. Write SKILL.md
 
@@ -65,12 +93,15 @@ The file has two parts:
   *when an agent should use it*. Agents pick skills by description; "use when the user asks
   for X" is the load-bearing half.
 - **Body** — everything the agent needs to run it without guessing:
-  1. How to get the API key: `NANOGPT_API_KEY` from the environment, or a `.env` file passed
-     with `--env-file` (precedence: `--api-key` > environment > `--env-file`). Porting note:
-     the JS CLI (`nanoodle`) differs — there `--env-file` wins over an ambient environment
-     variable.
-  2. The exact run command, with one `--input` per input key.
-  3. Where outputs land (`--out <dir>`) and what each output is.
+  1. How to get the API key: prefer ambient `NANOGPT_API_KEY`; use `--env-file` only when
+     needed. Precedence for this CLI: `--api-key` > environment > `--env-file`. Porting
+     note: the JS CLI (`nanoodle`) differs — there `--env-file` wins over an ambient
+     environment variable.
+  2. The exact run command, with one `--input` per input key. Paths relative to the skill
+     directory (or absolute).
+  3. Where outputs land (`--out <dir>`): key + MIME-derived extension. Tell the agent to
+     use the path printed on the `<OutputKey>:` line (or `--json`), not a hard-coded
+     `.png`.
   4. An honest per-run cost note — runs spend real NanoGPT credit, so the agent (and its
      user) should know roughly how much.
 
@@ -91,11 +122,8 @@ API. Requires Python >= 3.9 and the `nanoodle` PyPI package (stdlib-only, `pip i
 
 ## API key
 
-The run needs a NanoGPT API key. Use whichever is available:
-
-- `NANOGPT_API_KEY` already set in the environment — just run the command.
-- A `.env` file (e.g. this skill's directory or the project root) containing
-  `NANOGPT_API_KEY=...` — add `--env-file <path-to-.env>` to the command.
+The run needs a NanoGPT API key. Prefer `NANOGPT_API_KEY` already in the environment.
+Otherwise pass `--env-file <path-to-.env>` (this CLI: ambient env wins over `--env-file`).
 
 Never print the key.
 
@@ -103,15 +131,18 @@ Never print the key.
 
 python -m nanoodle run <path-to-this-skill>/workflows/<file>.noodle-graph.json \
   --input "<InputKey>=<what to put here>" \
-  --env-file <path-to-.env> \
   --out <output-dir>
+
+Add `--env-file …` only if the key is not in the environment. Add `--json` for a structured
+result (paths, costUsd, remainingBalance).
 
 Inspect the interface anytime with:
 python -m nanoodle inspect <path-to-this-skill>/workflows/<file>.noodle-graph.json
 
 ## Outputs
 
-- `<output-dir>/<OutputKey>.<ext>` — <what this artifact is>.
+- Media: `<output-dir>/<OutputKey>.<ext>` — extension follows MIME (jpg/png/…). Use the path
+  printed on the `<OutputKey>:` line; do not hard-code `.png`.
 - Text outputs are printed to stdout.
 
 ## Cost
@@ -125,7 +156,15 @@ See [`examples/agent-skill/poster-generator/`](../examples/agent-skill/poster-ge
 complete skill (SKILL.md + workflow) that turns a one-line idea into a poster image. Its
 workflow is the nanoodle starter graph with the text node named `Idea` and the image node
 named `Poster`, so the command reads `--input "Idea=..."` and the result saves as
-`Poster.png`.
+`Poster.<ext>` (path printed by the CLI).
+
+Install that example for coding agents:
+
+```sh
+npx skills add 255BITS/nanoodle-py@poster-generator -g -y
+# package must also be installed for the CLI:
+pip install nanoodle
+```
 
 Skills built this way work for Claude Code out of the box
 (`.claude/skills/<name>/SKILL.md`) and for any other agent that can read a markdown playbook

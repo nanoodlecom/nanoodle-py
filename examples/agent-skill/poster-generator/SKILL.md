@@ -14,24 +14,32 @@ PyPI package (stdlib-only, `pip install nanoodle`).
 
 The run needs a NanoGPT API key. Use whichever is available:
 
-- `NANOGPT_API_KEY` already set in the environment — just run the command.
-- A `.env` file (e.g. this skill's directory or the project root) containing
-  `NANOGPT_API_KEY=...` — add `--env-file <path-to-.env>` to the command.
+- `NANOGPT_API_KEY` already set in the environment — prefer this; no extra flags.
+- A `.env` file containing `NANOGPT_API_KEY=...` — pass `--env-file <path>` only when the
+  key is not already in the environment. (With this CLI, ambient environment variables win
+  over `--env-file`.)
 
 Never print the key.
 
 ## Run
 
+From this skill's directory (or prefix paths if running from elsewhere):
+
 ```sh
 python -m nanoodle run workflows/poster.noodle-graph.json \
   --input "Idea=<the user's poster idea, e.g. a cozy ramen shop on a rainy night>" \
-  --env-file .env \
   --out ./poster-out
 ```
 
-(With the package installed, the `nanoodle-py` console script is equivalent:
-`nanoodle-py run …`. Paths are relative to this skill's directory; prefix them if running
-from elsewhere. Drop `--env-file .env` when `NANOGPT_API_KEY` is already in the environment.)
+(With the package installed, `nanoodle-py run …` is equivalent.) Add `--env-file .env` only
+when the key is not already exported. For a machine-readable payload (paths, cost, balance),
+add `--json`.
+
+Optional style override (workflow also exposes this input):
+
+```sh
+--input "System prompt=<custom image-prompt writer instructions>"
+```
 
 Inspect the interface anytime with:
 
@@ -41,8 +49,11 @@ python -m nanoodle inspect workflows/poster.noodle-graph.json
 
 ## Outputs
 
-- `./poster-out/Poster.png` — the rendered poster image. Hand this file to the user.
-- The CLI also prints the run's total cost to stderr when it finishes.
+- Media is saved under `--out` as `Poster.<ext>` where `<ext>` follows the image MIME
+  (often `jpg` or `png`). **Use the path the CLI prints on the `Poster:` line** — do not
+  hard-code `.png`.
+- With `--json`, the path is in `outputs.Poster.file` (and cost/balance in the same object).
+- The CLI also prints total cost (and remaining balance when the API reports it) to stderr.
 
 ## Cost
 
