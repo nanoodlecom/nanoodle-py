@@ -3,6 +3,14 @@
   python -m nanoodle inspect graph.json
   python -m nanoodle run graph.json --input Text="a cozy ramen shop" \
       --input n2.system=@sys.txt --set n3.size=1k --out ./out [--json]
+
+The graph argument is also "the URL is the package": pass any nanoodle share
+link where a graph.json path is accepted — a full URL, a bare #g=/#j=/#a=
+fragment, or a da.gd/TinyURL short link. Quote the URL — # starts a comment in
+most shells.
+
+  python -m nanoodle inspect "https://nanoodle.com/#g=..."
+  python -m nanoodle run "https://nanoodle.com/play.html#a=..." --input Text=hi
 """
 
 import argparse
@@ -164,7 +172,9 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="execute a workflow")
-    p_run.add_argument("graph")
+    p_run.add_argument("graph", metavar="GRAPH",
+                       help="a noodle-graph.json save, or a nanoodle share link "
+                            "(URL or #g=/#j=/#a= fragment)")
     p_run.add_argument("--input", action="append", metavar="NAME=VALUE",
                        help="input value; @file reads a file (repeatable)")
     p_run.add_argument("--set", action="append", metavar="NODE.FIELD=VALUE",
@@ -180,7 +190,9 @@ def main(argv=None):
     p_run.set_defaults(fn=cmd_run)
 
     p_ins = sub.add_parser("inspect", help="print inputs/outputs/settings + node table")
-    p_ins.add_argument("graph")
+    p_ins.add_argument("graph", metavar="GRAPH",
+                       help="a noodle-graph.json save, or a nanoodle share link "
+                            "(URL or #g=/#j=/#a= fragment)")
     p_ins.add_argument("--api-key", default=None)
     p_ins.add_argument("--env-file", default=None, metavar="PATH",
                        help="read NANOGPT_API_KEY (and other vars) from a .env-style file; "

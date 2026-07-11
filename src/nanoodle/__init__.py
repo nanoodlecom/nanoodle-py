@@ -11,6 +11,7 @@ Zero runtime dependencies (Python >= 3.9, stdlib only).
 from .errors import NanoodleError, RunError, UnsupportedNodeError
 from .iodef import InputSpec, OutputSpec, SettingSpec
 from .media import MediaRef, media_from_file
+from .share import decode_share_fragment, decode_share_url, is_share_ref
 from .workflow import NodeRun, RunResult, Workflow
 
 __version__ = "0.1.3"
@@ -20,5 +21,6 @@ __all__ = [
     "MediaRef", "media_from_file",
     "NanoodleError", "UnsupportedNodeError", "RunError",
     "InputSpec", "OutputSpec", "SettingSpec",
+    "decode_share_url", "decode_share_fragment", "is_share_ref",
     "__version__",
 ]
