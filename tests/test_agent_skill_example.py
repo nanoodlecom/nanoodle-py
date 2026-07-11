@@ -1,6 +1,6 @@
 """Guards examples/agent-skill/poster-generator against engine renames: its SKILL.md
-documents --input "Idea=..." and a saved Poster.png, so the workflow file must keep
-deriving exactly those keys. Offline — no server, no run()."""
+documents --input "Idea=..." and output key Poster (saved as Poster.<ext> by MIME).
+Offline — no server, no run()."""
 
 import os
 import unittest
@@ -22,7 +22,11 @@ class AgentSkillExampleTest(unittest.TestCase):
             "required input keys must match SKILL.md's --input flag")
         self.assertEqual(
             [o.key for o in wf.outputs], ["Poster"],
-            "output keys must match SKILL.md's documented Poster.png")
+            "output keys must match SKILL.md's documented Poster.<ext>")
+        # Optional LLM system field is a useful advanced --input; keep it exposed.
+        opt = [s for s in wf.inputs if s.key == "System prompt"]
+        self.assertEqual(len(opt), 1)
+        self.assertTrue(opt[0].optional)
         self.assertEqual(wf.warnings, [])
 
 

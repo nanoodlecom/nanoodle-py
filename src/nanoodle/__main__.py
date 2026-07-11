@@ -150,7 +150,10 @@ def cmd_run(args):
             else:
                 print("%s:\n%s" % (key, value))
         approx = "" if result.cost_exact else "~"
-        print("cost: %s$%.4f" % (approx, result.cost_usd), file=sys.stderr)
+        cost_line = "cost: %s$%.4f" % (approx, result.cost_usd)
+        if result.remaining_balance is not None:
+            cost_line += " · balance: $%s" % result.remaining_balance
+        print(cost_line, file=sys.stderr)
     return 0
 
 

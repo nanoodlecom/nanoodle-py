@@ -170,6 +170,18 @@ class RunCliTest(MockedTest):
         self.assertIn("cost:", err)
         self.assertIn("LLM", err)   # progress lines on stderr
 
+    def test_plain_run_prints_balance_when_api_reports_it(self):
+        # image_response with balance → remaining_balance on result → stderr cost line
+        self.mock.script("POST", "/api/v1/chat/completions",
+                         chat_response("a vivid prompt", cost_usd=0.001, balance=9.5))
+        self.mock.script("POST", "/v1/images/generations",
+                         image_response(b64_list=[PNG_B64], cost=0.02, balance=9.48))
+        code, _, err = run_cli(self._argv("--input", "Text=x"))
+        self.assertEqual(code, 0)
+        self.assertIn("cost:", err)
+        self.assertIn("balance:", err)
+        self.assertIn("9.48", err)
+
 
 if __name__ == "__main__":
     unittest.main()

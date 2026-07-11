@@ -122,10 +122,20 @@ black/white mask matching the source dimensions.
 ## Use it as an agent skill
 
 A saved workflow plus a short `SKILL.md` playbook is a skill any coding agent
-can run — Claude Code (`.claude/skills/<name>/SKILL.md`) or anything that
-reads markdown and runs shell. Recipe and template:
-[docs/agent-skills.md](docs/agent-skills.md). Full example:
-[examples/agent-skill/poster-generator/](examples/agent-skill/poster-generator/).
+can run — Claude Code, Cursor, Grok, or anything that reads markdown and runs
+shell. Recipe and template: [docs/agent-skills.md](docs/agent-skills.md).
+
+**Example skill** (idea → LLM prompt → poster image):
+
+```bash
+npx skills add 255BITS/nanoodle-py@poster-generator -g -y
+pip install nanoodle   # CLI used by the skill
+```
+
+Source: [examples/agent-skill/poster-generator/](examples/agent-skill/poster-generator/).
+Media is saved as `Poster.<ext>` (MIME-derived; often `.jpg`) — use the path the
+CLI prints. The JavaScript package ships the same skill name; installing both
+overwrites — pick one runtime (see [agent-skills.md](docs/agent-skills.md)).
 
 ## Cost
 
