@@ -109,7 +109,7 @@ example: [examples/agent-skill/poster-generator/](examples/agent-skill/poster-ge
 You bring your own NanoGPT API key; NanoGPT bills your balance per generation and reports the
 price on each response. `result.cost_usd` totals it and `result.cost_exact` turns `False` when
 any call omitted a price (the total is then a floor). `result.remaining_balance` is the freshest
-balance the API reported. A price of 0 means known-free (subscription-included), not unknown.
+balance the API reported. A price of 0 means known-included (subscription), not unknown.
 No telemetry, no analytics, and your API key is never logged.
 
 ## Testing
