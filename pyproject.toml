@@ -38,8 +38,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://nanoodle.io"
-Repository = "https://github.com/255BITS/nanoodle-py"
+Homepage = "https://nanoodle.com"
+Repository = "https://github.com/nanoodlecom/nanoodle-py"
 
 [project.scripts]
 nanoodle-py = "nanoodle.__main__:main"

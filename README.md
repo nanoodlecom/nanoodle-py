@@ -1,13 +1,13 @@
 # nanoodle (Python)
 
 **Run visual AI workflows from Python.** Design them in the
-[nanoodle](https://nanoodle.io) editor, save as `noodle-graph.json`, then load
+[nanoodle](https://nanoodle.com) editor, save as `noodle-graph.json`, then load
 and re-run them here — same graph, same [NanoGPT](https://nano-gpt.com) API,
 your own key.
 
 Zero runtime dependencies (stdlib only). Library + CLI in one install.
 
-Looking for JavaScript / Node? → **[nanoodle-js](https://github.com/255BITS/nanoodle-js)**
+Looking for JavaScript / Node? → **[nanoodle-js](https://github.com/nanoodlecom/nanoodle-js)**
 
 ## At a glance
 
@@ -23,8 +23,8 @@ agents.
 |---|---|
 | **Package** | `nanoodle` on PyPI |
 | **Runtime** | Python ≥ 3.9 · stdlib only · no deps |
-| **Sibling** | [JavaScript package](https://github.com/255BITS/nanoodle-js) (same graphs, same semantics) |
-| **Editor** | [nanoodle.io](https://nanoodle.io) — wire nodes, hit 💾, download the graph |
+| **Sibling** | [JavaScript package](https://github.com/nanoodlecom/nanoodle-js) (same graphs, same semantics) |
+| **Editor** | [nanoodle.com](https://nanoodle.com) — wire nodes, hit 💾, download the graph |
 
 ## Install
 
@@ -128,7 +128,7 @@ shell. Recipe and template: [docs/agent-skills.md](docs/agent-skills.md).
 **Example skill** (idea → LLM prompt → poster image):
 
 ```bash
-npx skills add 255BITS/nanoodle-py@poster-generator -g -y
+npx skills add nanoodlecom/nanoodle-py@poster-generator -g -y
 pip install nanoodle   # CLI used by the skill
 ```
 
@@ -166,9 +166,9 @@ graph’s image step).
 Design contract and format/engine/io specs live in [`docs/`](docs/):
 `DESIGN.md`, `SPEC-format.md`, `SPEC-engine.md`, `SPEC-io.md`.
 
-Same contract as the [JavaScript package](https://github.com/255BITS/nanoodle-js).
+Same contract as the [JavaScript package](https://github.com/nanoodlecom/nanoodle-js).
 
 ## License
 
 MIT — see [LICENSE](LICENSE). Not affiliated with NanoGPT. Build workflows at
-[nanoodle.io](https://nanoodle.io).
+[nanoodle.com](https://nanoodle.com).

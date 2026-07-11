@@ -1,4 +1,4 @@
-"""nanoodle — re-execute nanoodle (https://nanoodle.io) workflow saves against NanoGPT.
+"""nanoodle — re-execute nanoodle (https://nanoodle.com) workflow saves against NanoGPT.
 
 Zero runtime dependencies (Python >= 3.9, stdlib only).
 

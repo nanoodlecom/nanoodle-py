@@ -56,7 +56,7 @@ result.outputs, result.cost_usd, result.cost_exact, result.remaining_balance, re
 - Version: 0.1.1.
 
 ## Repo layout (each)
-README.md (quickstart: download the save from https://nanoodle.io → 3-line usage; the starter-graph example; supported node matrix; cost note; link to nanoodle app)
+README.md (quickstart: download the save from https://nanoodle.com → 3-line usage; the starter-graph example; supported node matrix; cost note; link to nanoodle app)
 LICENSE (MIT, "Copyright (c) 2026 nanoodle contributors")
 src/... (js: src/*.mjs re-exported from src/index.mjs; py: src/nanoodle/*.py)
 tests/ (harness + unit tests; node:test / unittest — NO third-party test deps)
