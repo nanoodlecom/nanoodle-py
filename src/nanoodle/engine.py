@@ -853,7 +853,7 @@ def _run_transcribe(engine, node, inp, on_cost):
         data, ctype = engine.fetch_media(src)
         mime = (ctype or "audio/mpeg").split(";")[0].strip() or "audio/mpeg"
     if len(data) > TRANSCRIBE_MAX_BYTES:
-        raise NanoodleError("this clip is too big to transcribe directly (~3 MB max) — use a shorter clip")
+        raise NanoodleError("this clip is too big to transcribe directly (~3.5 MB max) — use a shorter clip")
     ext = (mime.split("/")[1] if "/" in mime else "mp3").split(";")[0] or "mp3"
     fields = {"model": _mdl(node)}
     language = (_fstr(node, "language") or "auto").strip()

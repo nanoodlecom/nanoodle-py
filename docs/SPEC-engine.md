@@ -99,7 +99,7 @@ Parse: `j.transcription ?? j.text ?? j.data?.transcription ?? j.data?.text`.
 ## Cost extraction (costFromJson 998-1013)
 USD priority: j.cost (if >0) → j.x_nanogpt_pricing.(costUsd|cost|amount) → j.metadata?.cost → header x-cost / x-nano-cost.
 Balance: header x-remaining-balance (wins) → j.remainingBalance → x_nanogpt_pricing.remainingBalance.
-Present-but-zero = known-free, keep 0. Absent → cost unknown (mark total inexact).
+Present-but-zero = known-included (subscription), keep 0. Absent → cost unknown (mark total inexact).
 
 ## HTTP errors (922-935)
 - 401/403 → auth error ("API key rejected").

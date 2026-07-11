@@ -66,7 +66,9 @@ The file has two parts:
   for X" is the load-bearing half.
 - **Body** — everything the agent needs to run it without guessing:
   1. How to get the API key: `NANOGPT_API_KEY` from the environment, or a `.env` file passed
-     with `--env-file` (precedence: `--api-key` > environment > `--env-file`).
+     with `--env-file` (precedence: `--api-key` > environment > `--env-file`). Porting note:
+     the JS CLI (`nanoodle`) differs — there `--env-file` wins over an ambient environment
+     variable.
   2. The exact run command, with one `--input` per input key.
   3. Where outputs land (`--out <dir>`) and what each output is.
   4. An honest per-run cost note — runs spend real NanoGPT credit, so the agent (and its
