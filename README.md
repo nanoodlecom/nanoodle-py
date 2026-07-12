@@ -46,6 +46,22 @@ print(result.cost_usd, result.remaining_balance)
 
 With the app’s starter graph (text → LLM prompt-writer → image), that’s the whole program.
 
+### The URL is the package
+
+Every nanoodle share link is a runnable artifact. Anywhere a `graph.json` path
+is accepted — `Workflow.load` or the CLI — a share link works just as well:
+
+```python
+wf = Workflow.load("https://nanoodle.com/#g=...")          # workflow link
+wf = Workflow.load("https://nanoodle.com/play.html#a=...")  # app link (graph only)
+```
+
+Workflow links (`#g=`/`#j=`) and app links (`#a=`, graph only — the app shell
+stays in the browser) both decode, as do `da.gd`/TinyURL short links (resolved
+by reading redirect headers; no credentials are ever sent). Direct fragment
+links decode **fully offline** — zero network I/O, stdlib only. Paste one
+straight from a README, a chat, or a tweet.
+
 ### Discover a workflow’s interface
 
 ```python
@@ -98,6 +114,7 @@ nanoodle-py inspect graph.json
 nanoodle-py run graph.json --input Text="a cozy ramen shop" --set n3.size=1k --out ./out
 nanoodle-py run graph.json --input n2.system=@style.txt --json
 nanoodle-py run graph.json --env-file .env --input Text="hello"   # NANOGPT_API_KEY from a .env file
+nanoodle-py inspect "https://nanoodle.com/#g=..."                 # a share link works too (quote it — # is a shell comment)
 ```
 
 - `--out DIR` — save media outputs to files

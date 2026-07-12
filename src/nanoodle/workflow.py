@@ -14,6 +14,7 @@ from .graph import (NODE_TYPES, classify_inbound, display_name, materialize,
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
 from .media import MEDIA_INLINE_MAX, MediaRef, make_data_url
+from .share import decode_share_url, is_share_ref
 from .transport import default_http, resolve_api_key
 
 _UNSUPPORTED_MSG = ("node type '%s' does local media processing that requires the "
@@ -95,8 +96,25 @@ class Workflow(object):
     # ---- constructors -------------------------------------------------------
 
     @classmethod
-    def load(cls, path, **opts):
-        with open(path, "r", encoding="utf-8") as f:
+    def load(cls, src, **opts):
+        """Load a workflow from a noodle-graph.json file on disk, or from any
+        nanoodle share link — a full URL (nanoodle.com/#g=…, /play.html#a=…, a
+        da.gd/TinyURL short link) or a bare #g=/#j=/#a= fragment. Direct
+        fragment links decode offline; only fragment-less short links touch the
+        network (redirect-header reads, no credentials attached).
+
+        Share options ``opener`` (injectable redirect hook) and ``max_hops``
+        are consumed here and never reach the constructor.
+        """
+        if is_share_ref(src):
+            share_opts = {}
+            if "opener" in opts:
+                share_opts["opener"] = opts.pop("opener")
+            if "max_hops" in opts:
+                share_opts["max_hops"] = opts.pop("max_hops")
+            graph = decode_share_url(src, **share_opts)["graph"]
+            return cls(graph, **opts)
+        with open(src, "r", encoding="utf-8") as f:
             return cls(json.load(f), **opts)
 
     @classmethod
