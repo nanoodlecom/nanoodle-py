@@ -137,6 +137,72 @@ class VframesNodeTest(unittest.TestCase):
         self.assertTrue(f1.url.startswith("data:image/"))
         self.assertIn("frame2", result.nodes["n2"].out)
 
+    @skip_no_ffmpeg
+    def test_wired_frames_floor_raises_frames_so_frame3_consumer_runs(self):
+        # Persisted graphs may have frames=1 while frame3 is wired to a
+        # downstream node. The engine must clamp up to the wired floor so the
+        # resize consumer receives frame3 (play.html wiredFramesFloor parity).
+        from nanoodle.graph import wired_frames_floor
+        from nanoodle.iodef import derive_settings
+
+        vid = media_from_file(MEDIA("clipA.mp4"))
+        data = {
+            "nodes": [
+                {"id": "n1", "type": "vupload", "fields": {}},
+                {"id": "n2", "type": "vframes", "name": "Frames",
+                 "fields": {"frames": "1", "gap": "0.05", "dir": "start"}},
+                {"id": "n3", "type": "resize", "name": "Thumb",
+                 "fields": {"mode": "fit", "width": "16", "height": "16"}},
+            ],
+            "links": [
+                {"id": "l1", "from": {"node": "n1", "port": "video"},
+                 "to": {"node": "n2", "port": "video"}},
+                {"id": "l2", "from": {"node": "n2", "port": "frame3"},
+                 "to": {"node": "n3", "port": "image"}},
+            ],
+        }
+        wf = Workflow.from_dict(data)
+        self.assertEqual(wired_frames_floor(wf.graph, "n2"), 3)
+        frames_knob = next(s for s in derive_settings(wf.graph)
+                           if s.node_id == "n2" and s.field == "frames")
+        self.assertEqual(frames_knob.min, 3)
+
+        result = wf.run({"Video": vid})
+        # vframes must have produced frame3
+        self.assertIn("frame3", result.nodes["n2"].out)
+        self.assertTrue(result.nodes["n2"].out["frame3"].url.startswith("data:image/"))
+        # resize sink succeeds on frame3
+        thumb = result["Thumb"]
+        self.assertIsInstance(thumb, MediaRef)
+        self.assertTrue(thumb.url.startswith("data:image/"))
+        self.assertGreater(len(thumb.bytes()), 20)
+
+
+class MediaInlineGuardTest(unittest.TestCase):
+    def test_local_only_accepts_oversized_data_url_input(self):
+        from nanoodle.media import MEDIA_INLINE_MAX
+        big = "data:video/mp4;base64," + "A" * (MEDIA_INLINE_MAX + 50)
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "n1", "type": "vupload", "fields": {}},
+        ]})
+        result = wf.run({"Video": big})
+        self.assertEqual(result["Video input"].url, big)
+
+    def test_network_graph_refuses_oversized_media_input(self):
+        from nanoodle.media import MEDIA_INLINE_MAX
+        from tests._util import tripwire_http
+        big = "data:image/png;base64," + "A" * (MEDIA_INLINE_MAX + 50)
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "n1", "type": "upload", "fields": {}},
+            {"id": "n2", "type": "vision", "fields": {"model": "m"}},
+        ], "links": [
+            {"id": "l1", "from": {"node": "n1", "port": "image"},
+             "to": {"node": "n2", "port": "image"}},
+        ]}, api_key="k", http=tripwire_http)
+        with self.assertRaises(NanoodleError) as ctx:
+            wf.run({"Image": big})
+        self.assertIn("too large", str(ctx.exception))
+
 
 class CombineNodeTest(unittest.TestCase):
     @skip_no_ffmpeg

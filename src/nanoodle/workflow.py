@@ -10,7 +10,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from .engine import Engine
 from .errors import NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, classify_inbound, display_name, materialize,
-                    topo_order)
+                    topo_order, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
 from .media import MEDIA_INLINE_MAX, MediaRef, make_data_url
@@ -158,13 +158,20 @@ class Workflow(object):
     def run(self, inputs=None, settings=None, timeout=None, on_progress=None):
         graph = self._copy_graph()
 
+        # Network nodes force the ~4 MB MEDIA_INLINE_MAX guard on user media
+        # inputs (NanoGPT has no upload endpoint). Local-only graphs (resize /
+        # vframes / combine / …) accept larger data: URLs for on-device ffmpeg.
+        has_network = any(
+            (NODE_TYPES.get(n.type) or {}).get("network") for n in graph.nodes.values())
+
         # 1. upfront input validation & application
         specs = self.inputs
         supplied = self._normalize_inputs(inputs, specs)
         explicit = set()   # id() of every spec the caller supplied a value for
         for key, value in supplied.items():
             spec = resolve_input_key(specs, key, graph)
-            graph.node(spec.node_id).fields[spec.field] = self._coerce_input(spec, value)
+            graph.node(spec.node_id).fields[spec.field] = self._coerce_input(
+                spec, value, has_network=has_network)
             explicit.add(id(spec))
         for key, value in (settings or {}).items():
             sspec = resolve_setting_key(self.settings, key, graph)
@@ -193,7 +200,6 @@ class Workflow(object):
                                 % ("s" if len(missing) > 1 else "", ", ".join(missing)))
 
         # 3. fail fast BEFORE spending: unknown node types, API key
-        has_network = False
         for node in graph.nodes.values():
             tspec = NODE_TYPES.get(node.type)
             if tspec is None:
@@ -201,12 +207,24 @@ class Workflow(object):
                     node.id, node.type,
                     "unknown node type '%s' (node %s '%s') — this workflow needs a newer "
                     "library or the nanoodle browser app" % (node.type, node.id, display_name(node)))
-            if tspec.get("network"):
-                has_network = True
         if has_network and not self._api_key and self._payment is None:
             raise NanoodleError("no API key — pass api_key=, set the NANOGPT_API_KEY "
                                 "environment variable, or pass payment= for accountless "
                                 "x402 runs (this workflow calls NanoGPT)")
+
+        # 4. vframes: clamp fields.frames up to the highest wired frameK port
+        #    (wired_frames_floor). Persisted apps may still carry frames=1 with
+        #    frame3 wired — without this the frame3 consumer starves mid-run.
+        for node in graph.nodes.values():
+            if node.type != "vframes":
+                continue
+            floor = wired_frames_floor(graph, node.id)
+            try:
+                cur = int(node.fields.get("frames") or 1)
+            except (TypeError, ValueError):
+                cur = 1
+            if floor > cur:
+                node.fields["frames"] = floor
 
         order = topo_order(graph)  # raises on cycles, naming the cyclic nodes
         return self._execute(graph, order, timeout, on_progress)
@@ -240,7 +258,7 @@ class Workflow(object):
             % (len(required), ", ".join(s.key for s in required) or "none"))
 
     @staticmethod
-    def _coerce_input(spec, value):
+    def _coerce_input(spec, value, has_network=False):
         if isinstance(value, MediaRef):
             value = value.url
         elif isinstance(value, (bytes, bytearray)):
@@ -265,7 +283,10 @@ class Workflow(object):
                     "input %s: expected a data: URL, an http(s) URL, bytes, or "
                     "media_from_file(path) — got a plain string. For a local file use "
                     "media_from_file(%r)." % (spec.key, value[:60]))
-            if value[:5].lower() == "data:" and len(value) > MEDIA_INLINE_MAX:
+            # MEDIA_INLINE_MAX only applies when the graph talks to NanoGPT.
+            # Local-only graphs (ffmpeg resize/vframes/combine/…) can handle larger media.
+            if (has_network and value[:5].lower() == "data:"
+                    and len(value) > MEDIA_INLINE_MAX):
                 raise NanoodleError(
                     "input %s: media is too large to send inline (~4 MB max). nanoodle "
                     "sends media as base64 in the request body (NanoGPT has no upload "
@@ -294,6 +315,7 @@ class Workflow(object):
                     pass
 
         engine = self._make_engine(progress)
+        engine.set_run_deadline(deadline, timeout)
 
         deps = {nid: set() for nid in order}
         for link in graph.links:
@@ -315,6 +337,8 @@ class Workflow(object):
             return on_cost
 
         def exec_node(nid):
+            # Honour deadline before starting (local media especially can be long).
+            engine.check_cancel()
             node = graph.node(nid)
             name = display_name(node)
             progress({"type": "node-start", "node_id": nid, "name": name})
