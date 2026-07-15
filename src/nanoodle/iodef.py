@@ -5,7 +5,8 @@ from dataclasses import dataclass, field as dc_field
 from typing import Any, List, Optional
 
 from .errors import NanoodleError
-from .graph import NODE_TYPES, display_name, topo_order
+from .graph import (MAX_FRAMES, NODE_TYPES, display_name, topo_order,
+                    wired_frames_floor)
 
 
 @dataclass
@@ -39,6 +40,8 @@ class SettingSpec:
     default: Optional[Any] = None
     options: Optional[List[str]] = None
     node_name: Optional[str] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
 
 
 # INPUT_SPECS (play.html 3140-3155) — field, label, kind, optional, default.
@@ -116,6 +119,19 @@ SETTING_SPECS = {
     "inpaint": [("model", "Model", "model", None, None),
                 ("size", "Image size", "select", "1024x1024", _SIZES),
                 ("seed", "Seed", "number", None, None)],
+    # local media knobs (play.html SETTING_SPECS) — shape-affecting for vframes
+    "resize": [("mode", "Mode", "select", "fit", ["fit", "fill", "exact"]),
+               ("width", "Width", "number", None, None),
+               ("height", "Height", "number", None, None)],
+    "vframes": [("dir", "Start from", "select", "end", ["end", "start"]),
+                ("frames", "Frames", "number", "1", None),
+                ("gap", "Gap (s)", "number", "0.5", None)],
+    "combine": [("dedup", "Trim duplicate seam frame", "boolean", True, None)],
+    "soundtrack": [("loop", "Loop audio to fill video", "boolean", False, None)],
+    "trim": [("start", "Start (s)", "number", "0", None),
+             ("length", "Length (s)", "number", "30", None)],
+    "extractaudio": [("start", "Start (s)", "number", "0", None),
+                     ("length", "Length (s)", "number", None, None)],
 }
 
 
@@ -209,6 +225,14 @@ def derive_outputs(graph):
         used[base] = used.get(base, 0) + 1
         key = base if used[base] == 1 else "%s %d" % (base, used[base])
         ports = [p for (p, _kind) in NODE_TYPES.get(node.type, {}).get("outputs", [])]
+        # vframes grows frame1..frameN from max(fields.frames, wired floor)
+        if node.type == "vframes":
+            try:
+                authored = max(1, min(MAX_FRAMES, int(node.fields.get("frames") or 1)))
+            except (TypeError, ValueError):
+                authored = 1
+            count = max(authored, wired_frames_floor(graph, node.id))
+            ports = ["frame%d" % i for i in range(1, count + 1)]
         out.append(OutputSpec(key, node.id, node.type, ports))
     return out
 
@@ -220,9 +244,16 @@ def derive_settings(graph):
         for (field, label, kind, default, options) in SETTING_SPECS.get(node.type, []):
             if graph.port_is_fed(node.id, field):
                 continue  # a knob fed by a link is decided upstream
+            # vframes frames is shape-affecting — never offer a floor below the
+            # highest wired frameK port (mirrors play.html wiredFramesFloor)
+            smin = smax = None
+            if node.type == "vframes" and field == "frames":
+                smin = max(1, wired_frames_floor(graph, node.id))
+                smax = MAX_FRAMES
             out.append(SettingSpec("%s.%s" % (node.id, field), node.id, field, kind, label,
                                    default=_field_default(node, field, default),
-                                   options=options, node_name=name))
+                                   options=options, node_name=name,
+                                   min=smin, max=smax))
         if node.type == "image" and node.fields.get("model") == "custom-civitai":
             out.append(SettingSpec("%s.customCivitaiAir" % node.id, node.id, "customCivitaiAir",
                                    "text", "CivitAI model", default=node.fields.get("customCivitaiAir"),

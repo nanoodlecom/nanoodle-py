@@ -18,7 +18,7 @@ Catalogs (public, no key): /api/v1/models?detailed=true, /api/v1/image-models,
 Every JSON call: `Content-Type: application/json` + BOTH `Authorization: Bearer <key>` and `x-api-key: <key>`.
 Multipart transcribe: the two auth headers, NO explicit Content-Type (let the http lib set boundary). File form field MUST be named "file"; also fields `model`, optional `language`.
 
-All media is inlined as base64 `data:` URLs in JSON bodies (no upload endpoint). MEDIA_INLINE_MAX = 4.4MB — guard locally and raise a clear error above it. Chat runs NON-STREAMING (no `stream` key); parse `r.json()` once.
+All media is inlined as base64 `data:` URLs in JSON bodies (no upload endpoint). MEDIA_INLINE_MAX = 4.4MB — guard locally and raise a clear error above it **when the graph has network nodes** (NanoGPT request bodies). Local-only graphs (resize / vframes / combine / soundtrack / trim / extractaudio) may accept larger `data:` inputs for on-device ffmpeg. Chat runs NON-STREAMING (no `stream` key); parse `r.json()` once.
 
 Model strings pass through VERBATIM (`body.model = node.fields.model`). Missing model → error "pick a model first". Endpoint choice is by node TYPE, never by model lookup. The catalog is optional/best-effort (capability gating + clamps); the library must run fine with no catalog fetch.
 
@@ -127,9 +127,10 @@ Implemented in `src/local-media.mjs` (JS) / `nanoodle/local_media.py` (Py). Beha
 
 - **resize** — `mode` fit|fill|exact, width/height; fit never upscales; PNG stays PNG else JPEG.
 - **vframes** — `frames` 1–12, `gap` seconds, `dir` end|start; emits `frame1..frameN` JPEG data URLs.
-- **combine** — clip1../vid1.. inputs (≥2); `dedup` drops ~1 frame from subsequent clips; concat → mp4.
+  - **wiredFramesFloor**: before run (and in `derive_settings` min), raise `fields.frames` up to the highest outbound `frameK` wire (clamped 1..12). Graphs saved with `frames=1` but a wire from `frame3` would otherwise starve the consumer after paid upstream steps.
+- **combine** — clip1../vid1.. inputs (≥2), sorted by port number then name, de-duped; `dedup` drops ~1 frame from subsequent clips; concat → mp4.
 - **soundtrack** — video+audio; `loop` loops audio to fill video length; mux → mp4.
 - **trim** — audio → mono WAV @ 16 kHz; `start` + `length` (default 30s when blank).
 - **extractaudio** — video → mono WAV @ 16 kHz; blank `length` = whole clip after start.
 
-Missing ffmpeg → clear error naming the binary. No `UnsupportedNodeError` for these types.
+Missing ffmpeg → clear error naming the binary. No `UnsupportedNodeError` for these types. Local media subprocesses honour the workflow deadline (cancel check before each op / between vframes frames; remaining time caps ffmpeg timeouts).

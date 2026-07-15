@@ -16,6 +16,26 @@ VID_PORT_RE = re.compile(r"^vid\d+$")        # combine clips
 CLIP_PORT_RE = re.compile(r"^clip\d+$")      # combine clips (spec alias)
 REF_PORT_RE = re.compile(r"^ref\d+$")        # tvideo reference images
 FRAME_PORT_RE = re.compile(r"^frame\d+$")    # vframes outputs
+MAX_FRAMES = 12
+
+
+def wired_frames_floor(graph, node_id):
+    """Highest frameN port wired OUT of a vframes node (clamped 1..MAX_FRAMES).
+
+    fields.frames is shape-affecting: run() emits frame1..frameN and downstream
+    links read fixed frameK ports. A count below the highest wired port starves
+    consumers mid-run (after upstream paid steps). Mirrors play.html
+    wiredFramesFloor — floor is raised at run and in derive_settings.
+    """
+    floor = 1
+    for link in (graph.links if graph is not None else []) or []:
+        if link.from_node != node_id:
+            continue
+        m = re.match(r"^frame(\d+)$", str(link.from_port))
+        if m:
+            floor = max(floor, int(m.group(1)) or 1)
+    return min(floor, MAX_FRAMES)
+
 
 # Node type registry. outputs = [(port, kind)] with the PRIMARY port first.
 # static = declared input port names; dynamic = port-name regexes.

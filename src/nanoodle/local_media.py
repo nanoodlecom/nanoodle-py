@@ -8,12 +8,12 @@ URLs for the MediaRef pipeline.
 
 from __future__ import annotations
 
-import base64
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 from .errors import NanoodleError
 from .media import MEDIA_INLINE_MAX, make_data_url, parse_data_url, sniff_mime
@@ -21,25 +21,75 @@ from .media import MEDIA_INLINE_MAX, make_data_url, parse_data_url, sniff_mime
 MAX_FRAMES = 12
 
 
-def _run(bin_name, args, timeout=120):
+def _effective_timeout(default, deadline=None):
+    """Clamp a per-process timeout to the remaining workflow deadline (if any)."""
+    if deadline is None:
+        return default
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        return 0
+    return min(default, rem)
+
+
+def _run(bin_name, args, timeout=120, cancel_check=None, deadline=None):
+    if cancel_check:
+        cancel_check()
     if not shutil.which(bin_name):
         raise NanoodleError(
             "local media nodes need ffmpeg on PATH (not found: %s). "
             "Install ffmpeg, or run this graph in the nanoodle browser app." % bin_name)
+    eff = _effective_timeout(timeout, deadline)
+    if eff <= 0:
+        if cancel_check:
+            cancel_check()
+        raise NanoodleError("%s timed out after %ss" % (bin_name, timeout))
     try:
-        p = subprocess.run(
+        # Use Popen so a mid-run cancel/deadline can kill the child promptly
+        # instead of waiting for the full process timeout.
+        p = subprocess.Popen(
             [bin_name] + list(args),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError:
         raise NanoodleError(
             "local media nodes need ffmpeg on PATH (not found: %s). "
             "Install ffmpeg, or run this graph in the nanoodle browser app." % bin_name)
-    except subprocess.TimeoutExpired:
-        raise NanoodleError("%s timed out after %ss" % (bin_name, timeout))
+    end = time.monotonic() + eff
+    stdout = stderr = None
+    try:
+        while True:
+            try:
+                remaining = max(0.05, end - time.monotonic())
+                stdout, stderr = p.communicate(timeout=min(0.25, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_check:
+                    try:
+                        cancel_check()
+                    except Exception:
+                        p.kill()
+                        try:
+                            p.communicate(timeout=2)
+                        except Exception:
+                            pass
+                        raise
+                if time.monotonic() >= end:
+                    p.kill()
+                    try:
+                        p.communicate(timeout=2)
+                    except Exception:
+                        pass
+                    raise NanoodleError("%s timed out after %ss" % (bin_name, timeout))
+    finally:
+        if p.poll() is None:
+            p.kill()
+            try:
+                p.communicate(timeout=2)
+            except Exception:
+                pass
     if p.returncode != 0:
-        err = (p.stderr or b"").decode("utf-8", "replace").strip()
+        err = (stderr or b"").decode("utf-8", "replace").strip()
         raise NanoodleError("%s failed (exit %s): %s" % (bin_name, p.returncode, err[-400:] or "no stderr"))
-    return p.stdout, (p.stderr or b"").decode("utf-8", "replace")
+    return stdout, (stderr or b"").decode("utf-8", "replace")
 
 
 def _as_url(url):
@@ -123,9 +173,11 @@ def resize_plan(sw, sh, mode, tw, th):
     return {"cw": bw, "ch": bh, "dx": (bw - dw) / 2, "dy": (bh - dh) / 2, "dw": dw, "dh": dh}
 
 
-def resize_crop_image(url, mode, tw, th, fetcher=None):
-    w = max(0, int(tw or 0) if str(tw or "").strip() not in ("",) else 0) if tw not in (None, "") else 0
-    h = max(0, int(th or 0) if str(th or "").strip() not in ("",) else 0) if th not in (None, "") else 0
+def _run_args(cancel_check=None, deadline=None):
+    return {"cancel_check": cancel_check, "deadline": deadline}
+
+
+def resize_crop_image(url, mode, tw, th, fetcher=None, cancel_check=None, deadline=None):
     try:
         w = max(0, int(float(tw))) if tw not in (None, "") else 0
     except (TypeError, ValueError):
@@ -136,12 +188,15 @@ def resize_crop_image(url, mode, tw, th, fetcher=None):
         h = 0
     if not w and not h:
         raise NanoodleError("set a width or height to resize to")
+    if cancel_check:
+        cancel_check()
     m = mode or "fit"
+    ra = _run_args(cancel_check, deadline)
     with tempfile.TemporaryDirectory(prefix="nanoodle-media-") as d:
         in_path = _write_input(d, "in", url, fetcher)
         out, _ = _run("ffprobe", [
             "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", in_path])
+            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", in_path], **ra)
         parts = out.decode("utf-8", "replace").strip().split("x")
         try:
             sw, sh = int(parts[0]), int(parts[1])
@@ -162,7 +217,7 @@ def resize_crop_image(url, mode, tw, th, fetcher=None):
         if not want_png:
             args += ["-q:v", "2"]
         args.append(out_path)
-        _run("ffmpeg", args)
+        _run("ffmpeg", args, **ra)
         result = _data_url_from_file(out_path, "image/png" if want_png else "image/jpeg")
         if len(result) > MEDIA_INLINE_MAX:
             raise NanoodleError(
@@ -170,7 +225,11 @@ def resize_crop_image(url, mode, tw, th, fetcher=None):
         return result
 
 
-def trim_audio_to_wav(url, start, length, rate=16000, fetcher=None, whole_if_blank=False):
+def trim_audio_to_wav(url, start, length, rate=16000, fetcher=None, whole_if_blank=False,
+                      cancel_check=None, deadline=None):
+    if cancel_check:
+        cancel_check()
+    ra = _run_args(cancel_check, deadline)
     with tempfile.TemporaryDirectory(prefix="nanoodle-media-") as d:
         in_path = _write_input(d, "in", url, fetcher)
         out_path = os.path.join(d, "out.wav")
@@ -179,7 +238,7 @@ def trim_audio_to_wav(url, start, length, rate=16000, fetcher=None, whole_if_bla
         try:
             out, _ = _run("ffprobe", [
                 "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", in_path])
+                "-of", "default=noprint_wrappers=1:nokey=1", in_path], **ra)
             dur = float(out.decode("utf-8", "replace").strip())
         except (NanoodleError, ValueError):
             pass
@@ -198,7 +257,7 @@ def trim_audio_to_wav(url, start, length, rate=16000, fetcher=None, whole_if_bla
             args += ["-t", str(take)]
         args += ["-vn", "-ac", "1", "-ar", str(rate or 16000), "-f", "wav", out_path]
         try:
-            _run("ffmpeg", args)
+            _run("ffmpeg", args, **ra)
         except NanoodleError as e:
             msg = str(e)
             if re.search(r"does not contain any stream|no audio|matches no streams", msg, re.I):
@@ -210,23 +269,33 @@ def trim_audio_to_wav(url, start, length, rate=16000, fetcher=None, whole_if_bla
         return _data_url_from_file(out_path, "audio/wav")
 
 
-def extract_audio_to_wav(url, start, length, rate=16000, fetcher=None):
-    return trim_audio_to_wav(url, start, length, rate, fetcher=fetcher, whole_if_blank=True)
+def extract_audio_to_wav(url, start, length, rate=16000, fetcher=None,
+                         cancel_check=None, deadline=None):
+    return trim_audio_to_wav(url, start, length, rate, fetcher=fetcher,
+                             whole_if_blank=True, cancel_check=cancel_check,
+                             deadline=deadline)
 
 
-def extract_video_frames(url, count=1, gap=0.5, dir="end", fetcher=None):
-    n = max(1, min(MAX_FRAMES, int(count or 1)))
+def extract_video_frames(url, count=1, gap=0.5, dir="end", fetcher=None,
+                         cancel_check=None, deadline=None):
+    try:
+        n = max(1, min(MAX_FRAMES, int(count or 1)))
+    except (TypeError, ValueError):
+        n = 1
     try:
         step = max(0.0, float(gap))
     except (TypeError, ValueError):
         step = 0.5
     from_end = (dir or "end") == "end"
     eps = 0.04
+    if cancel_check:
+        cancel_check()
+    ra = _run_args(cancel_check, deadline)
     with tempfile.TemporaryDirectory(prefix="nanoodle-media-") as d:
         in_path = _write_input(d, "in", url, fetcher)
         out, _ = _run("ffprobe", [
             "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", in_path])
+            "-of", "default=noprint_wrappers=1:nokey=1", in_path], **ra)
         try:
             dur = float(out.decode("utf-8", "replace").strip())
         except ValueError:
@@ -235,28 +304,37 @@ def extract_video_frames(url, count=1, gap=0.5, dir="end", fetcher=None):
             raise NanoodleError("video has no readable duration")
         result = {}
         for i in range(n):
+            # Between frames: honour workflow timeout/cancel so a long vframes
+            # loop does not run past the outer deadline after paid upstream work.
+            if cancel_check:
+                cancel_check()
             t = (dur - eps - i * step) if from_end else (i * step)
             t = max(0.0, min(max(0.0, dur - eps), t))
             frame_path = os.path.join(d, "f%d.jpg" % (i + 1))
             _run("ffmpeg", [
-                "-y", "-ss", str(t), "-i", in_path, "-frames:v", "1", "-q:v", "2", frame_path])
+                "-y", "-ss", str(t), "-i", in_path, "-frames:v", "1", "-q:v", "2", frame_path], **ra)
             result["frame%d" % (i + 1)] = _data_url_from_file(frame_path, "image/jpeg")
         return result
 
 
-def concat_videos(urls, dedup=True, fetcher=None):
+def concat_videos(urls, dedup=True, fetcher=None, cancel_check=None, deadline=None):
     if not urls or len(urls) < 2:
         raise NanoodleError("wire at least two clips to combine")
+    if cancel_check:
+        cancel_check()
+    ra = _run_args(cancel_check, deadline)
     with tempfile.TemporaryDirectory(prefix="nanoodle-media-") as d:
         paths = [_write_input(d, "c%d" % i, u, fetcher) for i, u in enumerate(urls)]
         prepared = []
         for i, p in enumerate(paths):
+            if cancel_check:
+                cancel_check()
             if dedup and i > 0:
                 trimmed = os.path.join(d, "t%d.mp4" % i)
                 _run("ffmpeg", [
                     "-y", "-ss", "0.033", "-i", p,
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", trimmed])
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", trimmed], **ra)
                 prepared.append(trimmed)
             else:
                 prepared.append(p)
@@ -268,16 +346,20 @@ def concat_videos(urls, dedup=True, fetcher=None):
         try:
             _run("ffmpeg", [
                 "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-                "-c", "copy", "-movflags", "+faststart", out_path])
+                "-c", "copy", "-movflags", "+faststart", out_path], **ra)
         except NanoodleError:
             _run("ffmpeg", [
                 "-y", "-f", "concat", "-safe", "0", "-i", list_path,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path])
+                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path], **ra)
         return _data_url_from_file(out_path, "video/mp4")
 
 
-def mux_soundtrack(video_url, audio_url, loop=False, fetcher=None):
+def mux_soundtrack(video_url, audio_url, loop=False, fetcher=None,
+                   cancel_check=None, deadline=None):
+    if cancel_check:
+        cancel_check()
+    ra = _run_args(cancel_check, deadline)
     with tempfile.TemporaryDirectory(prefix="nanoodle-media-") as d:
         v_path = _write_input(d, "v", video_url, fetcher)
         a_path = _write_input(d, "a", audio_url, fetcher)
@@ -286,7 +368,7 @@ def mux_soundtrack(video_url, audio_url, loop=False, fetcher=None):
         try:
             out, _ = _run("ffprobe", [
                 "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", v_path])
+                "-of", "default=noprint_wrappers=1:nokey=1", v_path], **ra)
             vdur = float(out.decode("utf-8", "replace").strip())
         except (NanoodleError, ValueError):
             pass
@@ -301,7 +383,7 @@ def mux_soundtrack(video_url, audio_url, loop=False, fetcher=None):
             args.append("-shortest")
         args += ["-movflags", "+faststart", out_path]
         try:
-            _run("ffmpeg", args)
+            _run("ffmpeg", args, **ra)
         except NanoodleError:
             args2 = ["-y", "-i", v_path]
             if loop:
@@ -314,5 +396,5 @@ def mux_soundtrack(video_url, audio_url, loop=False, fetcher=None):
             else:
                 args2.append("-shortest")
             args2 += ["-movflags", "+faststart", out_path]
-            _run("ffmpeg", args2)
+            _run("ffmpeg", args2, **ra)
         return _data_url_from_file(out_path, "video/mp4")

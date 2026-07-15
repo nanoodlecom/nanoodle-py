@@ -148,11 +148,26 @@ class MediaInputCoercionTest(unittest.TestCase):
         result = self._upload_wf().run({"Audio": "https://cdn.example/clip.mp3"})
         self.assertEqual(result["Audio input"].url, "https://cdn.example/clip.mp3")
 
-    def test_oversized_data_url_media_input_refused_at_coercion(self):
+    def test_oversized_data_url_accepted_on_local_only_graph(self):
+        # Local-only graphs (no NanoGPT nodes) may carry large media for
+        # on-device ffmpeg; MEDIA_INLINE_MAX is a network-body guard.
         from nanoodle.media import MEDIA_INLINE_MAX
         big = "data:audio/mpeg;base64," + "A" * MEDIA_INLINE_MAX
+        result = self._upload_wf().run({"Audio": big})
+        self.assertEqual(result["Audio input"].url, big)
+
+    def test_oversized_data_url_refused_when_graph_has_network_nodes(self):
+        from nanoodle.media import MEDIA_INLINE_MAX
+        big = "data:audio/mpeg;base64," + "A" * MEDIA_INLINE_MAX
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "n1", "type": "aupload", "fields": {}},
+            {"id": "n2", "type": "transcribe", "fields": {"model": "m"}},
+        ], "links": [
+            {"id": "l1", "from": {"node": "n1", "port": "audio"},
+             "to": {"node": "n2", "port": "audio"}},
+        ]}, api_key="k", http=tripwire_http)
         with self.assertRaises(NanoodleError) as ctx:
-            self._upload_wf().run({"Audio": big})
+            wf.run({"Audio": big})
         self.assertIn("too large", str(ctx.exception))
 
 
