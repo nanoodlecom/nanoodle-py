@@ -126,11 +126,10 @@ nanoodle-py inspect "https://nanoodle.com/#g=..."                 # a share link
 | runs | node types |
 |---|---|
 | local | text, upload (image/audio/video), choice, join, comment |
+| local media† | resize, vframes, combine, soundtrack, trim, extractaudio |
 | NanoGPT | llm (incl. vision + audio input), image, draw, edit, inpaint*, vision, tvideo, ivideo, vedit, lipsync, music, remix, tts, transcribe |
-| **not supported** (browser-only media processing) | resize, vframes, combine, soundtrack, trim, extractaudio |
 
-Workflows with unsupported node types load with a warning and fail fast at
-`run()` with `UnsupportedNodeError` — before any network call.
+† **local media** needs **ffmpeg** on `PATH` (soft dependency — not a PyPI package). Same behaviour as the browser app; clear error if ffmpeg is missing.
 
 \* **inpaint:** the browser app composites the mask onto black at the source
 pixel size; this library passes your mask through verbatim. Supply a
@@ -188,6 +187,9 @@ with your own wallet/signer, or show ``inv["uri"]`` for a human to scan. Each
 API call pays at most once; graphs with several paid nodes produce one small
 invoice per node. The invoice dict is field-identical to nanoodle-js's, so
 payment callbacks port between the two libraries unchanged.
+
+Copy-paste scripts (CLI, print callback, wallet stub):
+[examples/x402/](examples/x402/).
 
 ### Accountless image, start to finish
 
