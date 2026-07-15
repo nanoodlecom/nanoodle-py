@@ -18,9 +18,6 @@ from .share import decode_share_url, is_share_ref
 from .transport import default_http, resolve_api_key
 from .x402 import assert_payment_option
 
-_UNSUPPORTED_MSG = ("node type '%s' does local media processing that requires the "
-                    "nanoodle browser app; not supported by this library yet")
-
 
 class NodeRun(object):
     """Per-node run record: status ('done'|'error'|'skipped'), out, error, cost, ms."""
@@ -195,7 +192,7 @@ class Workflow(object):
             raise NanoodleError("missing required input%s: %s"
                                 % ("s" if len(missing) > 1 else "", ", ".join(missing)))
 
-        # 3. fail fast BEFORE spending: unsupported/unknown node types, API key
+        # 3. fail fast BEFORE spending: unknown node types, API key
         has_network = False
         for node in graph.nodes.values():
             tspec = NODE_TYPES.get(node.type)
@@ -204,10 +201,6 @@ class Workflow(object):
                     node.id, node.type,
                     "unknown node type '%s' (node %s '%s') — this workflow needs a newer "
                     "library or the nanoodle browser app" % (node.type, node.id, display_name(node)))
-            if tspec.get("unsupported"):
-                raise UnsupportedNodeError(
-                    node.id, node.type,
-                    (_UNSUPPORTED_MSG % node.type) + " (node %s '%s')" % (node.id, display_name(node)))
             if tspec.get("network"):
                 has_network = True
         if has_network and not self._api_key and self._payment is None:

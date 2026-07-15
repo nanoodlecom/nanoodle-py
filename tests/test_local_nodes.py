@@ -12,11 +12,6 @@ from nanoodle import (MediaRef, NanoodleError, UnsupportedNodeError, Workflow,
                       media_from_file)
 from nanoodle.graph import UNSUPPORTED_TYPES
 
-_UNSUPPORTED_STATIC = {   # a port the fixture graph can leave unwired
-    "resize": {"mode": "fit"}, "vframes": {"frames": "2"}, "combine": {},
-    "soundtrack": {}, "trim": {"start": "0"}, "extractaudio": {},
-}
-
 
 class LocalNodesTest(unittest.TestCase):
     def test_join_choice_chain_runs_offline(self):
@@ -176,40 +171,22 @@ class FailFastTest(unittest.TestCase):
             wf = Workflow.load(fixture("starter-graph.json"), api_key=None)
         self.assertEqual(wf._api_key, "env-key")
 
-    def test_unsupported_node_fails_fast_before_any_network_call(self):
-        calls = []
-
-        def spy_http(*a, **kw):
-            calls.append(a)
-            raise AssertionError("network call before fail-fast check")
-
-        wf = Workflow.load(fixture("unsupported-node.json"), api_key="k", http=spy_http)
-        # DESIGN: Workflow.load only WARNS for unsupported types (run fails fast)
-        self.assertEqual(len(wf.warnings), 1)
-        self.assertIn("resize", wf.warnings[0])
-        self.assertIn("not supported by this library yet", wf.warnings[0])
-        with self.assertRaises(UnsupportedNodeError) as ctx:
-            wf.run()
-        msg = str(ctx.exception)
-        self.assertIn("node type 'resize' does local media processing that requires "
-                      "the nanoodle browser app; not supported by this library yet", msg)
-        self.assertEqual(ctx.exception.node_type, "resize")
-        self.assertEqual(calls, [])   # fail-fast happened BEFORE any network call
-
-    def test_every_unsupported_type_raises_with_spec_message(self):
-        self.assertEqual(sorted(UNSUPPORTED_TYPES),
-                         ["combine", "extractaudio", "resize", "soundtrack", "trim", "vframes"])
-        for ntype in UNSUPPORTED_TYPES:
+    def test_local_media_types_no_longer_unsupported(self):
+        # capability gap closed: registry has no unsupported local-media types
+        self.assertEqual(list(UNSUPPORTED_TYPES), [])
+        for ntype in ("resize", "vframes", "combine", "soundtrack", "trim", "extractaudio"):
             wf = Workflow.from_dict({"nodes": [
-                {"id": "n1", "type": ntype, "fields": dict(_UNSUPPORTED_STATIC[ntype]),
-                 "name": "My %s" % ntype},
+                {"id": "n1", "type": ntype, "fields": {}, "name": "My %s" % ntype},
             ]}, api_key="k", http=tripwire_http)
-            with self.assertRaises(UnsupportedNodeError) as ctx:
+            # load does not warn; run may fail on missing inputs/ffmpeg — but never
+            # with the old "browser app; not supported" UnsupportedNodeError
+            self.assertEqual(wf.warnings, [])
+            try:
                 wf.run()
-            msg = str(ctx.exception)
-            self.assertIn("node type '%s' does local media processing" % ntype, msg)
-            self.assertIn("My %s" % ntype, msg)   # names the node
-            self.assertEqual(ctx.exception.node_id, "n1")
+            except UnsupportedNodeError as e:
+                self.fail("local media type %s still raises UnsupportedNodeError: %s" % (ntype, e))
+            except Exception:
+                pass  # missing inputs / ffmpeg — fine for this contract test
 
     def test_unknown_type_fails_fast_before_any_network_call(self):
         wf = Workflow.from_dict({"nodes": [

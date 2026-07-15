@@ -122,6 +122,14 @@ No streaming retries needed (engine is non-streaming). Poll GET failures: silent
 - join: [a,b].filter(non-empty).join(sep) where sep = fields.sep ?? " ", literal "\\n" in sep means newline
 - comment: skip
 
-## Local nodes UNSUPPORTED in v1 (browser media ops — raise UnsupportedNodeError naming node + type)
-resize, vframes, combine, soundtrack, trim, extractaudio.
-Error message must say: "node type 'X' does local media processing that requires the nanoodle browser app; not supported by this library yet".
+## Local media nodes (on-device; require ffmpeg on PATH — soft dependency, not an npm package)
+Implemented in `src/local-media.mjs` (JS) / `nanoodle/local_media.py` (Py). Behaviour mirrors the browser:
+
+- **resize** — `mode` fit|fill|exact, width/height; fit never upscales; PNG stays PNG else JPEG.
+- **vframes** — `frames` 1–12, `gap` seconds, `dir` end|start; emits `frame1..frameN` JPEG data URLs.
+- **combine** — clip1../vid1.. inputs (≥2); `dedup` drops ~1 frame from subsequent clips; concat → mp4.
+- **soundtrack** — video+audio; `loop` loops audio to fill video length; mux → mp4.
+- **trim** — audio → mono WAV @ 16 kHz; `start` + `length` (default 30s when blank).
+- **extractaudio** — video → mono WAV @ 16 kHz; blank `length` = whole clip after start.
+
+Missing ffmpeg → clear error naming the binary. No `UnsupportedNodeError` for these types.

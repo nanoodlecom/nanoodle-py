@@ -51,7 +51,8 @@ result.outputs, result.cost_usd, result.cost_exact, result.remaining_balance, re
 
 ## Shared behaviors (both)
 - run() input validation UPFRONT: unknown input key → error listing valid keys; missing required input with empty field default → error naming it; no API key while graph has network nodes → error BEFORE any node runs.
-- Unsupported node types (resize/vframes/combine/soundtrack/trim/extractaudio) and unknown types that must RUN → UnsupportedNodeError at run start (fail fast, before spending), naming node + type. Workflow.load only warns.
+- Unknown node types that must RUN → UnsupportedNodeError at run start (fail fast, before spending), naming node + type. Workflow.load only warns.
+- Local media ops (resize/vframes/combine/soundtrack/trim/extractaudio) run via ffmpeg on PATH (soft dependency; not a PyPI package). Clear error if ffmpeg is missing.
 - No locale suffix, no catalog fetch, no seed skip-cache, no telemetry/analytics of ANY kind. Never log the API key. Media over 4.4MB inline → clear local error.
 - Version: 0.1.1.
 

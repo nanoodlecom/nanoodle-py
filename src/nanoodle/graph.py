@@ -19,7 +19,7 @@ FRAME_PORT_RE = re.compile(r"^frame\d+$")    # vframes outputs
 
 # Node type registry. outputs = [(port, kind)] with the PRIMARY port first.
 # static = declared input port names; dynamic = port-name regexes.
-# network nodes need an API key; unsupported nodes are browser-local media ops.
+# network nodes need an API key; local media ops need ffmpeg on PATH (soft dependency).
 NODE_TYPES = {
     "text":       {"title": "Text",             "outputs": [("text", "text")]},
     "upload":     {"title": "Image input",      "outputs": [("image", "image")]},
@@ -37,7 +37,7 @@ NODE_TYPES = {
     "inpaint":    {"title": "Inpaint",          "outputs": [("image", "image")],
                    "static": ["image", "mask"], "network": True},
     "resize":     {"title": "Resize / crop",    "outputs": [("image", "image")],
-                   "static": ["image"], "unsupported": True},
+                   "static": ["image"]},
     "vision":     {"title": "Vision",           "outputs": [("text", "text")],
                    "static": ["image"], "network": True},
     "tvideo":     {"title": "Text→Video",       "outputs": [("video", "video")],
@@ -47,11 +47,11 @@ NODE_TYPES = {
     "vedit":      {"title": "Video edit",       "outputs": [("video", "video")],
                    "static": ["video"], "network": True},
     "vframes":    {"title": "Video → frames",   "outputs": [("frame1", "image")],
-                   "static": ["video"], "unsupported": True},
+                   "static": ["video"]},
     "combine":    {"title": "Combine videos",   "outputs": [("video", "video")],
-                   "dynamic": [VID_PORT_RE, CLIP_PORT_RE], "unsupported": True},
+                   "dynamic": [VID_PORT_RE, CLIP_PORT_RE]},
     "soundtrack": {"title": "Soundtrack",       "outputs": [("video", "video")],
-                   "static": ["video", "audio"], "unsupported": True},
+                   "static": ["video", "audio"]},
     "lipsync":    {"title": "Avatar / lipsync", "outputs": [("video", "video")],
                    "static": ["image", "audio"], "network": True},
     "music":      {"title": "Music",            "outputs": [("audio", "audio")], "network": True},
@@ -59,15 +59,15 @@ NODE_TYPES = {
                    "static": ["audio"], "network": True},
     "tts":        {"title": "Speech",           "outputs": [("audio", "audio")], "network": True},
     "trim":       {"title": "Trim audio",       "outputs": [("audio", "audio")],
-                   "static": ["audio"], "unsupported": True},
+                   "static": ["audio"]},
     "extractaudio": {"title": "Extract audio",  "outputs": [("audio", "audio")],
-                     "static": ["video"], "unsupported": True},
+                     "static": ["video"]},
     "transcribe": {"title": "Transcribe",       "outputs": [("text", "text")],
                    "static": ["audio"], "network": True},
     "comment":    {"title": "Comment",          "outputs": [], "note": True},
 }
 
-# Local media-processing node types this library cannot execute (v1).
+# Kept for import compatibility; empty — local media ops are implemented (need ffmpeg).
 UNSUPPORTED_TYPES = tuple(t for t, s in NODE_TYPES.items() if s.get("unsupported"))
 
 
@@ -152,11 +152,6 @@ def materialize(data, warnings=None):
             continue
         if ntype not in NODE_TYPES:
             warnings.append("unknown node type %r (node %s) — it cannot be executed" % (ntype, nid))
-        elif NODE_TYPES[ntype].get("unsupported"):
-            warnings.append(
-                "node type %r (node %s) does local media processing that requires the "
-                "nanoodle browser app; not supported by this library yet — run() will fail"
-                % (ntype, nid))
         fields = dict(raw.get("fields") or {})
         nodes[nid] = Node(nid, ntype, fields, raw.get("name"))
 

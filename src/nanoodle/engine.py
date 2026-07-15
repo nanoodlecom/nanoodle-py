@@ -976,6 +976,105 @@ def _run_join(engine, node, inp, on_cost):
     return {"text": sep.join(str(v) for v in parts)}
 
 
+# ---- local media (ffmpeg on PATH) ---------------------------------------------
+
+def _media_url(v):
+    if isinstance(v, MediaRef):
+        return v.url
+    return v
+
+
+def _run_resize(engine, node, inp, on_cost):
+    from .local_media import resize_crop_image
+    img = inp.get("image")
+    if not img:
+        raise NanoodleError("no image input")
+    return {"image": engine._media_ref(resize_crop_image(
+        _media_url(img), node.fields.get("mode") or "fit",
+        node.fields.get("width"), node.fields.get("height")))}
+
+
+def _run_vframes(engine, node, inp, on_cost):
+    from .local_media import extract_video_frames
+    vid = inp.get("video")
+    if not vid:
+        raise NanoodleError("no video input")
+    frames = extract_video_frames(
+        _media_url(vid),
+        count=node.fields.get("frames") or 1,
+        gap=node.fields.get("gap") if node.fields.get("gap") is not None else 0.5,
+        dir=node.fields.get("dir") or "end")
+    return {k: engine._media_ref(v) for k, v in frames.items()}
+
+
+def _run_combine(engine, node, inp, on_cost):
+    from .local_media import concat_videos
+    from .graph import CLIP_PORT_RE, VID_PORT_RE
+
+    def port_idx(name):
+        m = re.search(r"(\d+)$", name)
+        return int(m.group(1)) if m else 1
+
+    keys = sorted(
+        [k for k in inp if CLIP_PORT_RE.match(k) or VID_PORT_RE.match(k)],
+        key=port_idx)
+    clips = [_media_url(inp[k]) for k in keys if inp.get(k)]
+    # de-dupe preserving order
+    seen = set()
+    ordered = []
+    for c in clips:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    if len(ordered) < 2:
+        raise NanoodleError("wire at least two clips to combine")
+    dedup_raw = node.fields.get("dedup")
+    dedup = True if dedup_raw is None else str(dedup_raw).lower() not in ("false", "0", "")
+    return {"video": engine._media_ref(concat_videos(ordered, dedup=dedup))}
+
+
+def _run_soundtrack(engine, node, inp, on_cost):
+    from .local_media import mux_soundtrack
+    if not inp.get("video"):
+        raise NanoodleError("no video input")
+    if not inp.get("audio"):
+        raise NanoodleError("no audio input")
+    loop_raw = node.fields.get("loop")
+    loop = str(loop_raw).lower() in ("true", "1") if loop_raw is not None else False
+    return {"video": engine._media_ref(mux_soundtrack(
+        _media_url(inp["video"]), _media_url(inp["audio"]), loop=loop))}
+
+
+def _run_trim(engine, node, inp, on_cost):
+    from .local_media import trim_audio_to_wav
+    if not inp.get("audio"):
+        raise NanoodleError("no audio input")
+    start = float(node.fields.get("start") or 0)
+    try:
+        length = float(node.fields.get("length"))
+    except (TypeError, ValueError):
+        length = 30.0
+    if not (length > 0):
+        length = 30.0
+    return {"audio": engine._media_ref(trim_audio_to_wav(
+        _media_url(inp["audio"]), start, length, 16000))}
+
+
+def _run_extractaudio(engine, node, inp, on_cost):
+    from .local_media import extract_audio_to_wav
+    if not inp.get("video"):
+        raise NanoodleError("no video input")
+    start = float(node.fields.get("start") or 0)
+    try:
+        length = float(node.fields.get("length"))
+    except (TypeError, ValueError):
+        length = 0
+    if not (length > 0):
+        length = 0
+    return {"audio": engine._media_ref(extract_audio_to_wav(
+        _media_url(inp["video"]), start, length, 16000))}
+
+
 _EXECUTORS = {
     "text": _run_text,
     "upload": _run_upload("image"),
@@ -983,6 +1082,12 @@ _EXECUTORS = {
     "vupload": _run_upload("video"),
     "choice": _run_choice,
     "join": _run_join,
+    "resize": _run_resize,
+    "vframes": _run_vframes,
+    "combine": _run_combine,
+    "soundtrack": _run_soundtrack,
+    "trim": _run_trim,
+    "extractaudio": _run_extractaudio,
     "llm": _run_llm,
     "vision": _run_vision,
     "image": _run_image,
