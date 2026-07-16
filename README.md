@@ -8,6 +8,7 @@ your own key.
 Zero runtime dependencies (stdlib only). Library + CLI in one install.
 
 Looking for JavaScript / Node? → **[nanoodle-js](https://github.com/nanoodlecom/nanoodle-js)**
+Running graphs in GitHub CI → [run-noodle-action](https://github.com/nanoodlecom/run-noodle-action) · saved graphs as AI-agent tools → [nanoodle-mcp](https://github.com/nanoodlecom/nanoodle-mcp) · Agent Skills → [nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill) / [noodle-skills](https://github.com/nanoodlecom/noodle-skills)
 
 ## At a glance
 
@@ -33,6 +34,10 @@ pip install nanoodle
 export NANOGPT_API_KEY=...   # nano-gpt.com API key (or OAuth access token)
 ```
 
+Latest on PyPI is **0.1.3**; share-link loading, the local media nodes
+(resize/vframes/combine/soundtrack/trim/extractaudio), and x402 `--pay` need
+0.2 — until it ships, `pip install git+https://github.com/nanoodlecom/nanoodle-py`.
+
 ## Quickstart (library)
 
 ```python
@@ -40,7 +45,8 @@ from nanoodle import Workflow
 
 wf = Workflow.load("noodle-graph.json")
 result = wf.run({"Text": "a cozy ramen shop on a rainy night"})
-result["Image"].save("ramen.png")            # media: MediaRef (url + bytes()/save())
+img = result["Image"]                        # media: MediaRef (url + bytes()/save())
+img.save("ramen." + img.suggested_extension())   # extension matches the actual MIME (often jpg)
 print(result.cost_usd, result.remaining_balance)
 ```
 
