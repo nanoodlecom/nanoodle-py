@@ -34,9 +34,8 @@ pip install nanoodle
 export NANOGPT_API_KEY=...   # nano-gpt.com API key (or OAuth access token)
 ```
 
-Latest on PyPI is **0.1.3**; share-link loading, the local media nodes
-(resize/vframes/combine/soundtrack/trim/extractaudio), and x402 `--pay` need
-0.2 — until it ships, `pip install git+https://github.com/nanoodlecom/nanoodle-py`.
+Requires **0.2.0+** for share-link loading, the local media nodes
+(resize/vframes/combine/soundtrack/trim/extractaudio), and x402 `--pay`.
 
 ## Quickstart (library)
 
