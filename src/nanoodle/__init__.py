@@ -15,7 +15,7 @@ from .share import decode_share_fragment, decode_share_url, is_share_ref
 from .workflow import NodeRun, RunResult, Workflow
 from .x402 import parse_nano_invoice
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "Workflow", "RunResult", "NodeRun",
