@@ -19,7 +19,8 @@ import os
 import re
 import sys
 
-from . import MediaRef, NanoodleError, Workflow, __version__, media_from_file
+from . import (MediaRef, NanoodleError, RunError, Workflow, __version__,
+               media_from_file)
 
 _MEDIA_EXT = re.compile(r"\.(png|jpe?g|gif|webp|bmp|mp3|wav|ogg|oga|opus|flac|aac|m4a|mp4|webm|mov)$", re.I)
 
@@ -166,8 +167,21 @@ def cmd_run(args):
             print("✓ %s — %d ms" % (evt["name"], evt.get("ms") or 0), file=sys.stderr)
         elif evt["type"] == "node-error":
             print("✗ %s — %s" % (evt["name"], evt.get("error")), file=sys.stderr)
+        elif evt["type"] == "prompt-trimmed":
+            print("✂ %s — prompt trimmed %d → %d characters (cap %d)"
+                  % (evt["name"], evt["from"], evt["to"], evt["cap"]), file=sys.stderr)
 
-    result = wf.run(inputs, settings=settings, timeout=args.timeout, on_progress=progress)
+    failure = None
+    try:
+        result = wf.run(inputs, settings=settings, timeout=args.timeout, on_progress=progress)
+    except RunError as e:
+        # A failed run still carries a full RunResult: per-node status and error, the
+        # outputs that DID complete, and the cost already spent. With --json an agent
+        # reads the failure detail from stdout, so print the same payload and exit 1.
+        if not args.json:
+            raise
+        failure = e
+        result = e.result
 
     friendly = [o.key for o in wf.outputs]
     saved = _save_outputs(result, friendly, args.out) if args.out else {}
@@ -177,7 +191,8 @@ def cmd_run(args):
                    "nodes": {nid: {"status": r.status, "error": r.error,
                                    "costUsd": r.cost_usd, "ms": r.ms}
                              for nid, r in result.nodes.items()},
-                   "errors": result.errors}
+                   "errors": result.errors,
+                   "promptTrims": result.prompt_trims}
         for key in friendly:
             value = result.outputs.get(key)
             if isinstance(value, MediaRef):
@@ -186,6 +201,9 @@ def cmd_run(args):
             else:
                 payload["outputs"][key] = value
         print(json.dumps(payload, indent=2))
+        if failure is not None:
+            print("run failed: %s" % failure, file=sys.stderr)
+            return 1
     else:
         for key in friendly:
             value = result.outputs.get(key)

@@ -77,7 +77,10 @@ class InputDerivationTest(unittest.TestCase):
         # nodeId.field, which made wf.inputs keys differ between languages
         wf = Workflow.load(fixture("duplicate-names.json"), api_key="k")
         keys = sorted(s.key for s in wf.inputs)
-        self.assertEqual(keys, ["System prompt", "System prompt 2", "Text", "Text 2"])
+        # the two Writer nodes have their prompt wired, so each contributes ONE input
+        # (the optional system prompt) and keeps its custom name as the key — the JS
+        # naming rule, verified against nanoodle-js 0.8.0 on this same fixture
+        self.assertEqual(keys, ["Text", "Text 2", "Writer", "Writer 2"])
         # friendly keys stay addressable and resolve in derivation order
         first = resolve_input_key(wf.inputs, "Text", wf.graph)
         self.assertEqual((first.node_id, first.field), ("n1", "text"))
@@ -109,10 +112,16 @@ class KeyResolutionTest(unittest.TestCase):
         self.assertIn("Persona", msg)
         self.assertIn("Prompt", msg)
 
-    def test_duplicate_custom_names_ambiguous(self):
+    def test_duplicate_names_resolve_by_key_then_report_ambiguity(self):
         wf = Workflow.load(fixture("duplicate-names.json"), api_key="k")
+        # two nodes named Writer: each ADVERTISED key resolves to its own node
+        first = resolve_input_key(wf.inputs, "Writer", wf.graph)
+        self.assertEqual((first.node_id, first.field), ("n3", "system"))
+        second = resolve_input_key(wf.inputs, "Writer 2", wf.graph)
+        self.assertEqual((second.node_id, second.field), ("n4", "system"))
+        # the shared generic label still names two inputs, so it stays ambiguous
         with self.assertRaises(NanoodleError) as ctx:
-            wf.run({"Writer": "x"})   # two nodes named Writer
+            resolve_input_key(wf.inputs, "System prompt", wf.graph)
         self.assertIn("ambiguous", str(ctx.exception))
 
     def test_custom_name_resolves_to_single_required_input(self):

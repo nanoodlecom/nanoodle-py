@@ -5,8 +5,8 @@ from dataclasses import dataclass, field as dc_field
 from typing import Any, List, Optional
 
 from .errors import NanoodleError
-from .graph import (MAX_FRAMES, NODE_TYPES, display_name, topo_order,
-                    wired_frames_floor)
+from .graph import (MAX_FRAMES, NODE_TYPES, display_name, optional_node,
+                    topo_order, wired_frames_floor)
 
 
 @dataclass
@@ -139,39 +139,47 @@ def _field_default(node, field, spec_default):
 
 
 def derive_inputs(graph):
-    """Inputs = INPUT_SPECS fields not fed by a wire (+ inpaint/choice specials)."""
+    """Inputs = INPUT_SPECS fields not fed by a wire (+ inpaint/choice specials).
+
+    An author-marked optional node (fields.optional, graph.optional_node) makes every
+    input it surfaces optional, exactly as nanoodle-js io.mjs does.
+    """
     out = []
     for node in graph.nodes.values():
         fed = lambda port: graph.port_is_fed(node.id, port)  # noqa: E731
         name = (str(node.name).strip() or None) if node.name else None
+        author_optional = optional_node(node)
         if node.type == "inpaint":
             if not fed("prompt"):
                 out.append(InputSpec("", node.id, "prompt", "textarea", "What to paint in",
+                                     optional=author_optional,
                                      default=_field_default(node, "prompt", None), node_name=name))
             img_fed, mask_fed = fed("image"), fed("mask")
             if not img_fed:
                 out.append(InputSpec("", node.id, "image", "image",
                                      "Image" if mask_fed else "Image — brush the area to repaint",
-                                     node_name=name))
+                                     optional=author_optional, node_name=name))
             if not mask_fed:
                 # derived whenever the mask port is unwired — including the
                 # neither-wired case (play.html's combined upload+brush control
                 # writes BOTH fields.image and fields.mask); a baked fields.mask
                 # satisfies the required-input check.
                 out.append(InputSpec("", node.id, "mask", "image", "Mask (white = repaint)",
-                                     node_name=name))
+                                     optional=author_optional, node_name=name))
             continue
         if node.type == "choice":
             opts = [s.strip() for s in str(node.fields.get("options") or "").split("\n") if s.strip()]
             sel = node.fields.get("selected")
             out.append(InputSpec("", node.id, "selected", "choice", "Choice",
+                                 optional=author_optional,
                                  default=sel if sel in opts else (opts[0] if opts else None),
                                  options=opts, node_name=name))
             continue
         for (field, label, kind, optional, spec_def) in INPUT_SPECS.get(node.type, []):
             if fed(field):
                 continue  # a wire feeds this field — hide the control
-            out.append(InputSpec("", node.id, field, kind, label, optional=optional,
+            out.append(InputSpec("", node.id, field, kind, label,
+                                 optional=optional or author_optional,
                                  default=_field_default(node, field, spec_def), node_name=name))
     _assign_input_keys(out)
     return out
@@ -182,7 +190,9 @@ def _assign_input_keys(inputs):
     matching JS deriveInputs and SPEC-io's duplicate-key suffixing.
 
     Friendly name: the node's custom name when the node contributes exactly one
-    REQUIRED input (PR #138 flat-label rule), else the generic label.
+    REQUIRED input (PR #138 flat-label rule) — or exactly one input at all, so an
+    author-optional renamed node (e.g. an optional "Style reference" upload) keeps
+    its name as the key. Else the generic label.
     """
     per_node = {}
     for spec in inputs:
@@ -191,7 +201,9 @@ def _assign_input_keys(inputs):
     for spec in inputs:
         node_inputs = per_node[spec.node_id]
         required = [s for s in node_inputs if not s.optional]
-        if spec.node_name and len(required) == 1 and required[0] is spec:
+        names = ((len(required) == 1 and required[0] is spec)
+                 or (not required and len(node_inputs) == 1))
+        if spec.node_name and names:
             cand = spec.node_name
         else:
             cand = spec.label

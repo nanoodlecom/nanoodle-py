@@ -183,5 +183,57 @@ class RunCliTest(MockedTest):
         self.assertIn("9.48", err)
 
 
+class FailedRunJsonTest(MockedTest):
+    """A failed run must still answer --json. An agent caller reads the per-node status,
+    the per-node error, the partial outputs and the cost already spent from stdout."""
+
+    def _argv(self, *extra):
+        return ["run", fixture("partial-failure.json"),
+                "--api-key", "cli-key", "--base-url", self.mock.base_url] + list(extra)
+
+    def _script_one_lane_fails(self):
+        # the llm lane completes and costs money; the image lane fails
+        self.mock.script("POST", "/api/v1/chat/completions",
+                         chat_response("some notes", cost_usd=0.002, balance=9.5))
+        self.mock.script("POST", "/v1/images/generations",
+                         {"status": 400, "json": {"error": "Invalid image input."}})
+
+    def test_failed_run_with_json_prints_the_same_shape_and_exits_1(self):
+        self._script_one_lane_fails()
+        code, out, err = run_cli(self._argv("--json"))
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        # per-node status and error map
+        self.assertEqual(payload["nodes"]["n2"]["status"], "done")
+        self.assertEqual(payload["nodes"]["n3"]["status"], "error")
+        self.assertIn("Invalid image input", payload["nodes"]["n3"]["error"])
+        self.assertEqual([e["node_id"] for e in payload["errors"]], ["n3"])
+        # partial outputs: the lane that finished keeps its value, the failed one is null
+        self.assertEqual(payload["outputs"]["Notes"], "some notes")
+        self.assertIsNone(payload["outputs"]["Picture"])
+        # the money already spent is reported, not lost with the exception
+        self.assertEqual(payload["costUsd"], 0.002)
+        self.assertEqual(payload["remainingBalance"], 9.5)
+        self.assertIn("run failed:", err)
+
+    def test_failed_run_with_json_still_saves_the_partial_media(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("some notes"))
+        self.mock.script("POST", "/v1/images/generations",
+                         {"status": 400, "json": {"error": "Invalid image input."}})
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = os.path.join(d, "out")
+            code, out, _ = run_cli(self._argv("--json", "--out", out_dir))
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertEqual(payload["outputs"]["Notes"], "some notes")
+
+    def test_failed_run_without_json_keeps_the_plain_error_path(self):
+        self._script_one_lane_fails()
+        code, out, err = run_cli(self._argv())
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("error: output node", err)
+
+
 if __name__ == "__main__":
     unittest.main()

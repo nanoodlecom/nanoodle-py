@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "text", "fields": { "text": "a cozy ramen shop" } },
+    { "id": "n2", "type": "llm", "fields": { "model": "m1" }, "name": "Notes" },
+    { "id": "n3", "type": "image", "fields": { "model": "m2" }, "name": "Picture" }
+  ],
+  "links": [
+    { "id": "l1", "from": { "node": "n1", "port": "text" }, "to": { "node": "n2", "port": "prompt" } },
+    { "id": "l2", "from": { "node": "n1", "port": "text" }, "to": { "node": "n3", "port": "prompt" } }
+  ]
+}

@@ -12,11 +12,14 @@ INPUT_SPECS table (only these node types contribute; kind in parens):
 - choice (special): field `selected`, kind choice, options from fields.options newline-split
 
 Required unless marked optional. `def` = prefilled default.
+An input node whose `fields.optional` is true (the editor's optional checkbox) makes EVERY input that node
+surfaces optional: run() skips it and the node yields an empty value instead of failing.
 
 ## Input NAMING (for run({name: value}) resolution)
 - Node display name = node.name (trimmed) → NODE_TYPES[type].title → type.
 - The app labels an input with its generic spec label ("Image prompt", "Text", ...), EXCEPT:
-  when a node contributes exactly ONE required input AND has a custom name, that custom name is the label (PR #138).
+  when a node contributes exactly ONE required input AND has a custom name, that custom name is the label (PR #138) —
+  or when it contributes exactly ONE input at all, so an author-optional renamed node keeps its name as the key.
 - upload nodes feeding role ports get role labels ("End frame", "Reference N", "Image N") — UI nicety; library can skip.
 - Unique key = (nodeId, field). LIBRARY RESOLUTION ORDER for a user-supplied key (case-insensitive, trimmed):
   1. exact node custom name (if that node has exactly one derived input → that input; ambiguous → error listing candidates)

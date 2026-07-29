@@ -134,7 +134,9 @@ python -m nanoodle run <path-to-this-skill>/workflows/<file>.noodle-graph.json \
   --out <output-dir>
 
 Add `--env-file …` only if the key is not in the environment. Add `--json` for a structured
-result (paths, costUsd, remainingBalance).
+result (paths, costUsd, remainingBalance). A failed run with `--json` prints the same object —
+per-node `status` and `error`, the outputs that did complete, and the cost already spent — and
+exits 1. Read the failure from there.
 
 Inspect the interface anytime with:
 python -m nanoodle inspect <path-to-this-skill>/workflows/<file>.noodle-graph.json

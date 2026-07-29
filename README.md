@@ -84,6 +84,11 @@ Input keys are flexible (case-insensitive): the node’s custom name, `nodeId.fi
 (`"n2.system"`), or the input’s label when unique. A workflow with exactly one
 required input also accepts a bare value: `wf.run("hello")`.
 
+An input node the author marked **optional** in the editor (the checkbox, saved as
+`fields.optional`) is skippable: `spec.optional` is `True`, and a run that omits it
+proceeds with an empty value that consumers drop — an optional style reference costs
+you nothing when you leave it out.
+
 ### Media inputs
 
 ```python
@@ -115,6 +120,26 @@ lanes no output depends on only appear in `result.errors`. Unknown/unsupported
 node types, missing required inputs, bad keys, and a missing API key all fail
 **before** anything is spent.
 
+### Prompt length caps
+
+Many image and video models reject a prompt over a fixed character count (HTTP 400,
+`prompt_too_long`) before anything is charged. In a graph that prompt is usually written
+by an upstream LLM, so there is nothing you can shorten. nanoodle trims the prompt to the
+model's cap at a sentence boundary and tells you it did:
+
+```python
+result = wf.run({"Text": "..."}, on_progress=print)
+# {'node_id': 'n3', 'name': 'Image', 'from': 1440, 'to': 780, 'cap': 800, 'type': 'prompt-trimmed'}
+result.prompt_trims   # the same records, for a caller that passed no on_progress
+```
+
+Every trim is also raised as a `RuntimeWarning`. A cap this library does not know yet is
+learned from the live 400 and applied on the next run of the same `Workflow`. Your own
+prompts are never rewritten, summarised or added to — the library only ever cuts an
+over-length prompt at the end, and always says so. `PROMPT_CAPS`, `prompt_cap`,
+`fit_prompt_text`, `is_prompt_too_long` and `prompt_cap_from_error` are public, for
+callers that do their own orchestration.
+
 ## CLI
 
 Installed as `nanoodle-py` (and `python -m nanoodle` always works):
@@ -130,6 +155,11 @@ nanoodle-py inspect "https://nanoodle.com/#g=..."                 # a share link
 - `--out DIR` — save media outputs to files
 - `--json` — machine-readable result
 - `--env-file PATH` — load `.env`-style `KEY=VALUE` lines (existing env vars win)
+
+With `--json`, a **failed** run still prints the same JSON on stdout — per-node
+`status` and `error`, the outputs that did complete, the cost already spent, and any
+prompt trims — and exits 1. Without `--json` a failed run prints `error: …` on stderr
+and exits 1, as before.
 
 ## Supported nodes
 
