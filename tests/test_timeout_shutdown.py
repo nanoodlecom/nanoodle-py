@@ -227,19 +227,42 @@ print("returned %.3f paid_requests %d" % (time.monotonic() - t0, len(paid)), flu
 # process exits. That child must not outlive the parent.
 #
 # The child here is a QUIET ffprobe: `-v error`, the same flag
-# resize_crop_image() passes, and it prints nothing until it is done. A CHATTY
-# ffmpeg has a backstop this one does not — its next stderr write hits the
-# closed pipe, SIGPIPE kills it, and it dies about 1.5 to 2.0 s after the parent
-# (measured). A quiet probe never writes, so nothing ever tells it to stop: it
-# was still running 45 s later. This is the case that needs the exit hook.
+# resize_crop_image() passes, and it prints nothing until it is done. It has no
+# backstop of any kind — nothing ever tells it to stop.
+#
+# There is NO SIGPIPE backstop for a chatty child either, which is the case that
+# matters most, because ffmpeg is what does the long work. `ffmpeg` sets SIGPIPE
+# to SIG_IGN itself (SigIgn bit 13 in /proc/PID/status), so its stderr writes to
+# the pipe the dead parent closed fail with EPIPE and it carries on. Measured
+# with the exit hook removed, a chatty ffmpeg was still running 45 s after its
+# parent, 8 runs out of 8. `local_media._kill_children_at_exit` is the ONLY
+# thing that bounds an orphaned child. Do not remove it.
+#
+# `bin`, `args` and `reaper` are format fields so that
+# scripts/measure-timeout-hang.py can run the chatty case and the
+# reaper-removed case from this same committed template.
+
+# A quiet probe: it writes nothing until it is done.
+QUIET_PROBE_ARGS = ["-v", "error", "-count_frames", "-select_streams", "v:0",
+                    "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",
+                    "-f", "lavfi", "testsrc=size=1920x1080:rate=30:duration=600"]
+# A chatty encode: default log level and default stats, so it writes a progress
+# line to stderr about twice a second.
+CHATTY_FFMPEG_ARGS = ["-f", "lavfi",
+                      "-i", "testsrc=size=1920x1080:rate=30:duration=600",
+                      "-f", "null", "-"]
+
 _FFMPEG_CHILD = r'''
-import os, subprocess, sys, threading, time
+import atexit, os, subprocess, sys, threading, time
 sys.path.insert(0, {root!r})
 sys.path.insert(0, {src!r})
 
 from nanoodle.engine import Engine
 from nanoodle import local_media
 from nanoodle.workflow import _DaemonPool
+
+if not {reaper!r}:        # measure what the tree does WITHOUT the exit hook
+    atexit.unregister(local_media._kill_children_at_exit)
 
 started = threading.Event()
 pids = []
@@ -267,14 +290,10 @@ engine = Engine(api_key="k", base_url="http://127.0.0.1:1", http=None)
 engine.set_run_deadline(time.monotonic() + 60.0, 60.0)
 pool = _DaemonPool(max_workers=1)
 
-# Counting every frame of a 600 s source: minutes of work, and not one byte of
-# output until it finishes.
-ARGS = ["-v", "error", "-count_frames", "-select_streams", "v:0",
-        "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",
-        "-f", "lavfi", "testsrc=size=1920x1080:rate=30:duration=600"]
-
+# The default: counting every frame of a 600 s source. Minutes of work, and not
+# one byte of output until it finishes.
 def work():
-    return local_media._run("ffprobe", ARGS, timeout=600.0,
+    return local_media._run({bin!r}, {args!r}, timeout=600.0,
                             cancel_check=engine.check_cancel,
                             deadline=engine._deadline)
 
@@ -353,11 +372,14 @@ class ProcessExitTest(unittest.TestCase):
         # thread is frozen at finalization, so the `finally: p.kill()` inside
         # local_media._run never runs, and the ffmpeg/ffprobe child keeps a CPU
         # after the parent is gone. Measured with the atexit hook removed, the
-        # quiet probe below was still running 45 s later.
+        # quiet probe below was still running 45 s later — and so was a chatty
+        # ffmpeg, 8 runs out of 8, because ffmpeg ignores SIGPIPE.
         # local_media._kill_children_at_exit reaps it, and atexit hooks still
         # run at that point.
         src = _FFMPEG_CHILD.format(root=_REPO_ROOT,
-                                   src=os.path.join(_REPO_ROOT, "src"))
+                                   src=os.path.join(_REPO_ROOT, "src"),
+                                   reaper=True, bin="ffprobe",
+                                   args=QUIET_PROBE_ARGS)
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ffmpeg_child.py")
             with open(path, "w", encoding="utf-8") as f:
