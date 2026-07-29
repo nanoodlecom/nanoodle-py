@@ -133,7 +133,7 @@ The 0.4 s row is the one that matters, because that is where an abandoned worker
 
 Two earlier revisions of this document each wrote down one side of that race as a fact — first "a chatty ffmpeg dies on its own about 1.5 to 2.0 s later", then "still running 45 s after its parent, 8 runs out of 8". Both are retracted. The orphan usually survives, sometimes dies, and nothing in this library decides which.
 
-`ffprobe` is the one predictable case: it does not ignore SIGPIPE at all, so a chatty probe (`--chatty-probe`, `ffprobe -show_frames -of csv` on the same source) died 0.02 to 0.04 s after its parent, 8 runs out of 8. No `local_media` ffprobe call is chatty, though — they all pass `-v error`. Do not depend on SIGPIPE anywhere.
+`ffprobe` is the one predictable case: it does not ignore SIGPIPE at all. A chatty probe (`ffprobe -show_frames -of csv` on the same source) died 0.02 to 0.04 s after its parent in 8 runs of `measure-orphan-sigpipe.py --bin ffprobe`, and 0.00 to 0.02 s after it in 5 runs of `measure-timeout-hang.py --chatty-probe --no-reaper`. No `local_media` ffprobe call is chatty, though — they all pass `-v error`. Do not depend on SIGPIPE anywhere.
 
 ### What the deadline must NOT bound
 The deadline governs work the run is still doing. Two things have a different lifetime and stay outside it:
