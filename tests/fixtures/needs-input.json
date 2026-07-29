@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "nodes": [
+    { "id": "n1", "type": "llm", "fields": { "model": "m1", "prompt": "" }, "name": "Answer" }
+  ],
+  "links": []
+}

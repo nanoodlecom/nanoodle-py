@@ -19,7 +19,8 @@ import os
 import re
 import sys
 
-from . import MediaRef, NanoodleError, Workflow, __version__, media_from_file
+from . import (MediaRef, NanoodleError, RunError, Workflow, __version__,
+               media_from_file)
 
 _MEDIA_EXT = re.compile(r"\.(png|jpe?g|gif|webp|bmp|mp3|wav|ogg|oga|opus|flac|aac|m4a|mp4|webm|mov)$", re.I)
 
@@ -146,16 +147,43 @@ def _pay_printer(inv):
     print("waiting for the deposit… (Ctrl-C aborts)\n", file=sys.stderr)
 
 
+def _print_prerun_failure_json(wf, exc):
+    """The --json failure payload for a run that never started, then exit code 1.
+
+    A missing input, an unknown node type or an absent API key is caught BEFORE any node
+    executes, so there is no RunResult to report. That is the failure an agent caller hits
+    most, and printing nothing on stdout left it with no machine-readable answer at all.
+    Print the same shape as the post-execution failure, with the fields that describe
+    execution empty, because nothing executed: no nodes ran, nothing was spent.
+    """
+    payload = {"outputs": {o.key: None for o in wf.outputs} if wf is not None else {},
+               "costUsd": 0.0, "costExact": True, "remainingBalance": None,
+               "nodes": {},
+               "errors": [{"node_id": None, "name": None, "message": str(exc)}],
+               "promptTrims": []}
+    print(json.dumps(payload, indent=2))
+    print("error: %s" % exc, file=sys.stderr)
+    return 1
+
+
 def cmd_run(args):
     # --pay = accountless x402: the key is deliberately dropped (api_key="" stays
     # explicitly keyless — None would fall back to $NANOGPT_API_KEY and charge an account).
     pay = getattr(args, "pay", False)
-    wf = Workflow.load(args.graph,
-                       api_key="" if pay else args.api_key,
-                       payment=_pay_printer if pay else None,
-                       base_url=args.base_url or "https://nano-gpt.com")
-    inputs = _parse_kv(args.input, "input")
-    settings = _parse_kv(args.set, "set") or None
+    try:
+        wf = Workflow.load(args.graph,
+                           api_key="" if pay else args.api_key,
+                           payment=_pay_printer if pay else None,
+                           base_url=args.base_url or "https://nano-gpt.com")
+        inputs = _parse_kv(args.input, "input")
+        settings = _parse_kv(args.set, "set") or None
+    except (NanoodleError, OSError) as e:
+        # the graph would not even load (bad path, unreadable file, malformed save), or an
+        # --input/--set argument is malformed. The human path keeps raising exactly as
+        # before; only --json gains the payload it was documented to print.
+        if not args.json:
+            raise
+        return _print_prerun_failure_json(None, e)
 
     def progress(evt):
         if args.json:
@@ -166,8 +194,28 @@ def cmd_run(args):
             print("✓ %s — %d ms" % (evt["name"], evt.get("ms") or 0), file=sys.stderr)
         elif evt["type"] == "node-error":
             print("✗ %s — %s" % (evt["name"], evt.get("error")), file=sys.stderr)
+        elif evt["type"] == "prompt-trimmed":
+            print("✂ %s — prompt trimmed %d → %d characters (cap %d)"
+                  % (evt["name"], evt["from"], evt["to"], evt["cap"]), file=sys.stderr)
 
-    result = wf.run(inputs, settings=settings, timeout=args.timeout, on_progress=progress)
+    failure = None
+    try:
+        result = wf.run(inputs, settings=settings, timeout=args.timeout, on_progress=progress)
+    except RunError as e:
+        # A failed run still carries a full RunResult: per-node status and error, the
+        # outputs that DID complete, and the cost already spent. With --json an agent
+        # reads the failure detail from stdout, so print the same payload and exit 1.
+        if not args.json:
+            raise
+        failure = e
+        result = e.result
+    except NanoodleError as e:
+        # pre-run validation: a missing required input, an unknown node type, no API key.
+        # RunError is the only error raised once execution has begun, so anything else out
+        # of run() means no node ran and there is no RunResult to print.
+        if not args.json:
+            raise
+        return _print_prerun_failure_json(wf, e)
 
     friendly = [o.key for o in wf.outputs]
     saved = _save_outputs(result, friendly, args.out) if args.out else {}
@@ -177,7 +225,8 @@ def cmd_run(args):
                    "nodes": {nid: {"status": r.status, "error": r.error,
                                    "costUsd": r.cost_usd, "ms": r.ms}
                              for nid, r in result.nodes.items()},
-                   "errors": result.errors}
+                   "errors": result.errors,
+                   "promptTrims": result.prompt_trims}
         for key in friendly:
             value = result.outputs.get(key)
             if isinstance(value, MediaRef):
@@ -186,6 +235,9 @@ def cmd_run(args):
             else:
                 payload["outputs"][key] = value
         print(json.dumps(payload, indent=2))
+        if failure is not None:
+            print("run failed: %s" % failure, file=sys.stderr)
+            return 1
     else:
         for key in friendly:
             value = result.outputs.get(key)
