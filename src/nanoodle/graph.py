@@ -132,6 +132,21 @@ class Graph(object):
         return any(l.to_node == node_id and l.to_port == port for l in self.links)
 
 
+def optional_node(node):
+    """Author-marked optional node: the editor's "optional" checkbox on an input node.
+
+    ``fields.optional`` makes every input the node surfaces skippable — the run proceeds
+    and the node yields an empty value instead of failing. It is serialized inside fields,
+    so it survives save / share / materialize with zero format changes. Mirrors
+    nanoodle-js graph.mjs optionalNode.
+    """
+    if node is None:
+        return False
+    fields = node.get("fields") if isinstance(node, dict) else getattr(node, "fields", None)
+    v = (fields or {}).get("optional")
+    return v is True or v == "true"
+
+
 def display_name(node):
     """node.name (trimmed) -> type title -> type -> '?' (play.html displayName)."""
     if node is None:

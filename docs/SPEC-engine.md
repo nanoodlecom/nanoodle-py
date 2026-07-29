@@ -169,7 +169,9 @@ The record is written BEFORE the callback fires, because the worker thread can b
 
 ## Local nodes to IMPLEMENT (pure logic)
 - text: out.text = fields.text
-- upload/aupload/vupload: out = the stored/provided data URL
+- upload/aupload/vupload: out = the stored/provided data URL. Empty + author-marked optional
+  (`fields.optional` true or "true") = out is "" and the run continues; consumers drop empty
+  media. Empty and NOT optional = error.
 - choice: options = fields.options.split("\n") non-empty trimmed; out = fields.selected if in options else first; error if no options
 - join: [a,b].filter(non-empty).join(sep) where sep = fields.sep ?? " ", literal "\\n" in sep means newline
 - comment: skip

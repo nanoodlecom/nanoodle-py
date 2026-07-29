@@ -183,5 +183,106 @@ class RunCliTest(MockedTest):
         self.assertIn("9.48", err)
 
 
+class FailedRunJsonTest(MockedTest):
+    """A failed run must still answer --json. An agent caller reads the per-node status,
+    the per-node error, the partial outputs and the cost already spent from stdout."""
+
+    def _argv(self, *extra):
+        return ["run", fixture("partial-failure.json"),
+                "--api-key", "cli-key", "--base-url", self.mock.base_url] + list(extra)
+
+    def _script_one_lane_fails(self):
+        # the llm lane completes and costs money; the image lane fails
+        self.mock.script("POST", "/api/v1/chat/completions",
+                         chat_response("some notes", cost_usd=0.002, balance=9.5))
+        self.mock.script("POST", "/v1/images/generations",
+                         {"status": 400, "json": {"error": "Invalid image input."}})
+
+    def test_failed_run_with_json_prints_the_same_shape_and_exits_1(self):
+        self._script_one_lane_fails()
+        code, out, err = run_cli(self._argv("--json"))
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        # per-node status and error map
+        self.assertEqual(payload["nodes"]["n2"]["status"], "done")
+        self.assertEqual(payload["nodes"]["n3"]["status"], "error")
+        self.assertIn("Invalid image input", payload["nodes"]["n3"]["error"])
+        self.assertEqual([e["node_id"] for e in payload["errors"]], ["n3"])
+        # partial outputs: the lane that finished keeps its value, the failed one is null
+        self.assertEqual(payload["outputs"]["Notes"], "some notes")
+        self.assertIsNone(payload["outputs"]["Picture"])
+        # the money already spent is reported, not lost with the exception
+        self.assertEqual(payload["costUsd"], 0.002)
+        self.assertEqual(payload["remainingBalance"], 9.5)
+        self.assertIn("run failed:", err)
+
+    def test_failed_run_with_json_still_saves_the_partial_media(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("some notes"))
+        self.mock.script("POST", "/v1/images/generations",
+                         {"status": 400, "json": {"error": "Invalid image input."}})
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = os.path.join(d, "out")
+            code, out, _ = run_cli(self._argv("--json", "--out", out_dir))
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertEqual(payload["outputs"]["Notes"], "some notes")
+
+    def test_failed_run_without_json_keeps_the_plain_error_path(self):
+        self._script_one_lane_fails()
+        code, out, err = run_cli(self._argv())
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("error: output node", err)
+
+
+class PreRunFailureJsonTest(MockedTest):
+    """--json must answer the failures that happen BEFORE the first node runs.
+
+    A missing required input is the commonest way an agent's call fails, and it is caught
+    during validation, so there is no RunResult and RunError is never raised. The CLI used
+    to print nothing at all on stdout for it: exit 1, empty stdout, one line on stderr. The
+    docs promised JSON. An agent caller needs it most exactly here.
+    """
+
+    def _argv(self, graph, *extra):
+        return ["run", fixture(graph), "--api-key", "cli-key",
+                "--base-url", self.mock.base_url] + list(extra)
+
+    def test_missing_required_input_prints_json_and_exits_1(self):
+        code, out, err = run_cli(self._argv("needs-input.json", "--json"))
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertEqual([e["message"] for e in payload["errors"]],
+                         ["missing required input: Answer"])
+        self.assertIsNone(payload["errors"][0]["node_id"], "no node ran, so none is named")
+        self.assertEqual(payload["nodes"], {}, "nothing executed")
+        self.assertEqual(payload["costUsd"], 0.0, "and nothing was spent")
+        self.assertEqual(payload["outputs"], {"Answer": None},
+                         "the interface is still described, with no values")
+        self.assertEqual(payload["promptTrims"], [])
+        self.assertIn("error: missing required input", err)
+        self.assertEqual(self.mock.requests, [], "the API was never called")
+
+    def test_unknown_input_key_prints_json_and_exits_1(self):
+        code, out, _ = run_cli(self._argv("needs-input.json", "--json",
+                                          "--input", "Bogus=x"))
+        self.assertEqual(code, 1)
+        self.assertIn("Bogus", json.loads(out)["errors"][0]["message"])
+
+    def test_a_graph_that_cannot_be_read_still_answers_json(self):
+        code, out, err = run_cli(["run", os.path.join(tempfile.gettempdir(), "no-such-graph.json"),
+                                  "--json", "--api-key", "k"])
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertIn("no-such-graph.json", payload["errors"][0]["message"])
+        self.assertEqual(payload["outputs"], {}, "no interface is known, so none is described")
+
+    def test_the_human_path_is_unchanged(self):
+        code, out, err = run_cli(self._argv("needs-input.json"))
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "", "no JSON leaks into the plain path")
+        self.assertIn("error: missing required input: Answer", err)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,8 @@ key-resolution order incl. ambiguity errors (SPEC-io)."""
 import unittest
 
 from tests import fixture
+from tests._util import MockedTest
+from tests.harness import chat_response
 
 from nanoodle import NanoodleError, Workflow
 from nanoodle.iodef import resolve_input_key, resolve_setting_key
@@ -77,7 +79,10 @@ class InputDerivationTest(unittest.TestCase):
         # nodeId.field, which made wf.inputs keys differ between languages
         wf = Workflow.load(fixture("duplicate-names.json"), api_key="k")
         keys = sorted(s.key for s in wf.inputs)
-        self.assertEqual(keys, ["System prompt", "System prompt 2", "Text", "Text 2"])
+        # the two Writer nodes have their prompt wired, so each contributes ONE input
+        # (the optional system prompt) and keeps its custom name as the key — the JS
+        # naming rule, verified against nanoodle-js 0.8.0 on this same fixture
+        self.assertEqual(keys, ["Text", "Text 2", "Writer", "Writer 2"])
         # friendly keys stay addressable and resolve in derivation order
         first = resolve_input_key(wf.inputs, "Text", wf.graph)
         self.assertEqual((first.node_id, first.field), ("n1", "text"))
@@ -109,10 +114,16 @@ class KeyResolutionTest(unittest.TestCase):
         self.assertIn("Persona", msg)
         self.assertIn("Prompt", msg)
 
-    def test_duplicate_custom_names_ambiguous(self):
+    def test_duplicate_names_resolve_by_key_then_report_ambiguity(self):
         wf = Workflow.load(fixture("duplicate-names.json"), api_key="k")
+        # two nodes named Writer: each ADVERTISED key resolves to its own node
+        first = resolve_input_key(wf.inputs, "Writer", wf.graph)
+        self.assertEqual((first.node_id, first.field), ("n3", "system"))
+        second = resolve_input_key(wf.inputs, "Writer 2", wf.graph)
+        self.assertEqual((second.node_id, second.field), ("n4", "system"))
+        # the shared generic label still names two inputs, so it stays ambiguous
         with self.assertRaises(NanoodleError) as ctx:
-            wf.run({"Writer": "x"})   # two nodes named Writer
+            resolve_input_key(wf.inputs, "System prompt", wf.graph)
         self.assertIn("ambiguous", str(ctx.exception))
 
     def test_custom_name_resolves_to_single_required_input(self):
@@ -125,6 +136,7 @@ class KeyResolutionTest(unittest.TestCase):
         self.assertIn("Poet", [s.key for s in wf.inputs])   # the advertised key
         spec = resolve_input_key(wf.inputs, "Poet", wf.graph)
         self.assertEqual((spec.node_id, spec.field), ("n1", "prompt"))
+
 
     def test_same_custom_name_on_two_nodes_resolves_by_advertised_key(self):
         # two DIFFERENT nodes sharing one name: keys are suffixed ("Poet",
@@ -161,6 +173,53 @@ class KeyResolutionTest(unittest.TestCase):
         with self.assertRaises(NanoodleError) as ctx:
             wf.run({"Choice": "purple"})
         self.assertIn("options", str(ctx.exception))
+
+
+
+class DuplicateCustomNamesAtRunTest(MockedTest):
+    def test_duplicate_custom_names_are_no_longer_ambiguous_at_run(self):
+        """The run() path for two nodes sharing a custom name. Deliberately silent.
+
+        Before the nanoodle-js 0.8.0 key rule, wf.run({"Writer": "x"}) on this graph raised
+        "ambiguous". It no longer does: "Writer" is now node n3's OWN advertised key and
+        "Writer 2" is n4's, so the pair is addressable and neither is a guess. The cost of
+        that is real and is pinned here — a caller who meant the SECOND Writer and wrote
+        "Writer" now silently configures the first, where they used to be told to choose.
+        That is the accepted trade for one set of keys across both languages. The generic
+        label they share is still ambiguous, which is the case where nothing is advertised
+        and a guess would be one.
+        """
+        wf = self.wf("duplicate-names.json")
+        self.mock.script("POST", "/api/v1/chat/completions",
+                         [chat_response("one"), chat_response("two")])
+        wf.run({"Writer": "FIRST ONLY"})
+
+        sent = {}
+        for req in self.mock.requests_to("/api/v1/chat/completions"):
+            messages = req.json["messages"]
+            user = [m["content"] for m in messages if m["role"] == "user"][0]
+            system = [m["content"] for m in messages if m["role"] == "system"]
+            sent[user] = system
+        self.assertEqual(sent["alpha"], ["FIRST ONLY"], "n3 — the first Writer — took it")
+        self.assertNotIn("FIRST ONLY", sent["beta"], "n4 was NOT configured, and no error said so")
+
+        # the second Writer is reachable, by the key the interface advertises for it
+        self.mock.reset()
+        self.mock.script("POST", "/api/v1/chat/completions",
+                         [chat_response("one"), chat_response("two")])
+        wf.run({"Writer 2": "SECOND ONLY"})
+        sent = {}
+        for req in self.mock.requests_to("/api/v1/chat/completions"):
+            messages = req.json["messages"]
+            user = [m["content"] for m in messages if m["role"] == "user"][0]
+            sent[user] = [m["content"] for m in messages if m["role"] == "system"]
+        self.assertEqual(sent["beta"], ["SECOND ONLY"])
+        self.assertNotIn("SECOND ONLY", sent["alpha"])
+
+        # what they SHARE is the generic label, and that one still refuses to guess
+        with self.assertRaises(NanoodleError) as ctx:
+            wf.run({"System prompt": "x"})
+        self.assertIn("ambiguous", str(ctx.exception))
 
 
 class OutputDerivationTest(unittest.TestCase):

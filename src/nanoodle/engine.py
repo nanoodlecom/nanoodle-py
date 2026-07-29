@@ -13,7 +13,8 @@ import time
 import urllib.parse
 
 from .errors import NanoodleError
-from .graph import EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name
+from .graph import (EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name,
+                    optional_node)
 from .media import (MEDIA_INLINE_MAX, TRANSCRIBE_MAX_BYTES, MediaRef,
                     b64_image_mime, make_data_url, parse_data_url)
 from .transport import HttpResponse, encode_multipart
@@ -1249,6 +1250,10 @@ def _run_upload(field):
     def run(engine, node, inp, on_cost):
         v = node.fields.get(field)
         if not v:
+            if optional_node(node):
+                # skipped optional input: yield an empty value and let the run continue.
+                # Consumers drop empty media (_collect_ports filters falsy values).
+                return {field: ""}
             raise NanoodleError("no %s provided — supply it as a run input" % field)
         url = _as_url(v)
         return {field: engine._media_ref(url) if not isinstance(v, MediaRef) else v}

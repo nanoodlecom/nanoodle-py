@@ -2,22 +2,49 @@
 
 import copy
 import json
+import queue
 import re
+import sys
 import threading
 import time
-import queue
+import warnings as _warnings
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 
 from .engine import Engine
 from .errors import NanoodleError, RunError, UnsupportedNodeError
-from .graph import (NODE_TYPES, classify_inbound, display_name, materialize,
-                    topo_order, wired_frames_floor)
+from .graph import (NODE_TYPES, Node, classify_inbound, display_name,
+                    materialize, topo_order, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
 from .media import MEDIA_INLINE_MAX, MediaRef, make_data_url
+from .prompt_caps import learn_prompt_cap, with_fitted_prompt
 from .share import decode_share_url, is_share_ref
 from .transport import default_http, resolve_api_key
 from .x402 import assert_payment_option
+
+
+def _disclose(msg):
+    """Tell the caller something about their own run. This can never fail the run.
+
+    nanoodle-js discloses with process.emitWarning, which is advisory by construction. The
+    Python twin of that is warnings.warn, which is NOT: under PYTHONWARNINGS=error or
+    warnings.simplefilter("error") — the normal setting in a strict CI job or test suite —
+    a warning is raised instead of printed. Raised inside a node, it was collected as that
+    node's error and escalated to RunError, so telling the user about a trim KILLED the run
+    that the trim exists to save. A report must never cost more than what it reports.
+
+    So: warn (a filter, a logging bridge and assertWarns all keep working), and if the
+    warning is configured to raise, catch it and put the same sentence on stderr instead.
+    The disclosure is never lost, and neither is the run. The other two channels — the
+    ``prompt-trimmed`` progress event and ``result.prompt_trims`` — are unaffected either way.
+    """
+    try:
+        _warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    except Exception:   # noqa: BLE001 - warnings-as-errors must not fail a run
+        try:
+            print("nanoodle: %s" % msg, file=sys.stderr)
+        except Exception:   # noqa: BLE001 - a closed stderr must not fail a run either
+            pass
 
 
 class NodeRun(object):
@@ -131,13 +158,17 @@ def _note_payment(run, payment):
 
 class RunResult(object):
     def __init__(self, outputs, nodes, errors, cost_usd, cost_exact, remaining_balance,
-                 payments=None):
+                 prompt_trims=None, payments=None):
         self.outputs = outputs                    # friendly key AND node-id key -> value
         self.nodes = nodes                        # node id -> NodeRun
         self.errors = errors                      # [{node_id, name, message}]
         self.cost_usd = cost_usd
         self.cost_exact = cost_exact
         self.remaining_balance = remaining_balance
+        # every prompt this run trimmed to a model's cap: [{node_id, name, from, to, cap}].
+        # A trim changes what the run paid for, so it is disclosed here as well as on the
+        # progress stream — never silently.
+        self.prompt_trims = prompt_trims or []
         # x402 deposits this run asked the wallet to send (empty on a keyed run):
         # [{node_id, payment_id, amount, pay_to, explorer_url, trace, status,
         #   send_error, redeemed}]. status is "sending" | "sent" | "failed" —
@@ -179,7 +210,8 @@ class Workflow(object):
     """
 
     def __init__(self, data, api_key=None, base_url="https://nano-gpt.com",
-                 http=None, poll_intervals=None, timeouts=None, payment=None):
+                 http=None, poll_intervals=None, timeouts=None, payment=None,
+                 catalog=None):
         self.warnings = []
         self.graph = materialize(data, self.warnings)
         # accountless x402: a callback that sends the Nano invoice (never a seed).
@@ -191,6 +223,15 @@ class Workflow(object):
         self.http = http or default_http
         self.poll_intervals = poll_intervals or {}
         self.timeouts = timeouts or {}
+        # opt-in raw model-catalog data ({"audio": [...]}) — data only, never fetched by
+        # this library. Today it supplies the audio models' prompt caps
+        # (supported_parameters.max_chars); see prompt_caps.prompt_cap.
+        self.catalog = catalog
+        # Prompt character caps learned from live 400s ("kind:id" -> cap), on top of the
+        # probed table in prompt_caps.py. Per-instance and in memory: a run that hits an
+        # unknown model's limit teaches the next run of the same Workflow, which is where
+        # a retry actually happens.
+        self._prompt_caps = {}
         self._inputs = None
         self._outputs = None
         self._settings = None
@@ -412,6 +453,7 @@ class Workflow(object):
                 runs[nid] = rec
         lock = threading.Lock()
         cost = {"total": 0.0, "exact": True, "balance": None, "any": False}
+        prompt_trims = []   # every prompt this run had to fit to a model's cap
 
         def progress(evt):
             if on_progress:
@@ -462,7 +504,37 @@ class Workflow(object):
                         continue  # play.html: if(v!=null) — a null upstream value
                                   # leaves the typed field value in effect
                     node.fields[port] = v.url if isinstance(v, MediaRef) else v
-            out = engine.run_node(node, inp, make_on_cost(nid))
+            # Prompt length caps (see prompt_caps.py). Many image/video models reject an
+            # over-long prompt at the route, and in a graph the prompt is WRITTEN by an
+            # upstream LLM — so the caller has nothing to shorten. Trim it to fit rather
+            # than send a request certain to 400, and report the trim. The graph's own
+            # prompts are never rewritten to avoid this.
+            fitted, trimmed = with_fitted_prompt(node, node.fields, catalog=self.catalog,
+                                                 learned=self._prompt_caps)
+            if trimmed is not None:
+                node = Node(node.id, node.type, fitted, node.name)
+                # A fitted prompt changed what this run pays for — never silent, even headless.
+                record = {"node_id": nid, "name": name, "from": trimmed["from"],
+                          "to": trimmed["to"], "cap": trimmed["cap"]}
+                with lock:
+                    prompt_trims.append(record)
+                progress(dict(record, type="prompt-trimmed"))
+                _disclose(
+                    "node %s: prompt trimmed %d -> %d characters — %s rejects prompts over %d"
+                    % (nid, trimmed["from"], trimmed["to"],
+                       node.fields.get("model"), trimmed["cap"]))
+            try:
+                out = engine.run_node(node, inp, make_on_cost(nid))
+            except NanoodleError as e:
+                # A prompt-length rejection is free (nothing was generated) and, once
+                # banked, preventable: the next run fits the prompt before sending. Say
+                # that, rather than relay "please shorten it" about a prompt the caller
+                # never wrote.
+                if learn_prompt_cap(self._prompt_caps, node, str(e)):
+                    raise NanoodleError(
+                        "%s — noted: nanoodle keeps this model's prompt inside that limit "
+                        "from now on, so running again should succeed" % e) from e
+                raise
             return out, time.monotonic() - t0
 
         pool = _DaemonPool(max_workers=max(1, min(8, len(order))),
@@ -589,6 +661,7 @@ class Workflow(object):
                            cost_usd=cost["total"],
                            cost_exact=cost["exact"],
                            remaining_balance=cost["balance"],
+                           prompt_trims=prompt_trims,
                            payments=engine.payments())
         if failed_sinks:
             parts = []
