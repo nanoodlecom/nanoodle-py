@@ -139,7 +139,10 @@ class RunResult(object):
         self.cost_exact = cost_exact
         self.remaining_balance = remaining_balance
         # x402 deposits this run asked the wallet to send (empty on a keyed run):
-        # [{node_id, payment_id, amount, pay_to, explorer_url, trace, redeemed}]
+        # [{node_id, payment_id, amount, pay_to, explorer_url, trace, status,
+        #   send_error, redeemed}]. status is "sending" | "sent" | "failed" —
+        # see Engine.payments(). redeemed is True only when the request the
+        # deposit paid for came back 2xx.
         self.payments = payments or []
 
     def __getitem__(self, key):

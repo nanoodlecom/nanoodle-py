@@ -213,9 +213,18 @@ class Engine(object):
           that put the process hang back at 120 s instead of 600 s.
 
         So it gets whatever the run has left, never less than ``redeem_grace``
-        and never more than ``http_timeout``. A normal run (no deadline, not
-        cancelled) is unchanged: the full http_timeout. An abandoned run gets
-        redeem_grace, which bounds the worst-case process exit.
+        and never more than ``http_timeout``. Exactly, with the defaults:
+
+        - no deadline (``run()`` with no ``timeout=``): http_timeout, 120 s.
+        - live run, more than 120 s of deadline left: 120 s.
+        - live run, 60 s of deadline left: 60 s.
+        - live run, less than 15 s left: redeem_grace, 15 s.
+        - cancelled, or the deadline has passed: redeem_grace, 15 s.
+
+        A run WITH a deadline can therefore get less than http_timeout here.
+        That is deliberate: the run dies at its deadline whatever this one call
+        does, and redeem_grace is the floor that still lets the request land.
+        On an abandoned run redeem_grace is also what bounds process exit.
         """
         if self._deadline is None and not self._cancel.is_set():
             return self.http_timeout
@@ -240,7 +249,10 @@ class Engine(object):
         - ``"failed"`` — the callback raised. No deposit was made, and
           ``send_error`` carries the reason.
 
-        ``redeemed`` is True once the request the deposit paid for came back.
+        ``redeemed`` is True once the request the deposit paid for came back
+        with a 2xx. Any other status leaves it False: the XNO is gone and the
+        caller got nothing for it, so the payment id belongs in the node's
+        error message next to the API's own message.
         """
         with self._payments_lock:
             return [dict(p) for p in self._payments]
@@ -360,7 +372,13 @@ class Engine(object):
             raise NanoodleError(
                 "payment %s settled, but the API still answered 402 on retry — check %s "
                 "before paying again" % (settled["paymentId"], settled.get("statusUrl") or "the payment status"))
-        self._mark_redeemed(record)
+        # Only a 2xx redeems the deposit. On a 500 (or any other error status)
+        # the XNO is gone and the caller got nothing for it, so the deposit
+        # stays unredeemed and Workflow names it in the node error next to the
+        # API's own message. Marking it redeemed here hid the payment id from
+        # the one sentence the user actually reads.
+        if 200 <= resp2.status < 300:
+            self._mark_redeemed(record)
         return resp2
 
     def _settle_402(self, resp):

@@ -229,9 +229,8 @@ class SettleFlowTest(unittest.TestCase):
         self.assertEqual([p["redeemed"] for p in eng.payments()], [True])
         self.assertEqual([p["status"] for p in eng.payments()], ["sent"])
 
-    def test_a_live_run_still_gives_the_paid_retry_the_full_http_budget(self):
-        # The bound above must not shrink the normal path: with no deadline the
-        # paid retry keeps the whole http_timeout, exactly as before.
+    def _budget_of_the_paid_retry(self, deadline_in=None):
+        """Run one paid call and return the socket timeout its retry got."""
         calls = []
 
         def http(method, url, headers=None, body=None, timeout=None):
@@ -245,10 +244,36 @@ class SettleFlowTest(unittest.TestCase):
             raise AssertionError("unexpected url " + url)
 
         eng = make_engine(http, lambda inv: None)
+        if deadline_in is not None:
+            eng.set_run_deadline(time.monotonic() + deadline_in, deadline_in)
         self.assertEqual(self.chat(eng), CHAT_OK)
         retry = [c for c in calls
                  if "/chat/completions" in c[1] and c[2].get("x-x402-payment-id")][0]
-        self.assertEqual(retry[3], eng.http_timeout)
+        return eng, retry[3]
+
+    def test_a_run_with_no_deadline_gives_the_paid_retry_the_full_http_budget(self):
+        # The bound above must not shrink the normal path: with no deadline at
+        # all the paid retry keeps the whole http_timeout, exactly as before.
+        eng, budget = self._budget_of_the_paid_retry()
+        self.assertEqual(budget, eng.http_timeout)
+
+    def test_a_run_with_a_deadline_gives_the_paid_retry_what_the_run_has_left(self):
+        # Pins what _redeem_timeout ACTUALLY does, which is not "a live run gets
+        # the full 120 s". A live run gets the time its own deadline has left,
+        # floored at redeem_grace and capped at http_timeout. The floor is the
+        # part that matters for money — the request still lands — and the cap is
+        # the part that matters for exit.
+        eng, budget = self._budget_of_the_paid_retry(deadline_in=300.0)
+        self.assertEqual(budget, eng.http_timeout, "capped at http_timeout")
+
+        eng, budget = self._budget_of_the_paid_retry(deadline_in=60.0)
+        self.assertLess(budget, eng.http_timeout,
+                        "a 60 s run does not get the full 120 s")
+        self.assertGreater(budget, 55.0)
+
+        eng, budget = self._budget_of_the_paid_retry(deadline_in=5.0)
+        self.assertEqual(budget, eng.redeem_grace,
+                         "floored at redeem_grace so the paid request can land")
 
     def test_a_cancelled_run_starts_no_new_payment(self):
         # The other side of the same rule: no new money may leave the wallet for
@@ -425,6 +450,71 @@ class WalletCallbackFailureTest(unittest.TestCase):
             stop.set()
             for t in threads:
                 t.join(5.0)
+
+
+class PaidRetryFailsTest(unittest.TestCase):
+    """MONEY: the deposit settled, the paid retry then answered an ERROR status.
+
+    The XNO is gone and the caller got nothing for it, so this deposit is NOT
+    redeemed. Marking it redeemed dropped the payment id out of the one
+    sentence a user reads — the node error — and left it only in
+    result.payments, which almost nobody looks at.
+    """
+
+    GRAPH = {"v": 1, "links": [], "nodes": [
+        {"id": "n1", "type": "llm", "fields": {"model": "m", "prompt": "hi"}}]}
+
+    def http_500_on_retry(self, method, url, headers=None, body=None, timeout=None):
+        if "/chat/completions" in url:
+            if headers.get("x-x402-payment-id"):
+                return json_resp(500, {"error": "model overloaded"})
+            return json_resp(402, fresh_402())
+        if "/api/x402/complete/" in url:
+            return json_resp(200, {"status": "completed", "paymentId": "pay_x"})
+        raise AssertionError("unexpected url " + url)
+
+    def test_a_paid_retry_that_errors_leaves_the_deposit_unredeemed(self):
+        eng = make_engine(self.http_500_on_retry, lambda inv: None)
+        with self.assertRaisesRegex(NanoodleError, "500"):
+            eng._post_json("/api/v1/chat/completions", {"model": "m", "messages": []})
+        ledger = eng.payments()
+        self.assertEqual([p["status"] for p in ledger], ["sent"])
+        self.assertFalse(ledger[0]["redeemed"],
+                         "the API errored — this deposit bought nothing")
+        self.assertEqual(len(eng.unredeemed_payments()), 1)
+
+    def test_the_payment_id_reaches_the_node_error_when_the_paid_call_fails(self):
+        wf = Workflow.from_dict(self.GRAPH, api_key="", base_url=BASE,
+                                http=self.http_500_on_retry,
+                                poll_intervals={"x402": 0.02},
+                                payment=lambda inv: None)
+        with self.assertRaises(RunError) as ctx:
+            wf.run()
+        result = ctx.exception.result
+        message = result.nodes["n1"].error
+        pid = result.payments[0]["payment_id"]
+        self.assertIn("model overloaded", message)
+        self.assertIn("a Nano deposit was already sent", message)
+        self.assertIn(pid, message,
+                      "money left the wallet, the API errored, and the error "
+                      "the user reads carried no payment id")
+        self.assertIn(pid, ctx.exception.result.errors[0]["message"])
+
+    def test_a_paid_retry_that_succeeds_still_redeems(self):
+        # the no-regression guard for the bound above
+        def http(method, url, headers=None, body=None, timeout=None):
+            if "/chat/completions" in url:
+                if headers.get("x-x402-payment-id"):
+                    return json_resp(200, CHAT_OK)
+                return json_resp(402, fresh_402())
+            if "/api/x402/complete/" in url:
+                return json_resp(200, {"status": "completed", "paymentId": "pay_x"})
+            raise AssertionError("unexpected url " + url)
+
+        eng = make_engine(http, lambda inv: None)
+        eng._post_json("/api/v1/chat/completions", {"model": "m", "messages": []})
+        self.assertEqual([p["redeemed"] for p in eng.payments()], [True])
+        self.assertEqual(eng.unredeemed_payments(), [])
 
 
 class TimedOutRunKeepsThePaymentTraceableTest(unittest.TestCase):

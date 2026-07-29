@@ -113,13 +113,25 @@ This matters because a live worker can block interpreter exit, not just `run()`.
 
 A daemon thread is frozen at interpreter finalization, which is right for a poll loop and wrong in the middle of a wallet callback. Those spans mark themselves money-critical (`engine._money_critical`) and an atexit hook waits up to `EXIT_MONEY_GRACE` (5 s) for them, then exits anyway.
 
+A frozen daemon also never reaches the `finally` that kills its ffmpeg child. Local media nodes shell out to ffmpeg/ffprobe, so every child `local_media._run` starts is registered and a second atexit hook kills whatever is still alive (`local_media._kill_children_at_exit`, hard-bounded by `EXIT_CHILD_GRACE`, 2 s). Without it a quiet child — `ffprobe -v error`, which writes nothing until it is done — outlives the interpreter with no backstop at all. A chatty ffmpeg dies on its own about 1.5 to 2.0 s later, when its next stderr write hits the closed pipe.
+
 ### What the deadline must NOT bound
 The deadline governs work the run is still doing. Two things have a different lifetime and stay outside it:
 - **Media of a value the run already returned.** Every `MediaRef` carries `engine.fetch_media` as its lazy fetcher, and the caller may call it any time after `run()` returns — the CLI does exactly that in `_save_outputs`. That download uses the full `http_timeout` and never checks the cancel flag, so a successful run keeps its output and a lane that finished keeps its media after a sibling lane timed out. Fetches the run itself makes (`local_fetcher`, inlining hosted audio, transcribe input) pass `run_bound=True` and do stop with the run.
-- **The request a settled x402 deposit paid for.** Once `_settle_402` returns, real XNO has left the wallet. The retry carrying `x-x402-payment-id` is not cancelled by the deadline: a settled payment with no request ever sent is a money bug. Its budget is bounded, though, because it runs on a worker the run may already have abandoned. `_redeem_timeout()` gives it whatever the run has left, never less than `redeem_grace` (15 s) and never more than `http_timeout` (120 s). A live run is unchanged and gets the full 120 s; an abandoned one gets 15 s. The full 120 s on an abandoned worker re-created the process hang at 120 s.
+- **The request a settled x402 deposit paid for.** Once `_settle_402` returns, real XNO has left the wallet. The retry carrying `x-x402-payment-id` is not cancelled by the deadline: a settled payment with no request ever sent is a money bug. Its budget is bounded, though, because it runs on a worker the run may already have abandoned. `_redeem_timeout()` gives it whatever the run has left, never less than `redeem_grace` (15 s) and never more than `http_timeout` (120 s). Exactly:
+
+| run state | socket budget for the paid retry |
+|---|---|
+| no `timeout=` (no deadline) | `http_timeout` — 120 s, unchanged |
+| live, more than 120 s of deadline left | 120 s |
+| live, 60 s of deadline left | 60 s |
+| live, less than 15 s left | 15 s (`redeem_grace`) |
+| cancelled or past the deadline | 15 s (`redeem_grace`) |
+
+So a run WITH a deadline can give the paid retry less than `http_timeout`. That is intentional and it is not a loss: the run dies at its deadline whatever this call does, and `redeem_grace` is the floor that keeps the request itself alive. The full 120 s on an abandoned worker re-created the process hang at 120 s.
 
 ### Traceability of a sent deposit
-The engine keeps a ledger of every deposit it asked the callback to send: `node_id`, `payment_id`, `amount`, `pay_to`, `explorer_url`, `trace`, `status`, `send_error`, `redeemed`.
+The engine keeps a ledger of every deposit it asked the callback to send: `node_id`, `payment_id`, `amount`, `pay_to`, `explorer_url`, `trace`, `status`, `send_error`, `redeemed`. `redeemed` turns True only when the request the deposit paid for answered 2xx; a settled deposit whose paid retry answered 500 stays unredeemed, so the payment id reaches the node's error message next to the API's own message.
 
 The record is written BEFORE the callback fires, because the worker thread can be abandoned at any point after that and an abandoned future's exception surfaces nowhere. It therefore opens at `status="sending"`, which claims nothing. It becomes `"sent"` only when the callback RETURNS, and `"failed"` with a `send_error` when the callback raises. A ledger that said "sent" for a wallet callback that failed would send a person hunting an explorer for money that never moved.
 

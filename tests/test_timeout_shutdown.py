@@ -16,6 +16,8 @@ import contextlib
 import io
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,30 @@ SETTLE_BOUND = 10.0
 EXIT_BOUND = 25.0
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _child_alive(pid):
+    """True while `pid` runs. The process is NOT our child (its parent exited),
+    so wait() cannot answer and a zombie never appears — it is reparented."""
+    try:
+        with open("/proc/%d/stat" % pid, "r") as f:
+            return f.read().rsplit(") ", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _reap(pid):
+    """Never leave an orphan behind, whatever the assertions decided."""
+    if _child_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 class AbandonedWorkerTest(MockedTest):
@@ -195,6 +221,74 @@ print("returned %.3f paid_requests %d" % (time.monotonic() - t0, len(paid)), flu
 '''
 
 
+# The local-media twin. A daemon worker sits inside local_media._run — the exact
+# call every local media node executor makes, with the cancel_check and deadline
+# engine._local_opts() hands it — and its child is still running when the
+# process exits. That child must not outlive the parent.
+#
+# The child here is a QUIET ffprobe: `-v error`, the same flag
+# resize_crop_image() passes, and it prints nothing until it is done. A CHATTY
+# ffmpeg has a backstop this one does not — its next stderr write hits the
+# closed pipe, SIGPIPE kills it, and it dies about 1.5 to 2.0 s after the parent
+# (measured). A quiet probe never writes, so nothing ever tells it to stop: it
+# was still running 45 s later. This is the case that needs the exit hook.
+_FFMPEG_CHILD = r'''
+import os, subprocess, sys, threading, time
+sys.path.insert(0, {root!r})
+sys.path.insert(0, {src!r})
+
+from nanoodle.engine import Engine
+from nanoodle import local_media
+from nanoodle.workflow import _DaemonPool
+
+started = threading.Event()
+pids = []
+_real_popen = subprocess.Popen
+
+def _spy(*a, **k):
+    p = _real_popen(*a, **k)
+    pids.append(p.pid)
+    print("child_pid %d" % p.pid, flush=True)
+    started.set()
+    return p
+
+subprocess.Popen = _spy   # report the child PID to the parent test
+
+def running(pid):
+    # p.poll() would race the worker thread's communicate(), so read /proc.
+    # Unknown (no /proc) counts as running: the parent test then decides.
+    try:
+        with open("/proc/%d/stat" % pid, "r") as f:
+            return f.read().rsplit(") ", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+engine = Engine(api_key="k", base_url="http://127.0.0.1:1", http=None)
+engine.set_run_deadline(time.monotonic() + 60.0, 60.0)
+pool = _DaemonPool(max_workers=1)
+
+# Counting every frame of a 600 s source: minutes of work, and not one byte of
+# output until it finishes.
+ARGS = ["-v", "error", "-count_frames", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",
+        "-f", "lavfi", "testsrc=size=1920x1080:rate=30:duration=600"]
+
+def work():
+    return local_media._run("ffprobe", ARGS, timeout=600.0,
+                            cancel_check=engine.check_cancel,
+                            deadline=engine._deadline)
+
+pool.submit(work)
+started.wait(20)
+time.sleep(0.3)
+engine.cancel()          # what Workflow._execute does when the deadline fires
+# Was there anything left to orphan? An ffmpeg build that cannot open the lavfi
+# source answers 0, and the parent test skips instead of passing on nothing.
+print("still_running %d" % (1 if pids and running(pids[0]) else 0), flush=True)
+print("exiting", flush=True)
+'''
+
+
 class ProcessExitTest(unittest.TestCase):
     """End-to-end proof: the whole interpreter exits, not just run().
 
@@ -252,6 +346,49 @@ class ProcessExitTest(unittest.TestCase):
             self.assertIn("paid_requests 1", p.stdout,
                           "the settled deposit never got the request it paid for")
             self.assertLess(elapsed, EXIT_BOUND)
+
+    @unittest.skipUnless(shutil.which("ffprobe"), "ffprobe is not on PATH")
+    def test_no_local_media_child_outlives_the_process(self):
+        # Daemon workers closed the process hang and opened this: a daemon
+        # thread is frozen at finalization, so the `finally: p.kill()` inside
+        # local_media._run never runs, and the ffmpeg/ffprobe child keeps a CPU
+        # after the parent is gone. Measured with the atexit hook removed, the
+        # quiet probe below was still running 45 s later.
+        # local_media._kill_children_at_exit reaps it, and atexit hooks still
+        # run at that point.
+        src = _FFMPEG_CHILD.format(root=_REPO_ROOT,
+                                   src=os.path.join(_REPO_ROOT, "src"))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ffmpeg_child.py")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(src)
+            t0 = time.monotonic()
+            try:
+                p = subprocess.run([sys.executable, path], cwd=_REPO_ROOT,
+                                   capture_output=True, text=True,
+                                   timeout=EXIT_BOUND)
+            except subprocess.TimeoutExpired:
+                self.fail("the child process did not exit within %.0fs — the "
+                          "child reaper is holding interpreter shutdown"
+                          % EXIT_BOUND)
+            elapsed = time.monotonic() - t0
+        self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+        pids = [int(line.split()[1]) for line in p.stdout.splitlines()
+                if line.startswith("child_pid ")]
+        self.assertEqual(len(pids), 1, p.stdout)
+        if "still_running 1" not in p.stdout:
+            self.skipTest("this ffprobe build finished the probe too early to "
+                          "leave anything to orphan")
+        # The parent is gone. Give the kill a moment to land, then look.
+        self.addCleanup(_reap, pids[0])
+        end = time.monotonic() + 5.0
+        while _child_alive(pids[0]) and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertFalse(
+            _child_alive(pids[0]),
+            "ffprobe pid %d outlived the process that started it — an abandoned "
+            "daemon worker orphaned its child" % pids[0])
+        self.assertLess(elapsed, EXIT_BOUND)
 
 
 class OutputsOutliveTheDeadlineTest(MockedTest):
