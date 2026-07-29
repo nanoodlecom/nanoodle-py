@@ -115,13 +115,25 @@ A daemon thread is frozen at interpreter finalization, which is right for a poll
 
 A frozen daemon also never reaches the `finally` that kills its ffmpeg child. Local media nodes shell out to ffmpeg/ffprobe, so every child `local_media._run` starts is registered and a second atexit hook kills whatever is still alive (`local_media._kill_children_at_exit`, hard-bounded by `EXIT_CHILD_GRACE`, 2 s).
 
-**That hook is the only thing that bounds an orphaned child. Do not remove it.** There is no SIGPIPE backstop:
-- A quiet child — `ffprobe -v error`, which writes nothing until it is done — never writes to the closed pipe at all, so nothing tells it to stop.
-- A chatty `ffmpeg` writes about twice a second and still does not stop, because **ffmpeg sets SIGPIPE to `SIG_IGN` itself** (`SigIgn` bit 13 in `/proc/PID/status`). Its writes fail with `EPIPE`, `av_log` discards the error, and it runs on.
+**That hook is the only thing that bounds an orphaned child. Do not remove it. SIGPIPE is not a backstop, because it is a race that the orphan usually wins.**
 
-Measured with the hook removed (`scripts/measure-timeout-hang.py --chatty --no-reaper`) on Linux 6.14 with ffmpeg 7.1.1 — times vary with machine and load, the outcome does not: a chatty ffmpeg was still running 45 s after its parent exited, 8 runs out of 8. With the hook it died in the same 0.00 s as the quiet probe, 8 runs out of 8. An earlier revision of this document said a chatty ffmpeg "dies on its own about 1.5 to 2.0 s later". That was wrong and it is retracted.
+- A quiet child — `ffprobe -v error`, the flag every `local_media` probe passes — writes nothing until it is done. It never touches the closed pipe, so nothing tells it to stop, ever.
+- A chatty `ffmpeg` writes to stderr about twice a second, so it does touch the closed pipe. Whether that kills it depends on WHEN the parent died: `ffmpeg` sets SIGPIPE to `SIG_IGN` itself (the SIGPIPE bit of `SigIgn` in `/proc/PID/status`, mask `…1000`) a fraction of a second after it starts. Measured with `--when`: 0.08 to 0.11 s on an idle machine, 0.39 to 0.61 s on a busy one, 19 runs in total. Before that point the next write kills the child. After it, the writes fail with `EPIPE`, `av_log` discards the error, and the child runs on to the end of its work.
 
-The signal itself still works — `ffprobe` does not ignore it (`SigIgn` bit 13 clear), and the same harness with a chatty probe (`ffprobe -show_frames -of csv` on the same source) killed the child 0.01 s after its parent, 5 runs out of 5. It is `ffmpeg` that opts out. No `local_media` ffprobe call is chatty either: they all pass `-v error`. Do not rely on SIGPIPE anywhere.
+`scripts/measure-orphan-sigpipe.py` reads the REAL fate of the orphan: it makes itself a child subreaper, so `waitpid()` reports the exit status of a process whose parent is gone. On Linux 6.14, ffmpeg 7.1.1, Python 3.11.10. **Every count below moves with the machine and its load** — the start-up of ffmpeg is what varies, and this box was shared with other work:
+
+| the parent dies … | the orphaned chatty ffmpeg | runs |
+|---|---|---|
+| 0.05 s after the child starts | killed by SIGPIPE, 11 of 11 | 11 |
+| 0.4 s after | killed by SIGPIPE 11 times, alive at the end of the 12 s wait 13 times | 24 |
+| 1.0 s after | alive at the end of the wait 7 times, killed once | 8 |
+| 3.0 s after | alive at the end of the wait, 6 of 6 | 6 |
+
+The 0.4 s row is the one that matters, because that is where an abandoned worker of this library lands, and there the answer is a coin flip. Through the library harness itself (`scripts/measure-timeout-hang.py --chatty --no-reaper`), a chatty ffmpeg was still running 45 s after its parent in 14 of 16 runs, and died 0.33 s and 1.74 s after it in the other 2. Only children that had NOT yet reached their `SIG_IGN` call died; every child that had reached it survived (6 runs, each correlated against `/proc/PID/status`). With the hook, the same chatty child was dead at the first check after the parent exited (0.00 s, 8 runs out of 8).
+
+Two earlier revisions of this document each wrote down one side of that race as a fact — first "a chatty ffmpeg dies on its own about 1.5 to 2.0 s later", then "still running 45 s after its parent, 8 runs out of 8". Both are retracted. The orphan usually survives, sometimes dies, and nothing in this library decides which.
+
+`ffprobe` is the one predictable case: it does not ignore SIGPIPE at all, so a chatty probe (`--chatty-probe`, `ffprobe -show_frames -of csv` on the same source) died 0.02 to 0.04 s after its parent, 8 runs out of 8. No `local_media` ffprobe call is chatty, though — they all pass `-v error`. Do not depend on SIGPIPE anywhere.
 
 ### What the deadline must NOT bound
 The deadline governs work the run is still doing. Two things have a different lifetime and stay outside it:

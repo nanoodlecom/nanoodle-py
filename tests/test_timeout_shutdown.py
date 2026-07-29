@@ -230,13 +230,15 @@ print("returned %.3f paid_requests %d" % (time.monotonic() - t0, len(paid)), flu
 # resize_crop_image() passes, and it prints nothing until it is done. It has no
 # backstop of any kind — nothing ever tells it to stop.
 #
-# There is NO SIGPIPE backstop for a chatty child either, which is the case that
-# matters most, because ffmpeg is what does the long work. `ffmpeg` sets SIGPIPE
-# to SIG_IGN itself (SigIgn bit 13 in /proc/PID/status), so its stderr writes to
-# the pipe the dead parent closed fail with EPIPE and it carries on. Measured
-# with the exit hook removed, a chatty ffmpeg was still running 45 s after its
-# parent, 8 runs out of 8. `local_media._kill_children_at_exit` is the ONLY
-# thing that bounds an orphaned child. Do not remove it.
+# SIGPIPE is no backstop for a chatty child either, and that is the case that
+# matters most, because ffmpeg is what does the long work. ffmpeg sets SIGPIPE
+# to SIG_IGN itself a fraction of a second after it starts (0.08-0.19 s idle
+# here, later under load), so whether the closed pipe kills it is a race with
+# its own start-up: measured with the exit hook removed, a chatty ffmpeg was
+# still running 45 s after its parent in 14 of 16 runs and died in the other 2.
+# See docs/SPEC-engine.md and scripts/measure-orphan-sigpipe.py.
+# `local_media._kill_children_at_exit` is the ONLY thing that bounds an orphaned
+# child. Do not remove it.
 #
 # `bin`, `args` and `reaper` are format fields so that
 # scripts/measure-timeout-hang.py can run the chatty case and the
@@ -251,6 +253,13 @@ QUIET_PROBE_ARGS = ["-v", "error", "-count_frames", "-select_streams", "v:0",
 CHATTY_FFMPEG_ARGS = ["-f", "lavfi",
                       "-i", "testsrc=size=1920x1080:rate=30:duration=600",
                       "-f", "null", "-"]
+# A chatty PROBE on the same source: it writes a CSV line per frame to stdout.
+# ffprobe does not ignore SIGPIPE, so this one shows that the signal itself
+# works here and that it is ffmpeg which opts out. No local_media call is
+# chatty like this — they all pass `-v error`.
+CHATTY_PROBE_ARGS = ["-show_frames", "-of", "csv",
+                     "-f", "lavfi", "-i",
+                     "testsrc=size=1920x1080:rate=30:duration=600"]
 
 _FFMPEG_CHILD = r'''
 import atexit, os, subprocess, sys, threading, time

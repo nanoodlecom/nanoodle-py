@@ -22,6 +22,10 @@ with an ffprobe child running when the process exits).
     python3 scripts/measure-timeout-hang.py --no-x402 --video-timeouts "" \
         --chatty --no-reaper --ffmpeg-runs 8 --hard-limit 45
 
+    # the same question for a chatty ffprobe, which does NOT ignore SIGPIPE
+    python3 scripts/measure-timeout-hang.py --no-x402 --video-timeouts "" \
+        --chatty-probe --no-reaper --ffmpeg-runs 5 --hard-limit 45
+
 Make a pre-fix tree with:
 
     mkdir /tmp/prefix && git archive <commit> | tar -x -C /tmp/prefix
@@ -39,9 +43,18 @@ _REPO_ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _REPO_ROOT)
 
 from tests.test_timeout_shutdown import (CHATTY_FFMPEG_ARGS,  # noqa: E402
-                                         QUIET_PROBE_ARGS, _CHILD,
-                                         _FFMPEG_CHILD, _X402_CHILD,
+                                         CHATTY_PROBE_ARGS, QUIET_PROBE_ARGS,
+                                         _CHILD, _FFMPEG_CHILD, _X402_CHILD,
                                          _child_alive)
+
+
+def _child_spec(chatty=False, chatty_probe=False):
+    """Which local-media child to start: (binary, args)."""
+    if chatty_probe:
+        return "ffprobe", CHATTY_PROBE_ARGS
+    if chatty:
+        return "ffmpeg", CHATTY_FFMPEG_ARGS
+    return "ffprobe", QUIET_PROBE_ARGS
 
 
 def measure(tree, video_timeout, run_timeout, poll, hard_limit):
@@ -91,20 +104,22 @@ def measure_x402(tree, run_timeout, hard_limit):
         return returned, exited, paid
 
 
-def measure_ffmpeg(tree, hard_limit, chatty=False, reaper=True):
+def measure_ffmpeg(tree, hard_limit, chatty=False, reaper=True,
+                   chatty_probe=False):
     """Local media: a daemon worker is inside local_media._run with a child
     running when the process exits. Returns (exit_secs, orphan_secs, gave_up),
     where orphan_secs is how long the child outlived its parent and gave_up
     says the child was STILL running when the wait ran out.
 
     `chatty` swaps the quiet ffprobe for an ffmpeg that writes a progress line
-    to stderr about twice a second. `reaper=False` removes the atexit hook, so
-    the two together answer: does SIGPIPE bound an orphaned child on its own?
+    to stderr about twice a second. `chatty_probe` swaps it for an ffprobe that
+    writes a CSV line per frame. `reaper=False` removes the atexit hook, so
+    those together answer: does SIGPIPE bound an orphaned child on its own?
     """
+    binary, child_args = _child_spec(chatty=chatty, chatty_probe=chatty_probe)
     src = _FFMPEG_CHILD.format(
         root=tree, src=os.path.join(tree, "src"), reaper=reaper,
-        bin="ffmpeg" if chatty else "ffprobe",
-        args=CHATTY_FFMPEG_ARGS if chatty else QUIET_PROBE_ARGS)
+        bin=binary, args=child_args)
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "ffmpeg_child.py")
         with open(path, "w", encoding="utf-8") as f:
@@ -146,6 +161,9 @@ def main(argv=None):
                     help="skip the local-media child-reap measurement")
     ap.add_argument("--chatty", action="store_true",
                     help="local media: use a chatty ffmpeg, not a quiet ffprobe")
+    ap.add_argument("--chatty-probe", action="store_true",
+                    help="local media: use a chatty ffprobe (it does NOT ignore "
+                         "SIGPIPE, unlike ffmpeg)")
     ap.add_argument("--no-reaper", action="store_true",
                     help="local media: remove the atexit child reaper first")
     ap.add_argument("--ffmpeg-runs", type=int, default=1,
@@ -177,14 +195,15 @@ def main(argv=None):
                   "paid requests sent %s" % (returned, exited, paid))
     if not args.no_ffmpeg:
         print()
+        binary, child_args = _child_spec(chatty=args.chatty,
+                                         chatty_probe=args.chatty_probe)
         print("local media: a daemon worker is inside local_media._run with a "
               "%s child running when the process exits (child reaper %s)"
-              % ("chatty ffmpeg" if args.chatty else "quiet ffprobe",
-                 "OFF" if args.no_reaper else "ON"))
+              % (" ".join([binary] + child_args), "OFF" if args.no_reaper else "ON"))
         for i in range(args.ffmpeg_runs):
             exited, orphan, gave_up = measure_ffmpeg(
                 tree, args.hard_limit, chatty=args.chatty,
-                reaper=not args.no_reaper)
+                reaper=not args.no_reaper, chatty_probe=args.chatty_probe)
             if exited is None:
                 print("  run %d: did not exit within %.0f s" % (i + 1, args.hard_limit))
             elif orphan is None:
