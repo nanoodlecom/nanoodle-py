@@ -160,6 +160,30 @@ class SettleFlowTest(unittest.TestCase):
         with self.assertRaisesRegex(NanoodleError, "expired.*nano_"):
             self.chat(eng)
 
+    def test_run_deadline_stops_the_settle_poll_and_stays_traceable(self):
+        # The payment window is 15 minutes. Without a deadline check this loop
+        # polls for all 15, and the non-daemon worker thread holds interpreter
+        # shutdown for the same 15 minutes.
+        polls = []
+
+        def http(method, url, headers=None, body=None, timeout=None):
+            if "/chat/completions" in url:
+                return json_resp(402, fresh_402())
+            polls.append(url)
+            return json_resp(402, {"error": "Payment not verified", "status": "pending"})
+
+        eng = make_engine(http, lambda inv: None)
+        eng.set_run_deadline(time.monotonic() + 0.2, 0.2)
+        t0 = time.monotonic()
+        with self.assertRaises(NanoodleError) as ctx:
+            self.chat(eng)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        # the deposit may already be on-chain: the message must name it
+        msg = str(ctx.exception)
+        self.assertIn("pay_", msg)
+        self.assertIn("nano_", msg)
+        self.assertGreater(len(polls), 0, "it did poll before giving up")
+
     def test_no_nano_option_is_actionable_and_unpaid(self):
         paid = []
         no_nano = {"accepts": [a for a in FIXTURE_402["accepts"] if a["scheme"] != "nano"]}

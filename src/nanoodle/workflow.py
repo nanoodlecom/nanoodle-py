@@ -365,7 +365,8 @@ class Workflow(object):
             out = engine.run_node(node, inp, make_on_cost(nid))
             return out, time.monotonic() - t0
 
-        pool = ThreadPoolExecutor(max_workers=max(1, min(8, len(order))))
+        pool = ThreadPoolExecutor(max_workers=max(1, min(8, len(order))),
+                                  thread_name_prefix="nanoodle-run")
         pending = {}   # future -> node id
         settled = set()
         abandoned = False   # deadline hit with nodes still in flight
@@ -414,6 +415,11 @@ class Workflow(object):
                     # timeout in the result NOW; the worker threads are left to
                     # finish in the pool but their results are discarded.
                     abandoned = True
+                    # Tell those threads to stop. Pool threads are NOT daemons
+                    # and concurrent.futures joins them at interpreter exit, so
+                    # a thread still polling a dead run would hang the whole
+                    # process until its own node timeout (video: 600 s).
+                    engine.cancel()
                     for fut, nid in list(pending.items()):
                         run = runs[nid]
                         run.status = "error"

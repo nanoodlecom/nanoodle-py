@@ -109,6 +109,11 @@ result = wf.run(
 )
 ```
 
+`timeout=` bounds the whole run. When it fires, `run()` returns straight away
+and the in-flight nodes stop polling within about a second, so the process is
+free to exit. Without `timeout=`, each node still waits out its own limit
+(video 600 s, audio 300 s).
+
 `run()` raises `RunError` when an output (sink) node fails — `error.result`
 still has partial results, per-node statuses, and cost so far. Failures in
 lanes no output depends on only appear in `result.errors`. Unknown/unsupported

@@ -103,6 +103,14 @@ Present-but-zero = known-included (subscription), keep 0. Absent → cost unknow
 - else → error "<status>: <body first 160 chars>".
 No streaming retries needed (engine is non-streaming). Poll GET failures: silently continue the loop until timeout.
 
+## Run deadline (`run(timeout=…)`)
+A run-level timeout sets an absolute deadline on the engine. The deadline outranks every per-node timeout:
+- The video and audio status-poll loops check the deadline before and after each sleep, and stop at once when it passes. `timeout_video` (600 s) and `timeout_audio` (300 s) only apply while the deadline is in the future.
+- The sleep between poll attempts is interruptible. It waits on a cancel event and never sleeps past the deadline.
+- Per-request socket timeouts are capped at the time left, so one read cannot outlive the deadline by up to `http_timeout` (120 s).
+- The x402 settle poll stops at the deadline too. Its error names the payment id and explorer URL so a sent deposit stays traceable.
+This matters because the worker threads are not daemons: `concurrent.futures` joins each one at interpreter exit. A thread still polling an abandoned run blocks the whole process, not just `run()`. With no `timeout=`, no deadline exists and every loop behaves exactly as it did before.
+
 ## Execution (runGraph 3000-3133)
 1. Alias/filter nodes (materialize): audio→tts, drop unknown types + orphaned links, migrate music/tts inbound "text" port → "prompt".
 2. Kahn topological order; cyclic → error naming the cyclic nodes.

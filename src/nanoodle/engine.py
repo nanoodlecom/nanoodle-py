@@ -7,6 +7,7 @@ is by node TYPE only.
 
 import json
 import re
+import threading
 import time
 import urllib.parse
 
@@ -65,17 +66,70 @@ class Engine(object):
         # media / long poll loops can stop promptly.
         self._deadline = None          # time.monotonic() absolute, or None
         self._timeout_secs = None      # original timeout for error messages
+        # Latched by cancel() / the deadline. Poll loops wait on it instead of
+        # time.sleep(), so an abandoned node wakes in milliseconds and its
+        # thread can die. Without it the non-daemon pool threads keep polling
+        # and the interpreter's atexit thread-join hangs the whole process.
+        self._cancel = threading.Event()
 
     def set_run_deadline(self, deadline, timeout_secs=None):
         self._deadline = deadline
         self._timeout_secs = timeout_secs
 
-    def check_cancel(self):
-        """Raise if the workflow deadline has passed. Safe no-op when no deadline."""
+    def cancel(self):
+        """Abandon every in-flight node now. Poll loops and interruptible sleeps
+        wake immediately. Called by Workflow when a run deadline expires."""
+        self._cancel.set()
+
+    def cancelled(self):
+        """True once the run is cancelled or the deadline has passed.
+
+        The deadline latches the event, so a thread already blocked in
+        ``sleep()`` wakes on the next slice instead of the next poll timeout.
+        With no deadline and no cancel this is always False.
+        """
+        if self._cancel.is_set():
+            return True
         if self._deadline is not None and time.monotonic() > self._deadline:
+            self._cancel.set()
+            return True
+        return False
+
+    def check_cancel(self):
+        """Raise if the run is cancelled. Safe no-op when no deadline is set."""
+        if self.cancelled():
             msg = ("run timed out after %ss" % self._timeout_secs
                    if self._timeout_secs is not None else "run cancelled")
             raise NodeCancelled(msg)
+
+    def sleep(self, seconds):
+        """Sleep, but wake early when the run is cancelled or the deadline passes.
+
+        A run with no deadline and no cancel gets a plain time.sleep(), so
+        normal runs keep today's behaviour exactly.
+        """
+        if seconds is None or seconds <= 0:
+            return
+        if self._deadline is None and not self._cancel.is_set():
+            time.sleep(seconds)
+            return
+        if self._deadline is not None:
+            # cap the wait at the remaining deadline so the caller re-checks
+            # promptly even if nobody calls cancel()
+            seconds = min(seconds, max(0.0, self._deadline - time.monotonic()))
+        self._cancel.wait(seconds)
+
+    def _http_timeout_now(self):
+        """Socket timeout for the next request, clamped to the run deadline.
+
+        Without a deadline this is the configured http timeout, unchanged. With
+        one it never exceeds the time left, so an abandoned node cannot block
+        for the full 120 s inside a single read.
+        """
+        if self._deadline is None:
+            return self.http_timeout
+        self.check_cancel()
+        return max(0.05, min(self.http_timeout, self._deadline - time.monotonic()))
 
     def local_fetcher(self):
         """Adapter for local_media: callable(url) -> bytes (drops content-type)."""
@@ -113,7 +167,8 @@ class Engine(object):
         the original request stamped with the settled payment id. Each API call
         pays at most once; a second 402 after settling is an error, never a
         second send."""
-        resp = self.http(method, url, headers=headers, body=body, timeout=self.http_timeout)
+        resp = self.http(method, url, headers=headers, body=body,
+                         timeout=self._http_timeout_now())
         if resp.status != 402 or self._payment is None or self._api_key:
             return resp
         settled = self._settle_402(resp)
@@ -121,7 +176,8 @@ class Engine(object):
             return settled["response"]  # complete replayed the stored request
         retry_headers = dict(headers)
         retry_headers["x-x402-payment-id"] = settled["paymentId"]
-        resp2 = self.http(method, url, headers=retry_headers, body=body, timeout=self.http_timeout)
+        resp2 = self.http(method, url, headers=retry_headers, body=body,
+                          timeout=self._http_timeout_now())
         if resp2.status == 402:
             raise NanoodleError(
                 "payment %s settled, but the API still answered 402 on retry — check %s "
@@ -138,10 +194,22 @@ class Engine(object):
         self._payment(invoice)  # ← the callback does the actual XNO send
         # The complete endpoint doubles as the poll: 402 = not seen on-chain yet.
         deadline = (invoice["expiresAt"] / 1000.0) if invoice.get("expiresAt") else time.time() + 15 * 60
+        trace = ("(payment %s, %s to %s) — if you already sent it, check %s"
+                 % (invoice["paymentId"], invoice.get("amount") or invoice.get("amountRaw"),
+                    invoice.get("payTo"),
+                    invoice.get("explorerUrl") or invoice.get("statusUrl")))
         while True:
+            # A run deadline outranks the payment window. Stop here rather than
+            # poll for 15 more minutes on a run whose result is already
+            # discarded. Name the payment so a sent deposit stays traceable —
+            # this check is FIRST so its message beats the generic cancel
+            # message that _http_timeout_now() would raise below.
+            if self.cancelled():
+                raise NodeCancelled(
+                    "run cancelled before the Nano deposit was detected " + trace)
             cr = self.http("POST", invoice["completeUrl"],
                            headers={"Content-Type": "application/json", "x-x402": "true"},
-                           body="{}", timeout=self.http_timeout)
+                           body="{}", timeout=self._http_timeout_now())
             if 200 <= cr.status < 300:
                 cj = parse_json(cr.text()) if "json" in (cr.header("content-type") or "") else None
                 if looks_like_result(cj):
@@ -154,11 +222,8 @@ class Engine(object):
                 self._raise_http(cr)
             if time.time() >= deadline:
                 raise NanoodleError(
-                    "payment window expired before the Nano deposit was detected (payment %s, %s to %s) "
-                    "— if you already sent it, check %s"
-                    % (invoice["paymentId"], invoice.get("amount") or invoice.get("amountRaw"),
-                       invoice.get("payTo"), invoice.get("explorerUrl") or invoice.get("statusUrl")))
-            time.sleep(self.poll_x402)
+                    "payment window expired before the Nano deposit was detected " + trace)
+            self.sleep(self.poll_x402)   # wakes early on cancel/deadline
 
     def _raise_http(self, resp):
         body = resp.text()
@@ -185,11 +250,11 @@ class Engine(object):
 
     def _get(self, path):
         return self.http("GET", self.base_url + path, headers=self._auth_headers(),
-                         timeout=self.http_timeout)
+                         timeout=self._http_timeout_now())
 
     def fetch_media(self, url):
         """Download bytes of an https media URL (no auth headers — provider CDNs)."""
-        resp = self.http("GET", url, headers={}, timeout=self.http_timeout)
+        resp = self.http("GET", url, headers={}, timeout=self._http_timeout_now())
         if not (200 <= resp.status < 300):
             raise NanoodleError("could not download media (%d)" % resp.status)
         return resp.body, resp.header("content-type") or ""
@@ -689,7 +754,12 @@ def _gen_video(engine, node, on_cost, prompt, extra_body):
         raise NanoodleError("no runId returned")
     t0 = time.monotonic()
     while time.monotonic() - t0 < engine.timeout_video:
-        time.sleep(engine.poll_video)
+        # The run deadline outranks timeout_video. Both checks sit OUTSIDE the
+        # try below: NodeCancelled is a NanoodleError, and the except there
+        # swallows NanoodleError to keep polling.
+        engine.check_cancel()
+        engine.sleep(engine.poll_video)   # wakes early on cancel/deadline
+        engine.check_cancel()
         try:
             resp = engine._get(VIDEO_STATUS + "?requestId=" + urllib.parse.quote(str(run_id)))
             s = json.loads(resp.text())
@@ -823,7 +893,11 @@ def _poll_audio(engine, node, model, submit_json):
     query = urllib.parse.urlencode(qs)
     t0 = time.monotonic()
     while time.monotonic() - t0 < engine.timeout_audio:
-        time.sleep(engine.poll_audio)
+        # See _gen_video: the run deadline outranks timeout_audio, and both
+        # checks must stay outside the NanoodleError-swallowing try below.
+        engine.check_cancel()
+        engine.sleep(engine.poll_audio)   # wakes early on cancel/deadline
+        engine.check_cancel()
         try:
             resp = engine._get(AUDIO_STATUS + "?" + query)
             s = json.loads(resp.text())
