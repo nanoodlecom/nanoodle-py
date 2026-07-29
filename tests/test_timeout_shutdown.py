@@ -72,9 +72,13 @@ class AbandonedWorkerTest(MockedTest):
 
         self.assertEqual(len(workers), 1, "expected exactly one in-flight node")
         worker = workers[0]
-        # This is WHY a live worker hangs the process: concurrent.futures
-        # registers an atexit hook that joins every non-daemon pool thread.
-        self.assertFalse(worker.daemon)
+        # A non-daemon worker is WHY a live worker hangs the process: both the
+        # concurrent.futures atexit hook and threading._shutdown() join every
+        # non-daemon thread. ThreadPoolExecutor only makes non-daemon workers,
+        # so the run pool is _DaemonPool. Deadline-aware poll loops shorten the
+        # window; only a daemon worker closes it.
+        self.assertTrue(worker.daemon,
+                        "an abandoned non-daemon worker holds interpreter exit")
         end = time.monotonic() + SETTLE_BOUND
         while worker.is_alive() and time.monotonic() < end:
             time.sleep(0.02)
@@ -149,6 +153,47 @@ except RunError:
 print("returned %.3f" % (time.monotonic() - t0), flush=True)
 '''
 
+# The x402 twin of the harness above. A keyless llm node settles its Nano
+# invoice, and the request the deposit paid for is STILL IN FLIGHT when the run
+# deadline fires. That request must go out (a settled deposit with no request is
+# a money bug) and it must not hold the process for the full http timeout.
+_X402_CHILD = r'''
+import sys, time
+sys.path.insert(0, {root!r})
+sys.path.insert(0, {src!r})
+
+from tests.harness import MockNanoGPT
+from tests.test_x402 import fresh_402
+from nanoodle import Workflow, RunError
+from nanoodle.x402 import parse_nano_invoice
+
+GRAPH = {{"v": 1, "nodes": [{{"id": "n1", "type": "llm",
+         "fields": {{"model": "m", "prompt": "hi"}}}}], "links": []}}
+
+mock = MockNanoGPT().start()
+body = fresh_402()
+pid = parse_nano_invoice(body, mock.base_url)["paymentId"]
+# 1st POST: the 402 invoice. 2nd POST: the paid retry — a real generation call
+# that never answers inside this test.
+mock.script("POST", "/api/v1/chat/completions", [
+    {{"status": 402, "json": body}},
+    {{"status": 200, "delay": 900.0,
+      "json": {{"choices": [{{"message": {{"content": "paid hello"}}}}]}}}}])
+mock.script("POST", "/api/x402/complete/" + pid,
+            {{"status": 200, "json": {{"status": "completed", "paymentId": pid}}}})
+
+wf = Workflow.from_dict(GRAPH, api_key="", base_url=mock.base_url,
+                        poll_intervals={{"x402": 0.02}}, payment=lambda inv: None)
+t0 = time.monotonic()
+try:
+    wf.run(timeout={run_timeout!r})
+except RunError:
+    pass
+paid = [r for r in mock.requests
+        if r.path == "/api/v1/chat/completions" and r.headers.get("x-x402-payment-id")]
+print("returned %.3f paid_requests %d" % (time.monotonic() - t0, len(paid)), flush=True)
+'''
+
 
 class ProcessExitTest(unittest.TestCase):
     """End-to-end proof: the whole interpreter exits, not just run().
@@ -176,6 +221,36 @@ class ProcessExitTest(unittest.TestCase):
             elapsed = time.monotonic() - t0
             self.assertEqual(p.returncode, 0, p.stderr[-2000:])
             self.assertIn("returned", p.stdout)
+            self.assertLess(elapsed, EXIT_BOUND)
+
+    def test_process_exits_promptly_when_a_paid_x402_retry_is_in_flight(self):
+        # The money path, measured end to end. The deposit is settled and the
+        # request it paid for is in flight when the deadline fires. Both rules
+        # must hold at once:
+        #   1. that request goes out — the user's XNO is already gone;
+        #   2. the process still exits, so the 120 s http budget cannot be the
+        #      one this worker holds. Measured on the repair commit 2fb170d:
+        #      run() returned in 0.501 s, the process exited in 120.32 s.
+        src = _X402_CHILD.format(root=_REPO_ROOT,
+                                 src=os.path.join(_REPO_ROOT, "src"),
+                                 run_timeout=0.5)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x402_child.py")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(src)
+            t0 = time.monotonic()
+            try:
+                p = subprocess.run([sys.executable, path], cwd=_REPO_ROOT,
+                                   capture_output=True, text=True,
+                                   timeout=EXIT_BOUND)
+            except subprocess.TimeoutExpired:
+                self.fail("the child process did not exit within %.0fs — the "
+                          "paid x402 retry is holding interpreter shutdown"
+                          % EXIT_BOUND)
+            elapsed = time.monotonic() - t0
+            self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+            self.assertIn("paid_requests 1", p.stdout,
+                          "the settled deposit never got the request it paid for")
             self.assertLess(elapsed, EXIT_BOUND)
 
 
@@ -243,7 +318,13 @@ class OutputsOutliveTheDeadlineTest(MockedTest):
         # The node finishes inside the deadline, then _save_outputs downloads
         # the media. Clamping that download to the sliver of deadline left made
         # the CLI exit 1 with "could not reach …" and save no file at all.
-        self._hosted_image(node_delay=0.3, media_delay=0.35)
+        #
+        # Margins: the node sleeps 0.25 s against a 1.5 s deadline, so a loaded
+        # box has 1.25 s of overshoot before the node itself times out and the
+        # test fails for the wrong reason. The download sleeps 1.6 s, which is
+        # longer than the deadline can possibly have left, so the regression
+        # this test guards still fails it however the box is loaded.
+        self._hosted_image(node_delay=0.25, media_delay=1.6)
         with tempfile.TemporaryDirectory() as d:
             graph_path = os.path.join(d, "g.json")
             with open(graph_path, "w", encoding="utf-8") as f:
@@ -253,7 +334,7 @@ class OutputsOutliveTheDeadlineTest(MockedTest):
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = main(["run", graph_path, "--base-url", self.mock.base_url,
-                             "--api-key", "test-key", "--timeout", "0.5",
+                             "--api-key", "test-key", "--timeout", "1.5",
                              "--out", out_dir, "--json"])
             self.assertEqual(code, 0, err.getvalue())
             payload = json.loads(out.getvalue())

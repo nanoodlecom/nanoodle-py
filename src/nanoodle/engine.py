@@ -5,6 +5,7 @@ The catalog is never fetched: model ids pass through as typed, endpoint choice
 is by node TYPE only.
 """
 
+import atexit
 import json
 import re
 import threading
@@ -45,6 +46,55 @@ class NodeCancelled(NanoodleError):
     pass
 
 
+# ---- money-critical sections -----------------------------------------------
+# Pool workers are DAEMON threads (workflow._DaemonPool), so a node the run
+# deadline abandoned cannot hold interpreter exit. A daemon thread is frozen at
+# finalization, which is fine for a poll loop and NOT fine in the middle of a
+# wallet callback or the request a settled deposit already paid for. Those two
+# spans mark themselves money-critical, and exit waits a short, bounded time for
+# them. The trade-off is explicit: exit waits at most EXIT_MONEY_GRACE seconds,
+# then goes anyway. The request bytes are already on the wire by then; only its
+# reply is lost, and an abandoned run discards that reply in any case.
+EXIT_MONEY_GRACE = 5.0
+
+_MONEY = threading.Condition()
+_MONEY_INFLIGHT = [0]
+
+
+class _money_critical(object):
+    """Context manager: 'this thread is moving money, do not exit under it'."""
+
+    def __enter__(self):
+        with _MONEY:
+            _MONEY_INFLIGHT[0] += 1
+        return self
+
+    def __exit__(self, *exc):
+        with _MONEY:
+            _MONEY_INFLIGHT[0] -= 1
+            _MONEY.notify_all()
+        return False
+
+
+def _wait_for_money_in_flight(timeout=EXIT_MONEY_GRACE):
+    """Block until no money-critical section is running, or the grace runs out.
+
+    Returns True when the sections finished. Registered as an atexit hook:
+    atexit callbacks run BEFORE daemon threads are frozen.
+    """
+    end = time.monotonic() + timeout
+    with _MONEY:
+        while _MONEY_INFLIGHT[0] > 0:
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            _MONEY.wait(left)
+    return True
+
+
+atexit.register(_wait_for_money_in_flight)
+
+
 class Engine(object):
     def __init__(self, api_key, base_url, http, poll_intervals=None, timeouts=None,
                  on_progress=None, payment=None):
@@ -61,6 +111,11 @@ class Engine(object):
         self.timeout_video = to.get("video", 600.0)
         self.timeout_audio = to.get("audio", 300.0)
         self.http_timeout = to.get("http", 120.0)
+        # Socket budget for the one request a SETTLED x402 deposit has already
+        # paid for, when the run that ordered it is already abandoned. It must
+        # be long enough for that request to reach the API, and short enough
+        # that it never re-creates the process hang this module removes.
+        self.redeem_grace = to.get("redeem", 15.0)
         self.on_progress = on_progress
         # Set by Workflow._execute when a run-level timeout is active so local
         # media / long poll loops can stop promptly.
@@ -86,8 +141,15 @@ class Engine(object):
 
     def cancel(self):
         """Abandon every in-flight node now. Poll loops and interruptible sleeps
-        wake immediately. Called by Workflow when a run deadline expires."""
-        self._cancel.set()
+        wake immediately. Called by Workflow when a run deadline expires.
+
+        The payments lock is held while the flag latches. _record_payment takes
+        the same lock and re-checks the flag under it, so once cancel() returns
+        no NEW deposit can ever be recorded. Every deposit that will ever exist
+        is therefore already visible to the caller that just cancelled.
+        """
+        with self._payments_lock:
+            self._cancel.set()
 
     def cancelled(self):
         """True once the run is cancelled or the deadline has passed.
@@ -139,33 +201,95 @@ class Engine(object):
         self.check_cancel()
         return max(0.05, min(self.http_timeout, self._deadline - time.monotonic()))
 
+    def _redeem_timeout(self):
+        """Socket timeout for the request a SETTLED deposit already paid for.
+
+        Two rules meet here and both must hold:
+
+        - The user's XNO is gone, so this request must go out and be given a
+          real chance to land. The run deadline must not cancel it.
+        - It runs on a worker the run may already have abandoned, so it must
+          not block for the full http_timeout (120 s). Measured: it did, and
+          that put the process hang back at 120 s instead of 600 s.
+
+        So it gets whatever the run has left, never less than ``redeem_grace``
+        and never more than ``http_timeout``. A normal run (no deadline, not
+        cancelled) is unchanged: the full http_timeout. An abandoned run gets
+        redeem_grace, which bounds the worst-case process exit.
+        """
+        if self._deadline is None and not self._cancel.is_set():
+            return self.http_timeout
+        left = 0.0
+        if self._deadline is not None and not self._cancel.is_set():
+            left = max(0.0, self._deadline - time.monotonic())
+        return min(self.http_timeout, max(self.redeem_grace, left))
+
     # ---- x402 payment ledger ------------------------------------------------
 
     def payments(self):
         """Every x402 deposit this engine asked the wallet to send, oldest first.
 
         Each entry is a dict: node_id, payment_id, amount, pay_to, explorer_url,
-        trace (one human-readable line) and redeemed (True once the request the
-        deposit paid for came back).
+        trace (one human-readable line), status, send_error and redeemed.
+
+        ``status`` is the money fact, and the three values are different states:
+
+        - ``"sending"`` — the wallet callback was entered and has not returned.
+          Whether XNO left is not known yet.
+        - ``"sent"`` — the callback returned without raising. Money moved.
+        - ``"failed"`` — the callback raised. No deposit was made, and
+          ``send_error`` carries the reason.
+
+        ``redeemed`` is True once the request the deposit paid for came back.
         """
         with self._payments_lock:
             return [dict(p) for p in self._payments]
 
     def unredeemed_payments(self):
-        """Deposits that were sent but whose request never returned a result."""
+        """Deposits whose request never returned a result — any send status.
+
+        A failed send is reported too, because the caller must be able to tell
+        'your money is gone and unspent' from 'your wallet never sent it'.
+        """
         return [p for p in self.payments() if not p["redeemed"]]
 
     def _record_payment(self, invoice, trace):
+        """Open a ledger entry, BEFORE the callback and atomically with cancel.
+
+        Written before the callback because the worker thread can be abandoned
+        at any point after this line, and its exception then reaches nobody, so
+        the payment id has to live on the engine. It starts at "sending": no
+        money has moved yet, and the entry must never claim otherwise.
+
+        The cancel check sits INSIDE the lock that cancel() takes. That closes
+        the race where a worker clears check_cancel() microseconds before
+        Workflow calls cancel() and then records a deposit that no sweep and no
+        result snapshot could see.
+        """
         record = {"node_id": getattr(self._tls, "node_id", None),
                   "payment_id": invoice["paymentId"],
                   "amount": invoice.get("amount") or invoice.get("amountRaw"),
                   "pay_to": invoice.get("payTo"),
                   "explorer_url": invoice.get("explorerUrl") or invoice.get("statusUrl"),
                   "trace": trace,
+                  "status": "sending",
+                  "send_error": None,
                   "redeemed": False}
         with self._payments_lock:
+            self.check_cancel()
             self._payments.append(record)
         return record
+
+    def _mark_sent(self, record):
+        """The wallet callback returned. Only now did money really move."""
+        with self._payments_lock:
+            record["status"] = "sent"
+
+    def _mark_send_failed(self, record, exc):
+        """The wallet callback raised. Nothing was deposited — say so."""
+        with self._payments_lock:
+            record["status"] = "failed"
+            record["send_error"] = str(exc) or exc.__class__.__name__
 
     def _mark_redeemed(self, record):
         if record is None:
@@ -226,10 +350,12 @@ class Engine(object):
         retry_headers["x-x402-payment-id"] = settled["paymentId"]
         # The deposit is settled: real XNO has left the wallet and the API owes
         # this request. The run deadline governs work the run MAY abandon, so it
-        # must not cancel the one request the user already paid for. This retry
-        # gets its own full http budget, independent of the deadline.
-        resp2 = self.http(method, url, headers=retry_headers, body=body,
-                          timeout=self.http_timeout)
+        # must not cancel the one request the user already paid for. It gets its
+        # own budget, independent of the deadline — but a BOUNDED one, see
+        # _redeem_timeout: an unbounded budget here re-created the process hang.
+        with _money_critical():
+            resp2 = self.http(method, url, headers=retry_headers, body=body,
+                              timeout=self._redeem_timeout())
         if resp2.status == 402:
             raise NanoodleError(
                 "payment %s settled, but the API still answered 402 on retry — check %s "
@@ -244,18 +370,26 @@ class Engine(object):
             raise NanoodleError(
                 "payment required, but the 402 response offered no usable Nano option"
                 + (" — " + resp.text()[:200] if body else ""))
-        trace = ("(payment %s, %s to %s) — if you already sent it, check %s"
+        trace = ("(payment %s, %s to %s) — check %s"
                  % (invoice["paymentId"], invoice.get("amount") or invoice.get("amountRaw"),
                     invoice.get("payTo"),
                     invoice.get("explorerUrl") or invoice.get("statusUrl")))
         # Never start a NEW deposit on a run that is already abandoned: nothing
         # would ever redeem it. This closes the window before money moves.
+        # _record_payment re-checks under the cancel lock.
         self.check_cancel()
-        # Record the deposit BEFORE the callback. The worker thread can be
-        # abandoned at any point after this line, and its exception then reaches
-        # nobody, so the payment id has to live on the engine.
-        record = self._record_payment(invoice, trace)
-        self._payment(invoice)  # ← the callback does the actual XNO send
+        record = self._record_payment(invoice, trace)   # status "sending"
+        # The callback does the actual XNO send. Mark the entry "sent" only
+        # after it RETURNS: a callback that raises deposited nothing, and a
+        # ledger that claimed otherwise would send the user hunting an explorer
+        # for money that never moved.
+        with _money_critical():
+            try:
+                self._payment(invoice)
+            except BaseException as exc:   # noqa: BLE001 - re-raised below
+                self._mark_send_failed(record, exc)
+                raise
+            self._mark_sent(record)
         # The complete endpoint doubles as the poll: 402 = not seen on-chain yet.
         deadline = (invoice["expiresAt"] / 1000.0) if invoice.get("expiresAt") else time.time() + 15 * 60
         while True:

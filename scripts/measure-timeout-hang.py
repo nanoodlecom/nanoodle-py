@@ -29,7 +29,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _REPO_ROOT)
 
-from tests.test_timeout_shutdown import _CHILD  # noqa: E402
+from tests.test_timeout_shutdown import _CHILD, _X402_CHILD  # noqa: E402
 
 
 def measure(tree, video_timeout, run_timeout, poll, hard_limit):
@@ -55,6 +55,30 @@ def measure(tree, video_timeout, run_timeout, poll, hard_limit):
         return returned, exited
 
 
+def measure_x402(tree, run_timeout, hard_limit):
+    """The money path: the request a settled deposit paid for is in flight when
+    the deadline fires. Returns (returned_secs, exit_secs, paid_requests)."""
+    src = _X402_CHILD.format(root=tree, src=os.path.join(tree, "src"),
+                             run_timeout=run_timeout)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "x402_child.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(src)
+        t0 = time.monotonic()
+        try:
+            p = subprocess.run([sys.executable, path], cwd=tree, capture_output=True,
+                               text=True, timeout=hard_limit)
+        except subprocess.TimeoutExpired:
+            return None, None, None
+        exited = time.monotonic() - t0
+        returned, paid = None, None
+        for line in p.stdout.splitlines():
+            if line.startswith("returned "):
+                parts = line.split()
+                returned, paid = float(parts[1]), int(parts[3])
+        return returned, exited, paid
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--tree", default=_REPO_ROOT,
@@ -65,6 +89,8 @@ def main(argv=None):
     ap.add_argument("--run-timeout", type=float, default=0.5)
     ap.add_argument("--hard-limit", type=float, default=90.0,
                     help="give up on the child after this many seconds")
+    ap.add_argument("--no-x402", action="store_true",
+                    help="skip the paid-retry (money path) measurement")
     args = ap.parse_args(argv)
 
     tree = os.path.abspath(args.tree)
@@ -78,6 +104,16 @@ def main(argv=None):
             print("%-16.1f %-18s did not exit within %.0f s" % (n, "-", args.hard_limit))
         else:
             print("%-16.1f %-18.3f %.2f s" % (n, returned, exited))
+    if not args.no_x402:
+        print()
+        print("keyless x402 llm node, paid retry in flight at the deadline "
+              "(run(timeout=%.1f))" % args.run_timeout)
+        returned, exited, paid = measure_x402(tree, args.run_timeout, args.hard_limit)
+        if exited is None:
+            print("  did not exit within %.0f s" % args.hard_limit)
+        else:
+            print("  run() returned %.3f s, process exited %.2f s, "
+                  "paid requests sent %s" % (returned, exited, paid))
     return 0
 
 

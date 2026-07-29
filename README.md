@@ -210,10 +210,12 @@ payment callbacks port between the two libraries unchanged.
 
 Money that leaves the wallet stays traceable. `result.payments` lists every
 deposit the run asked for (`payment_id`, `amount`, `pay_to`, `explorer_url`,
-`redeemed`), and a deposit that never bought its request is named in the node's
-error message too — including when a `timeout=` abandoned the node that sent it.
-A settled deposit always gets its request: the run deadline never cancels the
-one call the user has already paid for.
+`status`, `send_error`, `redeemed`), and a deposit that never bought its request
+is named in the node's error message too — including when a `timeout=` abandoned
+the node that sent it. `status` is the money fact: `sent` means your callback
+returned, `failed` means it raised and nothing was deposited, and the error
+message says which. A settled deposit always gets its request: the run deadline
+never cancels the one call the user has already paid for.
 
 Copy-paste scripts (CLI, print callback, wallet stub):
 [examples/x402/](examples/x402/).

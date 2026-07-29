@@ -5,7 +5,8 @@ import json
 import re
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import queue
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 
 from .engine import Engine
 from .errors import NanoodleError, RunError, UnsupportedNodeError
@@ -36,17 +37,96 @@ class NodeRun(object):
             self.status, self.error, self.cost_usd, self.ms)
 
 
+class _DaemonPool(object):
+    """A tiny thread pool whose workers are DAEMON threads.
+
+    concurrent.futures.ThreadPoolExecutor is not usable here: its workers are
+    non-daemon, and BOTH the concurrent.futures atexit hook and
+    threading._shutdown() join every one of them at interpreter exit. A node the
+    run deadline abandoned therefore holds the whole process for as long as it
+    keeps working — the exact hang this module exists to remove. Deadline-aware
+    poll loops shorten that window; only a daemon worker closes it.
+
+    Money is the one thing a frozen daemon must not interrupt, so the wallet
+    callback and the request a settled deposit paid for mark themselves
+    money-critical and exit waits a bounded time for them (engine.EXIT_MONEY_GRACE).
+
+    The surface is only what _execute uses: submit() -> concurrent.futures.Future,
+    and shutdown(wait=).
+    """
+
+    def __init__(self, max_workers, thread_name_prefix="nanoodle-run"):
+        self._q = queue.Queue()
+        self._max = max(1, int(max_workers))
+        self._threads = []
+        self._prefix = thread_name_prefix
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def submit(self, fn, *args):
+        fut = Future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot submit to a pool that is shut down")
+            self._q.put((fut, fn, args))
+            if len(self._threads) < self._max:
+                t = threading.Thread(
+                    target=self._worker,
+                    name="%s_%d" % (self._prefix, len(self._threads)),
+                    daemon=True)
+                self._threads.append(t)
+                t.start()
+        return fut
+
+    def _worker(self):
+        while True:
+            item = self._q.get()
+            if item is None:      # shutdown token
+                return
+            fut, fn, args = item
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                fut.set_result(fn(*args))
+            except BaseException as e:   # noqa: BLE001 - handed to the future
+                fut.set_exception(e)
+
+    def shutdown(self, wait=True):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                for _ in self._threads:
+                    self._q.put(None)
+            threads = list(self._threads)
+        if wait:
+            for t in threads:
+                t.join()
+
+
 def _note_payment(run, payment):
-    """Name a sent-but-unredeemed x402 deposit in a node's error message.
+    """Name an unredeemed x402 deposit in a node's error message.
 
     Money that left the wallet must stay traceable. The worker that sent it can
     be abandoned by a run deadline, and nobody ever reads its exception, so the
     payment id has to ride out on the node record instead.
+
+    The three send states get three different sentences. Saying "a deposit was
+    sent" when the wallet callback in fact failed is worse than saying nothing:
+    it sends a person hunting an explorer for money that never moved.
     """
     if payment["payment_id"] in (run.error or ""):
         return
+    status = payment.get("status")
+    if status == "failed":
+        note = ("no Nano deposit was sent (payment %s): the wallet callback failed — %s"
+                % (payment["payment_id"], payment.get("send_error")))
+    elif status == "sent":
+        note = "a Nano deposit was already sent " + payment["trace"]
+    else:
+        note = ("a Nano deposit may have been sent — the wallet callback had not "
+                "returned when the run was abandoned " + payment["trace"])
     prefix = (run.error + " — ") if run.error else ""
-    run.error = prefix + "a Nano deposit was already sent " + payment["trace"]
+    run.error = prefix + note
 
 
 class RunResult(object):
@@ -382,8 +462,8 @@ class Workflow(object):
             out = engine.run_node(node, inp, make_on_cost(nid))
             return out, time.monotonic() - t0
 
-        pool = ThreadPoolExecutor(max_workers=max(1, min(8, len(order))),
-                                  thread_name_prefix="nanoodle-run")
+        pool = _DaemonPool(max_workers=max(1, min(8, len(order))),
+                           thread_name_prefix="nanoodle-run")
         pending = {}   # future -> node id
         settled = set()
         abandoned = False   # deadline hit with nodes still in flight
@@ -432,10 +512,12 @@ class Workflow(object):
                     # timeout in the result NOW; the worker threads are left to
                     # finish in the pool but their results are discarded.
                     abandoned = True
-                    # Tell those threads to stop. Pool threads are NOT daemons
-                    # and concurrent.futures joins them at interpreter exit, so
-                    # a thread still polling a dead run would hang the whole
-                    # process until its own node timeout (video: 600 s).
+                    # Tell those threads to stop, so they end in milliseconds
+                    # instead of running on to their own node timeout (video:
+                    # 600 s). cancel() also latches under the payments lock, so
+                    # from here on no worker can open a NEW deposit — every
+                    # deposit that will ever exist is already in the ledger and
+                    # visible to the sweep below.
                     engine.cancel()
                     # A deposit the wallet already sent must stay traceable. The
                     # worker that sent it is abandoned and its exception reaches
