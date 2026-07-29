@@ -22,9 +22,10 @@ surfaces optional: run() skips it and the node yields an empty value instead of 
   or when it contributes exactly ONE input at all, so an author-optional renamed node keeps its name as the key.
 - upload nodes feeding role ports get role labels ("End frame", "Reference N", "Image N") — UI nicety; library can skip.
 - Unique key = (nodeId, field). LIBRARY RESOLUTION ORDER for a user-supplied key (case-insensitive, trimmed):
-  1. exact node custom name (if that node has exactly one derived input → that input; ambiguous → error listing candidates)
-  2. "nodeId.field" (e.g. "n2.prompt") and bare nodeId (if single input on the node)
-  3. the input's label / field name if unique across inputs
+  1. the input's ASSIGNED key — the very name wf.inputs advertises (suffixed forms like "Text 2" live here)
+  2. exact node custom name (if that node has exactly one derived input → that input; ambiguous → error listing candidates)
+  3. "nodeId.field" (e.g. "n2.prompt") and bare nodeId (if single input on the node)
+  4. the input's label / field name if unique across inputs
   Unknown key → error listing available input names.
 - If the workflow has exactly one required input, allow a bare scalar: run("hello").
 

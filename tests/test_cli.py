@@ -235,5 +235,54 @@ class FailedRunJsonTest(MockedTest):
         self.assertIn("error: output node", err)
 
 
+class PreRunFailureJsonTest(MockedTest):
+    """--json must answer the failures that happen BEFORE the first node runs.
+
+    A missing required input is the commonest way an agent's call fails, and it is caught
+    during validation, so there is no RunResult and RunError is never raised. The CLI used
+    to print nothing at all on stdout for it: exit 1, empty stdout, one line on stderr. The
+    docs promised JSON. An agent caller needs it most exactly here.
+    """
+
+    def _argv(self, graph, *extra):
+        return ["run", fixture(graph), "--api-key", "cli-key",
+                "--base-url", self.mock.base_url] + list(extra)
+
+    def test_missing_required_input_prints_json_and_exits_1(self):
+        code, out, err = run_cli(self._argv("needs-input.json", "--json"))
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertEqual([e["message"] for e in payload["errors"]],
+                         ["missing required input: Answer"])
+        self.assertIsNone(payload["errors"][0]["node_id"], "no node ran, so none is named")
+        self.assertEqual(payload["nodes"], {}, "nothing executed")
+        self.assertEqual(payload["costUsd"], 0.0, "and nothing was spent")
+        self.assertEqual(payload["outputs"], {"Answer": None},
+                         "the interface is still described, with no values")
+        self.assertEqual(payload["promptTrims"], [])
+        self.assertIn("error: missing required input", err)
+        self.assertEqual(self.mock.requests, [], "the API was never called")
+
+    def test_unknown_input_key_prints_json_and_exits_1(self):
+        code, out, _ = run_cli(self._argv("needs-input.json", "--json",
+                                          "--input", "Bogus=x"))
+        self.assertEqual(code, 1)
+        self.assertIn("Bogus", json.loads(out)["errors"][0]["message"])
+
+    def test_a_graph_that_cannot_be_read_still_answers_json(self):
+        code, out, err = run_cli(["run", os.path.join(tempfile.gettempdir(), "no-such-graph.json"),
+                                  "--json", "--api-key", "k"])
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertIn("no-such-graph.json", payload["errors"][0]["message"])
+        self.assertEqual(payload["outputs"], {}, "no interface is known, so none is described")
+
+    def test_the_human_path_is_unchanged(self):
+        code, out, err = run_cli(self._argv("needs-input.json"))
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "", "no JSON leaks into the plain path")
+        self.assertIn("error: missing required input: Answer", err)
+
+
 if __name__ == "__main__":
     unittest.main()

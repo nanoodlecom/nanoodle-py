@@ -89,6 +89,30 @@ An input node the author marked **optional** in the editor (the checkbox, saved 
 proceeds with an empty value that consumers drop — an optional style reference costs
 you nothing when you leave it out.
 
+#### Breaking in 0.5.0: named nodes now name their input key
+
+A node with a custom name that surfaces exactly one input uses that name as the input key,
+even when the input is optional. This matches nanoodle-js 0.8.0, so one set of keys now
+works in both languages. It **renames advertised keys** on published workflows. Run
+`nanoodle-py inspect <graph>` to see the current keys, or use `nodeId.field`
+(`"n2.system"`), which never changes.
+
+| workflow | 0.4.0 key | 0.5.0 key | old key still resolves? |
+|---|---|---|---|
+| pr-describe | `System prompt` | `Drafter` | no — now ambiguous across 3 nodes |
+| pr-describe | `System prompt 2` | `Auditor` | no |
+| pr-describe | `System prompt 3` | `Final PR body` | no |
+| jingle | `System prompt` | `Lyric writer` | no — now ambiguous across 2 nodes |
+| jingle | `System prompt 2` | `Style writer` | no |
+| visual-judge | `System prompt` | `Verdict` | yes — the label is unique |
+| narrated-poem | `System prompt` | `Poet` | yes |
+| video-teaser | `System prompt` | `Shot writer` | yes |
+
+Where the old label still names exactly one input it keeps resolving, so those calls need
+no change. Where two or more nodes shared it, the old key now raises `ambiguous` (or
+`unknown input` for the numbered forms) instead of silently picking one — the call fails
+loudly and costs nothing.
+
 ### Media inputs
 
 ```python
@@ -133,10 +157,22 @@ result = wf.run({"Text": "..."}, on_progress=print)
 result.prompt_trims   # the same records, for a caller that passed no on_progress
 ```
 
-Every trim is also raised as a `RuntimeWarning`. A cap this library does not know yet is
-learned from the live 400 and applied on the next run of the same `Workflow`. Your own
-prompts are never rewritten, summarised or added to — the library only ever cuts an
-over-length prompt at the end, and always says so. `PROMPT_CAPS`, `prompt_cap`,
+Every trim is also reported as a `RuntimeWarning`. Reporting can never fail your run: if
+you run with warnings as errors (`PYTHONWARNINGS=error`), the same sentence goes to stderr
+instead, and the run continues.
+
+A cap counts **UTF-16 code units**, which is what the model route counts and what
+nanoodle-js reports — not Python code points. One emoji is 1 code point and 2 code units,
+so `"🎉" * 450` is 450 to `len()` and 900 to the API. `from` and `to` in the trim record are
+code units for the same reason, and `nanoodle.prompt_caps.utf16_len` measures them.
+
+A cap this library does not know yet is learned from the live 400 and applied on the next
+run of the same `Workflow`. That applies to image, video and audio nodes. An `llm` or
+`vision` node is never fitted (its real limit is tokens), so its rejection is relayed
+exactly as the API worded it, with no promise that a retry would behave differently.
+
+Your own prompts are never rewritten, summarised or added to — the library only ever cuts
+an over-length prompt at the end, and always says so. `PROMPT_CAPS`, `prompt_cap`,
 `fit_prompt_text`, `is_prompt_too_long` and `prompt_cap_from_error` are public, for
 callers that do their own orchestration.
 
@@ -160,6 +196,16 @@ With `--json`, a **failed** run still prints the same JSON on stdout — per-nod
 `status` and `error`, the outputs that did complete, the cost already spent, and any
 prompt trims — and exits 1. Without `--json` a failed run prints `error: …` on stderr
 and exits 1, as before.
+
+That includes a failure caught **before** the first node runs (a missing required input,
+an unknown key, an unreadable graph). Nothing executed, so `nodes` is `{}` and `costUsd`
+is `0.0`, and the reason is in `errors[0].message`:
+
+```json
+{"outputs": {"Answer": null}, "costUsd": 0.0, "costExact": true, "remainingBalance": null,
+ "nodes": {}, "errors": [{"node_id": null, "name": null,
+                          "message": "missing required input: Answer"}], "promptTrims": []}
+```
 
 ## Supported nodes
 

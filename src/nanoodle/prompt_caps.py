@@ -151,6 +151,85 @@ def prompt_cap(node, catalog=None, learned=None, fields=None):
     return (PROMPT_CAPS.get(kind) or {}).get(model_id) or None
 
 
+# --- UTF-16 code units -------------------------------------------------------------
+# A cap is a count of UTF-16 code units, not of Python code points. NanoGPT's route
+# counts what the JavaScript app counts (`String#length`), and nanoodle-js measures the
+# same way, so a Python `len()` is the wrong ruler for any prompt outside the Basic
+# Multilingual Plane. One emoji is 1 code point and 2 code units; "🎉" * 450 is 450 to
+# Python and 900 to the API. Measuring in code points let an over-cap prompt through, and
+# cut a trimmed prompt to nearly twice the cap. So measure and cut in code units.
+#
+# The trick below is that a Python str can hold a lone surrogate, so "the string as UTF-16
+# code units" is itself a str: one character per code unit. Every index, slice and rfind
+# then behaves exactly as in JavaScript. _from_units puts the pairs back.
+
+_HIGH, _LOW = 0xD800, 0xDC00
+
+# JavaScript String#trim removes WhiteSpace + LineTerminator. That set is NOT Python's
+# str.strip() default: Python also strips U+001C..U+001F and U+0085, and does not strip
+# U+FEFF. Spell it out so a trimmed prompt is byte-identical in both languages.
+_JS_WS = (
+    "\t\n\v\f\r "                 # TAB LF VT FF CR SP
+    "\u00a0\u1680"                       # NBSP, OGHAM SPACE MARK
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029"                       # LINE / PARAGRAPH SEPARATOR
+    "\u202f\u205f\u3000"                 # NARROW NBSP, MEDIUM MATH SPACE, IDEOGRAPHIC SP
+    "\ufeff"                             # ZWNBSP - JS trims it, Python str.strip() does not
+)
+
+
+def _js_trim(s):
+    """s.trim() as JavaScript defines it."""
+    return s.strip(_JS_WS)
+
+
+def utf16_len(s):
+    """Length in UTF-16 code units — what nanoodle-js and the API route count."""
+    s = "" if s is None else str(s)
+    return len(s.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _to_units(s):
+    """s with every astral character split into its surrogate pair, one char per unit."""
+    if s.isascii():
+        return s
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if o > 0xFFFF:
+            o -= 0x10000
+            out.append(chr(_HIGH + (o >> 10)))
+            out.append(chr(_LOW + (o & 0x3FF)))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _from_units(u):
+    """Surrogate pairs back into characters. A LONE surrogate is dropped, never emitted.
+
+    A cut at the cap can land between the two halves of an astral character. JavaScript
+    keeps the orphan half; Python must not. A lone surrogate is not encodable as UTF-8, so
+    it would break the very request this function exists to make sendable, and json.dumps
+    of the trim record would raise. Dropping it costs one code unit, always under the cap.
+    """
+    if not any(_HIGH <= ord(c) <= 0xDFFF for c in u):
+        return u
+    out = []
+    i, n = 0, len(u)
+    while i < n:
+        o = ord(u[i])
+        if _HIGH <= o <= 0xDBFF and i + 1 < n and _LOW <= ord(u[i + 1]) <= 0xDFFF:
+            out.append(chr(0x10000 + ((o - _HIGH) << 10) + (ord(u[i + 1]) - _LOW)))
+            i += 2
+        elif _HIGH <= o <= 0xDFFF:
+            i += 1          # orphan half of a character: drop it
+        else:
+            out.append(u[i])
+            i += 1
+    return "".join(out)
+
+
 def fit_prompt_text(s, cap):
     """Cut to the last sentence end inside the cap, then the last word.
 
@@ -158,15 +237,16 @@ def fit_prompt_text(s, cap):
     away more than the overflow did.
     """
     s = "" if s is None else str(s)
-    if len(s) <= cap:
+    u = _to_units(s)
+    if len(u) <= cap:
         return s
-    head = s[:cap]
+    head = u[:cap]
     floor = int(cap * 0.7)
     sent = max(head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind("\n"))
     if sent >= floor:
-        return head[:sent + 1].strip()
+        return _from_units(_js_trim(head[:sent + 1]))
     word = head.rfind(" ")
-    return (head[:word] if word >= floor else head).strip()
+    return _from_units(_js_trim(head[:word] if word >= floor else head))
 
 
 def with_fitted_prompt(node, fields, catalog=None, learned=None):
@@ -178,12 +258,17 @@ def with_fitted_prompt(node, fields, catalog=None, learned=None):
     """
     cap = prompt_cap(node, catalog=catalog, learned=learned, fields=fields)
     p = (fields or {}).get("prompt")
-    if not cap or not isinstance(p, str) or len(p) <= cap:
+    if not cap or not isinstance(p, str):
+        return fields, None
+    # lengths are UTF-16 code units throughout — the unit the cap is stated in, and the
+    # unit nanoodle-js reports, so the same graph discloses the same figures either side
+    was = utf16_len(p)
+    if was <= cap:
         return fields, None
     prompt = fit_prompt_text(p, cap)
     out = dict(fields)
     out["prompt"] = prompt
-    return out, {"from": len(p), "to": len(prompt), "cap": cap}
+    return out, {"from": was, "to": utf16_len(prompt), "cap": cap}
 
 
 # NanoGPT phrases the rejection three ways (all live-verified 2026-07-26):
@@ -213,11 +298,24 @@ def prompt_cap_from_error(msg):
 
 
 def learn_prompt_cap(learned, node, msg):
-    """Bank a cap learned from a live rejection. True when it is new information."""
+    """Bank a cap learned from a live rejection. True when it is new information.
+
+    True is a PROMISE: the caller turns it into "running again should succeed". So only
+    bank what ``prompt_cap`` will actually read back. It returns None for kind "chat"
+    before it ever consults ``learned``, because an llm or vision node's limit is tokens
+    and that node is never the one being fitted. A cap banked under a chat key can
+    therefore never be applied, and promising an llm caller a fix would send them into a
+    PAID re-run that fails in exactly the same way. Decline instead: the API's own message
+    is relayed untouched, which is the honest answer when we cannot prevent the failure.
+
+    This is a deliberate, narrow divergence from nanoodle-js learnPromptCap, which banks
+    the chat key and makes the promise. The cut is behaviourally invisible everywhere the
+    promise was keepable, and only removes a false one.
+    """
     cap = prompt_cap_from_error(msg)
     kind = CAP_KIND.get(_node_type(node))
     model_id = _node_fields(node).get("model")
-    if not cap or not kind or not model_id:
+    if not cap or not kind or not model_id or kind == "chat":
         return False
     key = "%s:%s" % (kind, model_id)
     if learned.get(key) == cap:
