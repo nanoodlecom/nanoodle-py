@@ -9,7 +9,7 @@ import unittest
 
 from tests import fixture
 
-from nanoodle import NanoodleError, Workflow
+from nanoodle import NanoodleError, RunError, Workflow
 from nanoodle.engine import Engine
 from nanoodle.transport import HttpResponse
 from nanoodle.x402 import assert_payment_option, looks_like_result, parse_nano_invoice
@@ -183,6 +183,55 @@ class SettleFlowTest(unittest.TestCase):
         self.assertIn("pay_", msg)
         self.assertIn("nano_", msg)
         self.assertGreater(len(polls), 0, "it did poll before giving up")
+        # and the caller can read the deposit back off the engine, because the
+        # worker that sent it may be abandoned before anyone sees its exception
+        owed = eng.unredeemed_payments()
+        self.assertEqual(len(owed), 1)
+        self.assertEqual(owed[0]["payment_id"], parse_nano_invoice(FIXTURE_402, BASE)["paymentId"])
+        self.assertIn("pay_", owed[0]["trace"])
+
+    def test_a_settled_payment_always_gets_the_request_it_paid_for(self):
+        # MONEY: the callback has sent XNO and the complete endpoint confirmed
+        # the deposit. If the run deadline passes in that window, the retry must
+        # STILL go out. Clamping it to the deadline meant the user paid and no
+        # request was ever sent.
+        calls = []
+
+        def http(method, url, headers=None, body=None, timeout=None):
+            calls.append((method, url, headers, timeout))
+            if "/chat/completions" in url:
+                if headers.get("x-x402-payment-id"):
+                    return json_resp(200, CHAT_OK)
+                return json_resp(402, fresh_402())
+            if "/api/x402/complete/" in url:
+                time.sleep(0.3)   # the deposit is confirmed AFTER the deadline
+                return json_resp(200, {"status": "completed", "paymentId": "pay_x"})
+            raise AssertionError("unexpected url " + url)
+
+        eng = make_engine(http, lambda inv: None)
+        eng.set_run_deadline(time.monotonic() + 0.1, 0.1)
+        self.assertEqual(self.chat(eng), CHAT_OK)
+        retries = [c for c in calls
+                   if "/chat/completions" in c[1] and c[2].get("x-x402-payment-id")]
+        self.assertEqual(len(retries), 1, "a settled payment never got its request")
+        self.assertEqual(retries[0][3], eng.http_timeout,
+                         "the paid retry needs its own budget, not the run deadline")
+        self.assertEqual([p["redeemed"] for p in eng.payments()], [True])
+
+    def test_a_cancelled_run_starts_no_new_payment(self):
+        # The other side of the same rule: no new money may leave the wallet for
+        # a run that is already abandoned, because nothing would redeem it.
+        paid = []
+
+        def http(method, url, headers=None, body=None, timeout=None):
+            return json_resp(402, fresh_402())
+
+        eng = make_engine(http, paid.append)
+        eng.cancel()
+        with self.assertRaises(NanoodleError):
+            self.chat(eng)
+        self.assertEqual(paid, [], "a cancelled run sent a deposit nobody can redeem")
+        self.assertEqual(eng.payments(), [])
 
     def test_no_nano_option_is_actionable_and_unpaid(self):
         paid = []
@@ -206,6 +255,59 @@ class SettleFlowTest(unittest.TestCase):
         with self.assertRaisesRegex(NanoodleError, "out of balance"):
             self.chat(eng)
         self.assertEqual(paid, [])
+
+
+class TimedOutRunKeepsThePaymentTraceableTest(unittest.TestCase):
+    """MONEY: a deposit sent by a worker that the run then abandons must still
+    reach the caller.
+
+    The worker raises NodeCancelled naming the payment id, but its future is
+    discarded by the deadline handler and concurrent.futures never logs an
+    unretrieved exception. Without the engine-side ledger the user who sent XNO
+    gets nothing but "run timed out after 0.3s".
+    """
+
+    GRAPH = {"v": 1, "links": [], "nodes": [
+        {"id": "n1", "type": "llm", "fields": {"model": "m", "prompt": "hi"}}]}
+
+    def test_the_payment_id_reaches_the_caller_after_a_run_timeout(self):
+        sent = []
+
+        def http(method, url, headers=None, body=None, timeout=None):
+            if "/chat/completions" in url:
+                return json_resp(402, fresh_402())
+            if "/api/x402/complete/" in url:
+                # slow confirmation: the worker is still INSIDE this call when
+                # the deadline fires, so its future is abandoned and its
+                # exception is thrown away. That is the case the ledger covers.
+                time.sleep(0.6)
+                return json_resp(402, {"error": "Payment not verified", "status": "pending"})
+            raise AssertionError("unexpected url " + url)
+
+        wf = Workflow.from_dict(self.GRAPH, api_key="", base_url=BASE, http=http,
+                                poll_intervals={"x402": 0.02}, payment=sent.append)
+        with self.assertRaises(RunError) as ctx:
+            wf.run(timeout=0.3)
+        result = ctx.exception.result
+        self.assertEqual(len(sent), 1, "the callback sent exactly one deposit")
+        pay_id = sent[0]["paymentId"]
+
+        message = result.nodes["n1"].error
+        self.assertIn("run timed out after 0.3s", message)
+        self.assertIn(pay_id, message, "the timed-out node hid the payment id")
+        self.assertIn(sent[0]["explorerUrl"], message)
+        self.assertIn(pay_id, result.errors[0]["message"])
+
+        self.assertEqual([p["payment_id"] for p in result.payments], [pay_id])
+        self.assertEqual(result.payments[0]["node_id"], "n1")
+        self.assertFalse(result.payments[0]["redeemed"])
+
+    def test_a_keyed_run_reports_no_payments(self):
+        def http(method, url, headers=None, body=None, timeout=None):
+            return json_resp(200, CHAT_OK)
+
+        wf = Workflow.from_dict(self.GRAPH, api_key="k", base_url=BASE, http=http)
+        self.assertEqual(wf.run().payments, [])
 
 
 class GuardTest(unittest.TestCase):

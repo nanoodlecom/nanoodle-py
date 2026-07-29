@@ -108,8 +108,16 @@ A run-level timeout sets an absolute deadline on the engine. The deadline outran
 - The video and audio status-poll loops check the deadline before and after each sleep, and stop at once when it passes. `timeout_video` (600 s) and `timeout_audio` (300 s) only apply while the deadline is in the future.
 - The sleep between poll attempts is interruptible. It waits on a cancel event and never sleeps past the deadline.
 - Per-request socket timeouts are capped at the time left, so one read cannot outlive the deadline by up to `http_timeout` (120 s).
-- The x402 settle poll stops at the deadline too. Its error names the payment id and explorer URL so a sent deposit stays traceable.
+- The x402 settle poll stops at the deadline too, and starts no NEW deposit once the run is cancelled.
 This matters because the worker threads are not daemons: `concurrent.futures` joins each one at interpreter exit. A thread still polling an abandoned run blocks the whole process, not just `run()`. With no `timeout=`, no deadline exists and every loop behaves exactly as it did before.
+
+### What the deadline must NOT bound
+The deadline governs work the run is still doing. Two things have a different lifetime and stay outside it:
+- **Media of a value the run already returned.** Every `MediaRef` carries `engine.fetch_media` as its lazy fetcher, and the caller may call it any time after `run()` returns — the CLI does exactly that in `_save_outputs`. That download uses the full `http_timeout` and never checks the cancel flag, so a successful run keeps its output and a lane that finished keeps its media after a sibling lane timed out. Fetches the run itself makes (`local_fetcher`, inlining hosted audio, transcribe input) pass `run_bound=True` and do stop with the run.
+- **The request a settled x402 deposit paid for.** Once `_settle_402` returns, real XNO has left the wallet. The retry carrying `x-x402-payment-id` gets its own full `http_timeout` budget, independent of the deadline. A settled payment with no request ever sent is a money bug.
+
+### Traceability of a sent deposit
+The engine keeps a ledger of every deposit it asked the callback to send: `node_id`, `payment_id`, `amount`, `pay_to`, `explorer_url`, `trace`, `redeemed`. The record is written BEFORE the callback fires, because the worker thread can be abandoned at any point after that and `concurrent.futures` never surfaces an unretrieved exception. `Workflow` copies the ledger to `result.payments` and names every unredeemed deposit in the error message of the node that sent it. So a user who sent XNO gets the payment id and explorer URL even when the run timed out and the worker's `NodeCancelled` went nowhere.
 
 ## Execution (runGraph 3000-3133)
 1. Alias/filter nodes (materialize): audio→tts, drop unknown types + orphaned links, migrate music/tts inbound "text" port → "prompt".

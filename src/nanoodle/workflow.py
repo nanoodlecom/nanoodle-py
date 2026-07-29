@@ -36,14 +36,31 @@ class NodeRun(object):
             self.status, self.error, self.cost_usd, self.ms)
 
 
+def _note_payment(run, payment):
+    """Name a sent-but-unredeemed x402 deposit in a node's error message.
+
+    Money that left the wallet must stay traceable. The worker that sent it can
+    be abandoned by a run deadline, and nobody ever reads its exception, so the
+    payment id has to ride out on the node record instead.
+    """
+    if payment["payment_id"] in (run.error or ""):
+        return
+    prefix = (run.error + " — ") if run.error else ""
+    run.error = prefix + "a Nano deposit was already sent " + payment["trace"]
+
+
 class RunResult(object):
-    def __init__(self, outputs, nodes, errors, cost_usd, cost_exact, remaining_balance):
+    def __init__(self, outputs, nodes, errors, cost_usd, cost_exact, remaining_balance,
+                 payments=None):
         self.outputs = outputs                    # friendly key AND node-id key -> value
         self.nodes = nodes                        # node id -> NodeRun
         self.errors = errors                      # [{node_id, name, message}]
         self.cost_usd = cost_usd
         self.cost_exact = cost_exact
         self.remaining_balance = remaining_balance
+        # x402 deposits this run asked the wallet to send (empty on a keyed run):
+        # [{node_id, payment_id, amount, pay_to, explorer_url, trace, redeemed}]
+        self.payments = payments or []
 
     def __getitem__(self, key):
         if key in self.outputs:
@@ -420,10 +437,18 @@ class Workflow(object):
                     # a thread still polling a dead run would hang the whole
                     # process until its own node timeout (video: 600 s).
                     engine.cancel()
+                    # A deposit the wallet already sent must stay traceable. The
+                    # worker that sent it is abandoned and its exception reaches
+                    # nobody, so name the payment in the node's error instead.
+                    owed = {}
+                    for p in engine.unredeemed_payments():
+                        owed.setdefault(p["node_id"], []).append(p)
                     for fut, nid in list(pending.items()):
                         run = runs[nid]
                         run.status = "error"
                         run.error = "run timed out after %ss" % timeout
+                        for p in owed.get(nid, ()):
+                            _note_payment(run, p)
                         settled.add(nid)
                         progress({"type": "node-error", "node_id": nid,
                                   "name": display_name(graph.node(nid)),
@@ -454,6 +479,12 @@ class Workflow(object):
             pool.shutdown(wait=not abandoned)
 
         # ---- assemble result -------------------------------------------------
+        # Catch any deposit that settled after the abandonment pass above, so no
+        # sent XNO is left without a payment id in the result.
+        for p in engine.unredeemed_payments():
+            run = runs.get(p["node_id"])
+            if run is not None and run.status == "error":
+                _note_payment(run, p)
         outputs = {}
         failed_sinks = []
         out_specs = derive_outputs(graph)
@@ -472,7 +503,8 @@ class Workflow(object):
         result = RunResult(outputs, runs, errors,
                            cost_usd=cost["total"],
                            cost_exact=cost["exact"],
-                           remaining_balance=cost["balance"])
+                           remaining_balance=cost["balance"],
+                           payments=engine.payments())
         if failed_sinks:
             parts = []
             for ospec, run in failed_sinks:
