@@ -260,6 +260,7 @@ class PreRunFailureJsonTest(MockedTest):
         self.assertEqual(payload["outputs"], {"Answer": None},
                          "the interface is still described, with no values")
         self.assertEqual(payload["promptTrims"], [])
+        self.assertEqual(payload["payments"], [], "no node ran, so no deposit exists")
         self.assertIn("error: missing required input", err)
         self.assertEqual(self.mock.requests, [], "the API was never called")
 

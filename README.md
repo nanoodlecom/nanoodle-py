@@ -203,9 +203,10 @@ nanoodle-py inspect "https://nanoodle.com/#g=..."                 # a share link
 - `--env-file PATH` — load `.env`-style `KEY=VALUE` lines (existing env vars win)
 
 With `--json`, a **failed** run still prints the same JSON on stdout — per-node
-`status` and `error`, the outputs that did complete, the cost already spent, and any
-prompt trims — and exits 1. Without `--json` a failed run prints `error: …` on stderr
-and exits 1, as before.
+`status` and `error`, the outputs that did complete, the cost already spent, any
+prompt trims (`promptTrims`) and any Nano deposit the run asked for (`payments`,
+empty unless you ran `--pay`) — and exits 1. Without `--json` a failed run prints
+`error: …` on stderr and exits 1, as before.
 
 That includes a failure caught **before** the first node runs (a missing required input,
 an unknown key, an unreadable graph). Nothing executed, so `nodes` is `{}` and `costUsd`
@@ -214,7 +215,8 @@ is `0.0`, and the reason is in `errors[0].message`:
 ```json
 {"outputs": {"Answer": null}, "costUsd": 0.0, "costExact": true, "remainingBalance": null,
  "nodes": {}, "errors": [{"node_id": null, "name": null,
-                          "message": "missing required input: Answer"}], "promptTrims": []}
+                          "message": "missing required input: Answer"}],
+ "promptTrims": [], "payments": []}
 ```
 
 ## Supported nodes
@@ -292,7 +294,8 @@ the node that sent it, and when the paid call itself answered an error. `status`
 is the money fact: `sent` means your callback returned, `failed` means it raised
 and nothing was deposited, and the error message says which. A settled deposit
 always gets its request: the run deadline never cancels the one call the user
-has already paid for.
+has already paid for. The CLI reports the same list as `payments` in its `--json`
+output, so an agent caller never has to re-derive a payment id from stderr.
 
 Copy-paste scripts (CLI, print callback, wallet stub):
 [examples/x402/](examples/x402/).

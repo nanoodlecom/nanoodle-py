@@ -33,7 +33,7 @@ nanoodle run graph.json --input Text="a cozy ramen shop" --input n2.system=@file
 nanoodle inspect graph.json      # prints inputs/outputs/settings + node table
 ```
 --out saves media outputs to files (fetch https, decode data:), prints text outputs; --json prints machine-readable result.
-A FAILED run with --json prints the same JSON (per-node status/error, partial outputs, accrued cost, prompt trims) and exits non-zero.
+A FAILED run with --json prints the same JSON (per-node status/error, partial outputs, accrued cost, prompt trims, x402 payments) and exits non-zero.
 
 ## Public API — Python (mirror, pythonic)
 ```python
