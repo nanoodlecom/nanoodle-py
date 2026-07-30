@@ -5,8 +5,10 @@ The catalog is never fetched: model ids pass through as typed, endpoint choice
 is by node TYPE only.
 """
 
+import atexit
 import json
 import re
+import threading
 import time
 import urllib.parse
 
@@ -45,6 +47,55 @@ class NodeCancelled(NanoodleError):
     pass
 
 
+# ---- money-critical sections -----------------------------------------------
+# Pool workers are DAEMON threads (workflow._DaemonPool), so a node the run
+# deadline abandoned cannot hold interpreter exit. A daemon thread is frozen at
+# finalization, which is fine for a poll loop and NOT fine in the middle of a
+# wallet callback or the request a settled deposit already paid for. Those two
+# spans mark themselves money-critical, and exit waits a short, bounded time for
+# them. The trade-off is explicit: exit waits at most EXIT_MONEY_GRACE seconds,
+# then goes anyway. The request bytes are already on the wire by then; only its
+# reply is lost, and an abandoned run discards that reply in any case.
+EXIT_MONEY_GRACE = 5.0
+
+_MONEY = threading.Condition()
+_MONEY_INFLIGHT = [0]
+
+
+class _money_critical(object):
+    """Context manager: 'this thread is moving money, do not exit under it'."""
+
+    def __enter__(self):
+        with _MONEY:
+            _MONEY_INFLIGHT[0] += 1
+        return self
+
+    def __exit__(self, *exc):
+        with _MONEY:
+            _MONEY_INFLIGHT[0] -= 1
+            _MONEY.notify_all()
+        return False
+
+
+def _wait_for_money_in_flight(timeout=EXIT_MONEY_GRACE):
+    """Block until no money-critical section is running, or the grace runs out.
+
+    Returns True when the sections finished. Registered as an atexit hook:
+    atexit callbacks run BEFORE daemon threads are frozen.
+    """
+    end = time.monotonic() + timeout
+    with _MONEY:
+        while _MONEY_INFLIGHT[0] > 0:
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            _MONEY.wait(left)
+    return True
+
+
+atexit.register(_wait_for_money_in_flight)
+
+
 class Engine(object):
     def __init__(self, api_key, base_url, http, poll_intervals=None, timeouts=None,
                  on_progress=None, payment=None):
@@ -61,27 +112,212 @@ class Engine(object):
         self.timeout_video = to.get("video", 600.0)
         self.timeout_audio = to.get("audio", 300.0)
         self.http_timeout = to.get("http", 120.0)
+        # Socket budget for the one request a SETTLED x402 deposit has already
+        # paid for, when the run that ordered it is already abandoned. It must
+        # be long enough for that request to reach the API, and short enough
+        # that it never re-creates the process hang this module removes.
+        self.redeem_grace = to.get("redeem", 15.0)
         self.on_progress = on_progress
         # Set by Workflow._execute when a run-level timeout is active so local
         # media / long poll loops can stop promptly.
         self._deadline = None          # time.monotonic() absolute, or None
         self._timeout_secs = None      # original timeout for error messages
+        # Latched by cancel() / the deadline. Poll loops wait on it instead of
+        # time.sleep(), so an abandoned node wakes in milliseconds and its
+        # thread can die. Without it the non-daemon pool threads keep polling
+        # and the interpreter's atexit thread-join hangs the whole process.
+        self._cancel = threading.Event()
+        # x402 deposits this engine asked the wallet to send. Money that left
+        # the wallet must stay traceable even when the worker thread that sent
+        # it is abandoned, so the record lives on the engine, not in the
+        # worker's exception.
+        self._payments = []
+        self._payments_lock = threading.Lock()
+        # Which node the calling thread is executing, for the payment record.
+        self._tls = threading.local()
 
     def set_run_deadline(self, deadline, timeout_secs=None):
         self._deadline = deadline
         self._timeout_secs = timeout_secs
 
-    def check_cancel(self):
-        """Raise if the workflow deadline has passed. Safe no-op when no deadline."""
+    def cancel(self):
+        """Abandon every in-flight node now. Poll loops and interruptible sleeps
+        wake immediately. Called by Workflow when a run deadline expires.
+
+        The payments lock is held while the flag latches. _record_payment takes
+        the same lock and re-checks the flag under it, so once cancel() returns
+        no NEW deposit can ever be recorded. Every deposit that will ever exist
+        is therefore already visible to the caller that just cancelled.
+        """
+        with self._payments_lock:
+            self._cancel.set()
+
+    def cancelled(self):
+        """True once the run is cancelled or the deadline has passed.
+
+        The deadline latches the event, so a thread already blocked in
+        ``sleep()`` wakes on the next slice instead of the next poll timeout.
+        With no deadline and no cancel this is always False.
+        """
+        if self._cancel.is_set():
+            return True
         if self._deadline is not None and time.monotonic() > self._deadline:
+            self._cancel.set()
+            return True
+        return False
+
+    def check_cancel(self):
+        """Raise if the run is cancelled. Safe no-op when no deadline is set."""
+        if self.cancelled():
             msg = ("run timed out after %ss" % self._timeout_secs
                    if self._timeout_secs is not None else "run cancelled")
             raise NodeCancelled(msg)
 
+    def sleep(self, seconds):
+        """Sleep, but wake early when the run is cancelled or the deadline passes.
+
+        A run with no deadline and no cancel gets a plain time.sleep(), so
+        normal runs keep today's behaviour exactly.
+        """
+        if seconds is None or seconds <= 0:
+            return
+        if self._deadline is None and not self._cancel.is_set():
+            time.sleep(seconds)
+            return
+        if self._deadline is not None:
+            # cap the wait at the remaining deadline so the caller re-checks
+            # promptly even if nobody calls cancel()
+            seconds = min(seconds, max(0.0, self._deadline - time.monotonic()))
+        self._cancel.wait(seconds)
+
+    def _http_timeout_now(self):
+        """Socket timeout for the next request, clamped to the run deadline.
+
+        Without a deadline this is the configured http timeout, unchanged. With
+        one it never exceeds the time left, so an abandoned node cannot block
+        for the full 120 s inside a single read.
+        """
+        if self._deadline is None:
+            return self.http_timeout
+        self.check_cancel()
+        return max(0.05, min(self.http_timeout, self._deadline - time.monotonic()))
+
+    def _redeem_timeout(self):
+        """Socket timeout for the request a SETTLED deposit already paid for.
+
+        Two rules meet here and both must hold:
+
+        - The user's XNO is gone, so this request must go out and be given a
+          real chance to land. The run deadline must not cancel it.
+        - It runs on a worker the run may already have abandoned, so it must
+          not block for the full http_timeout (120 s). Measured: it did, and
+          that put the process hang back at 120 s instead of 600 s.
+
+        So it gets whatever the run has left, never less than ``redeem_grace``
+        and never more than ``http_timeout``. Exactly, with the defaults:
+
+        - no deadline (``run()`` with no ``timeout=``): http_timeout, 120 s.
+        - live run, more than 120 s of deadline left: 120 s.
+        - live run, 60 s of deadline left: 60 s.
+        - live run, less than 15 s left: redeem_grace, 15 s.
+        - cancelled, or the deadline has passed: redeem_grace, 15 s.
+
+        A run WITH a deadline can therefore get less than http_timeout here.
+        That is deliberate: the run dies at its deadline whatever this one call
+        does, and redeem_grace is the floor that still lets the request land.
+        On an abandoned run redeem_grace is also what bounds process exit.
+        """
+        if self._deadline is None and not self._cancel.is_set():
+            return self.http_timeout
+        left = 0.0
+        if self._deadline is not None and not self._cancel.is_set():
+            left = max(0.0, self._deadline - time.monotonic())
+        return min(self.http_timeout, max(self.redeem_grace, left))
+
+    # ---- x402 payment ledger ------------------------------------------------
+
+    def payments(self):
+        """Every x402 deposit this engine asked the wallet to send, oldest first.
+
+        Each entry is a dict: node_id, payment_id, amount, pay_to, explorer_url,
+        trace (one human-readable line), status, send_error and redeemed.
+
+        ``status`` is the money fact, and the three values are different states:
+
+        - ``"sending"`` — the wallet callback was entered and has not returned.
+          Whether XNO left is not known yet.
+        - ``"sent"`` — the callback returned without raising. Money moved.
+        - ``"failed"`` — the callback raised. No deposit was made, and
+          ``send_error`` carries the reason.
+
+        ``redeemed`` is True once the request the deposit paid for came back
+        with a 2xx. Any other status leaves it False: the XNO is gone and the
+        caller got nothing for it, so the payment id belongs in the node's
+        error message next to the API's own message.
+        """
+        with self._payments_lock:
+            return [dict(p) for p in self._payments]
+
+    def unredeemed_payments(self):
+        """Deposits whose request never returned a result — any send status.
+
+        A failed send is reported too, because the caller must be able to tell
+        'your money is gone and unspent' from 'your wallet never sent it'.
+        """
+        return [p for p in self.payments() if not p["redeemed"]]
+
+    def _record_payment(self, invoice, trace):
+        """Open a ledger entry, BEFORE the callback and atomically with cancel.
+
+        Written before the callback because the worker thread can be abandoned
+        at any point after this line, and its exception then reaches nobody, so
+        the payment id has to live on the engine. It starts at "sending": no
+        money has moved yet, and the entry must never claim otherwise.
+
+        The cancel check sits INSIDE the lock that cancel() takes. That closes
+        the race where a worker clears check_cancel() microseconds before
+        Workflow calls cancel() and then records a deposit that no sweep and no
+        result snapshot could see.
+        """
+        record = {"node_id": getattr(self._tls, "node_id", None),
+                  "payment_id": invoice["paymentId"],
+                  "amount": invoice.get("amount") or invoice.get("amountRaw"),
+                  "pay_to": invoice.get("payTo"),
+                  "explorer_url": invoice.get("explorerUrl") or invoice.get("statusUrl"),
+                  "trace": trace,
+                  "status": "sending",
+                  "send_error": None,
+                  "redeemed": False}
+        with self._payments_lock:
+            self.check_cancel()
+            self._payments.append(record)
+        return record
+
+    def _mark_sent(self, record):
+        """The wallet callback returned. Only now did money really move."""
+        with self._payments_lock:
+            record["status"] = "sent"
+
+    def _mark_send_failed(self, record, exc):
+        """The wallet callback raised. Nothing was deposited — say so."""
+        with self._payments_lock:
+            record["status"] = "failed"
+            record["send_error"] = str(exc) or exc.__class__.__name__
+
+    def _mark_redeemed(self, record):
+        if record is None:
+            return
+        with self._payments_lock:
+            record["redeemed"] = True
+
     def local_fetcher(self):
-        """Adapter for local_media: callable(url) -> bytes (drops content-type)."""
+        """Adapter for local_media: callable(url) -> bytes (drops content-type).
+
+        Local media ops run INSIDE the run, so their downloads obey the run
+        deadline.
+        """
         def fetch(url):
-            data, _ctype = self.fetch_media(url)
+            data, _ctype = self.fetch_media(url, run_bound=True)
             return data
         return fetch
 
@@ -114,19 +350,36 @@ class Engine(object):
         the original request stamped with the settled payment id. Each API call
         pays at most once; a second 402 after settling is an error, never a
         second send."""
-        resp = self.http(method, url, headers=headers, body=body, timeout=self.http_timeout)
+        resp = self.http(method, url, headers=headers, body=body,
+                         timeout=self._http_timeout_now())
         if resp.status != 402 or self._payment is None or self._api_key:
             return resp
         settled = self._settle_402(resp)
+        record = settled.get("record")
         if settled.get("response") is not None:
+            self._mark_redeemed(record)
             return settled["response"]  # complete replayed the stored request
         retry_headers = dict(headers)
         retry_headers["x-x402-payment-id"] = settled["paymentId"]
-        resp2 = self.http(method, url, headers=retry_headers, body=body, timeout=self.http_timeout)
+        # The deposit is settled: real XNO has left the wallet and the API owes
+        # this request. The run deadline governs work the run MAY abandon, so it
+        # must not cancel the one request the user already paid for. It gets its
+        # own budget, independent of the deadline — but a BOUNDED one, see
+        # _redeem_timeout: an unbounded budget here re-created the process hang.
+        with _money_critical():
+            resp2 = self.http(method, url, headers=retry_headers, body=body,
+                              timeout=self._redeem_timeout())
         if resp2.status == 402:
             raise NanoodleError(
                 "payment %s settled, but the API still answered 402 on retry — check %s "
                 "before paying again" % (settled["paymentId"], settled.get("statusUrl") or "the payment status"))
+        # Only a 2xx redeems the deposit. On a 500 (or any other error status)
+        # the XNO is gone and the caller got nothing for it, so the deposit
+        # stays unredeemed and Workflow names it in the node error next to the
+        # API's own message. Marking it redeemed here hid the payment id from
+        # the one sentence the user actually reads.
+        if 200 <= resp2.status < 300:
+            self._mark_redeemed(record)
         return resp2
 
     def _settle_402(self, resp):
@@ -136,30 +389,55 @@ class Engine(object):
             raise NanoodleError(
                 "payment required, but the 402 response offered no usable Nano option"
                 + (" — " + resp.text()[:200] if body else ""))
-        self._payment(invoice)  # ← the callback does the actual XNO send
+        trace = ("(payment %s, %s to %s) — check %s"
+                 % (invoice["paymentId"], invoice.get("amount") or invoice.get("amountRaw"),
+                    invoice.get("payTo"),
+                    invoice.get("explorerUrl") or invoice.get("statusUrl")))
+        # Never start a NEW deposit on a run that is already abandoned: nothing
+        # would ever redeem it. This closes the window before money moves.
+        # _record_payment re-checks under the cancel lock.
+        self.check_cancel()
+        record = self._record_payment(invoice, trace)   # status "sending"
+        # The callback does the actual XNO send. Mark the entry "sent" only
+        # after it RETURNS: a callback that raises deposited nothing, and a
+        # ledger that claimed otherwise would send the user hunting an explorer
+        # for money that never moved.
+        with _money_critical():
+            try:
+                self._payment(invoice)
+            except BaseException as exc:   # noqa: BLE001 - re-raised below
+                self._mark_send_failed(record, exc)
+                raise
+            self._mark_sent(record)
         # The complete endpoint doubles as the poll: 402 = not seen on-chain yet.
         deadline = (invoice["expiresAt"] / 1000.0) if invoice.get("expiresAt") else time.time() + 15 * 60
         while True:
+            # A run deadline outranks the payment window. Stop here rather than
+            # poll for 15 more minutes on a run whose result is already
+            # discarded. Name the payment so a sent deposit stays traceable —
+            # this check is FIRST so its message beats the generic cancel
+            # message that _http_timeout_now() would raise below.
+            if self.cancelled():
+                raise NodeCancelled(
+                    "run cancelled before the Nano deposit was detected " + trace)
             cr = self.http("POST", invoice["completeUrl"],
                            headers={"Content-Type": "application/json", "x-x402": "true"},
-                           body="{}", timeout=self.http_timeout)
+                           body="{}", timeout=self._http_timeout_now())
             if 200 <= cr.status < 300:
                 cj = parse_json(cr.text()) if "json" in (cr.header("content-type") or "") else None
                 if looks_like_result(cj):
                     # re-wrap so call sites keep their HttpResponse contract
                     replay = HttpResponse(200, cr.headers, json.dumps(cj).encode("utf-8"))
                     return {"paymentId": invoice["paymentId"], "statusUrl": invoice.get("statusUrl"),
-                            "response": replay}
-                return {"paymentId": invoice["paymentId"], "statusUrl": invoice.get("statusUrl")}
+                            "record": record, "response": replay}
+                return {"paymentId": invoice["paymentId"], "statusUrl": invoice.get("statusUrl"),
+                        "record": record}
             if cr.status != 402:
                 self._raise_http(cr)
             if time.time() >= deadline:
                 raise NanoodleError(
-                    "payment window expired before the Nano deposit was detected (payment %s, %s to %s) "
-                    "— if you already sent it, check %s"
-                    % (invoice["paymentId"], invoice.get("amount") or invoice.get("amountRaw"),
-                       invoice.get("payTo"), invoice.get("explorerUrl") or invoice.get("statusUrl")))
-            time.sleep(self.poll_x402)
+                    "payment window expired before the Nano deposit was detected " + trace)
+            self.sleep(self.poll_x402)   # wakes early on cancel/deadline
 
     def _raise_http(self, resp):
         body = resp.text()
@@ -186,11 +464,21 @@ class Engine(object):
 
     def _get(self, path):
         return self.http("GET", self.base_url + path, headers=self._auth_headers(),
-                         timeout=self.http_timeout)
+                         timeout=self._http_timeout_now())
 
-    def fetch_media(self, url):
-        """Download bytes of an https media URL (no auth headers — provider CDNs)."""
-        resp = self.http("GET", url, headers={}, timeout=self.http_timeout)
+    def fetch_media(self, url, run_bound=False):
+        """Download bytes of an https media URL (no auth headers — provider CDNs).
+
+        The run deadline governs work the RUN is still doing, never a caller who
+        asks a returned MediaRef for its bytes. Those are different lifetimes:
+        every MediaRef carries this method as its lazy fetcher (``_media_ref``)
+        and the caller may call it long after ``run()`` returned, or after a
+        SIBLING lane timed out and cancelled the engine. So the default is
+        deadline-free. Fetches the run itself makes pass run_bound=True and stop
+        with the run.
+        """
+        timeout = self._http_timeout_now() if run_bound else self.http_timeout
+        resp = self.http("GET", url, headers={}, timeout=timeout)
         if not (200 <= resp.status < 300):
             raise NanoodleError("could not download media (%d)" % resp.status)
         return resp.body, resp.header("content-type") or ""
@@ -267,7 +555,13 @@ class Engine(object):
         fn = _EXECUTORS.get(node.type)
         if fn is None:
             raise NanoodleError("node type %r cannot be executed" % node.type)
-        return fn(self, node, inp, on_cost)
+        # Stamp the worker thread so an x402 deposit sent inside this node can
+        # be reported against it later, even if the node itself is abandoned.
+        self._tls.node_id = node.id
+        try:
+            return fn(self, node, inp, on_cost)
+        finally:
+            self._tls.node_id = None
 
 
 def _is_num(v):
@@ -529,7 +823,7 @@ def _inline_hosted_audio(engine, url):
     """Hosted audio (music/tts nodes return https CDN URLs verbatim) -> download
     and inline as a data: URL: the chat input_audio part carries bytes, never a
     URL (mirrors JS client.fetchMediaDataUrl)."""
-    data, ctype = engine.fetch_media(url)
+    data, ctype = engine.fetch_media(url, run_bound=True)
     mime = (ctype or "").split(";")[0].strip().lower()
     if not mime or mime in ("application/octet-stream", "binary/octet-stream"):
         mime = None  # make_data_url sniffs magic bytes when the CDN's type is generic
@@ -690,7 +984,12 @@ def _gen_video(engine, node, on_cost, prompt, extra_body):
         raise NanoodleError("no runId returned")
     t0 = time.monotonic()
     while time.monotonic() - t0 < engine.timeout_video:
-        time.sleep(engine.poll_video)
+        # The run deadline outranks timeout_video. Both checks sit OUTSIDE the
+        # try below: NodeCancelled is a NanoodleError, and the except there
+        # swallows NanoodleError to keep polling.
+        engine.check_cancel()
+        engine.sleep(engine.poll_video)   # wakes early on cancel/deadline
+        engine.check_cancel()
         try:
             resp = engine._get(VIDEO_STATUS + "?requestId=" + urllib.parse.quote(str(run_id)))
             s = json.loads(resp.text())
@@ -824,7 +1123,11 @@ def _poll_audio(engine, node, model, submit_json):
     query = urllib.parse.urlencode(qs)
     t0 = time.monotonic()
     while time.monotonic() - t0 < engine.timeout_audio:
-        time.sleep(engine.poll_audio)
+        # See _gen_video: the run deadline outranks timeout_audio, and both
+        # checks must stay outside the NanoodleError-swallowing try below.
+        engine.check_cancel()
+        engine.sleep(engine.poll_audio)   # wakes early on cancel/deadline
+        engine.check_cancel()
         try:
             resp = engine._get(AUDIO_STATUS + "?" + query)
             s = json.loads(resp.text())
@@ -907,7 +1210,7 @@ def _run_transcribe(engine, node, inp, on_cost):
     if src.startswith("data:"):
         mime, data = parse_data_url(src)
     else:
-        data, ctype = engine.fetch_media(src)
+        data, ctype = engine.fetch_media(src, run_bound=True)
         mime = (ctype or "audio/mpeg").split(";")[0].strip() or "audio/mpeg"
     if len(data) > TRANSCRIBE_MAX_BYTES:
         raise NanoodleError("this clip is too big to transcribe directly (~3.5 MB max) — use a shorter clip")

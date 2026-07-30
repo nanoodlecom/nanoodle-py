@@ -160,7 +160,7 @@ def _print_prerun_failure_json(wf, exc):
                "costUsd": 0.0, "costExact": True, "remainingBalance": None,
                "nodes": {},
                "errors": [{"node_id": None, "name": None, "message": str(exc)}],
-               "promptTrims": []}
+               "promptTrims": [], "payments": []}
     print(json.dumps(payload, indent=2))
     print("error: %s" % exc, file=sys.stderr)
     return 1
@@ -226,7 +226,12 @@ def cmd_run(args):
                                    "costUsd": r.cost_usd, "ms": r.ms}
                              for nid, r in result.nodes.items()},
                    "errors": result.errors,
-                   "promptTrims": result.prompt_trims}
+                   "promptTrims": result.prompt_trims,
+                   # every x402 deposit this run asked for (empty on a keyed run). A
+                   # deposit is the one thing an agent caller cannot re-derive from the
+                   # run, so the payment id and explorer URL belong on stdout, not only
+                   # in the RunResult a --json caller never sees.
+                   "payments": result.payments}
         for key in friendly:
             value = result.outputs.get(key)
             if isinstance(value, MediaRef):

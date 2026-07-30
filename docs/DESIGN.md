@@ -33,7 +33,7 @@ nanoodle run graph.json --input Text="a cozy ramen shop" --input n2.system=@file
 nanoodle inspect graph.json      # prints inputs/outputs/settings + node table
 ```
 --out saves media outputs to files (fetch https, decode data:), prints text outputs; --json prints machine-readable result.
-A FAILED run with --json prints the same JSON (per-node status/error, partial outputs, accrued cost, prompt trims) and exits non-zero.
+A FAILED run with --json prints the same JSON (per-node status/error, partial outputs, accrued cost, prompt trims, x402 payments) and exits non-zero.
 
 ## Public API — Python (mirror, pythonic)
 ```python
@@ -45,7 +45,7 @@ result = wf.run({"Text": "a cozy ramen shop"}, settings=None, timeout=None, on_p
 result["Image"]              # __getitem__ = outputs lookup (friendly key or node id)
 result.outputs, result.cost_usd, result.cost_exact, result.remaining_balance, result.nodes, result.errors
 ```
-- Sync API (urllib + concurrent.futures ThreadPoolExecutor for node concurrency). Same RunError semantics.
+- Sync API (urllib + a daemon-thread pool over concurrent.futures Futures for node concurrency). Same RunError semantics.
 - MediaRef: .url, .mime, .bytes(), .save(path), __str__ → url.
 - Injectable transport: Workflow(..., base_url=..., http=callable) for the harness (default small urllib wrapper).
 - CLI: `python -m nanoodle run|inspect ...` mirroring the JS flags.

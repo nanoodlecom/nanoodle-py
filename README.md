@@ -138,6 +138,16 @@ result = wf.run(
 )
 ```
 
+`timeout=` bounds the whole run. When it fires, `run()` returns straight away
+and the in-flight nodes stop polling within about a second, so the process is
+free to exit. Without `timeout=`, each node still waits out its own limit
+(video 600 s, audio 300 s).
+
+The deadline bounds the run, and nothing else. Media a node already produced
+stays fetchable after it: `result["Image"].save("out.png")` works once the
+deadline has passed, and works for a lane that finished while another lane
+timed out.
+
 `run()` raises `RunError` when an output (sink) node fails — `error.result`
 still has partial results, per-node statuses, and cost so far. Failures in
 lanes no output depends on only appear in `result.errors`. Unknown/unsupported
@@ -193,9 +203,10 @@ nanoodle-py inspect "https://nanoodle.com/#g=..."                 # a share link
 - `--env-file PATH` — load `.env`-style `KEY=VALUE` lines (existing env vars win)
 
 With `--json`, a **failed** run still prints the same JSON on stdout — per-node
-`status` and `error`, the outputs that did complete, the cost already spent, and any
-prompt trims — and exits 1. Without `--json` a failed run prints `error: …` on stderr
-and exits 1, as before.
+`status` and `error`, the outputs that did complete, the cost already spent, any
+prompt trims (`promptTrims`) and any Nano deposit the run asked for (`payments`,
+empty unless you ran `--pay`) — and exits 1. Without `--json` a failed run prints
+`error: …` on stderr and exits 1, as before.
 
 That includes a failure caught **before** the first node runs (a missing required input,
 an unknown key, an unreadable graph). Nothing executed, so `nodes` is `{}` and `costUsd`
@@ -204,7 +215,8 @@ is `0.0`, and the reason is in `errors[0].message`:
 ```json
 {"outputs": {"Answer": null}, "costUsd": 0.0, "costExact": true, "remainingBalance": null,
  "nodes": {}, "errors": [{"node_id": null, "name": null,
-                          "message": "missing required input: Answer"}], "promptTrims": []}
+                          "message": "missing required input: Answer"}],
+ "promptTrims": [], "payments": []}
 ```
 
 ## Supported nodes
@@ -273,6 +285,17 @@ with your own wallet/signer, or show ``inv["uri"]`` for a human to scan. Each
 API call pays at most once; graphs with several paid nodes produce one small
 invoice per node. The invoice dict is field-identical to nanoodle-js's, so
 payment callbacks port between the two libraries unchanged.
+
+Money that leaves the wallet stays traceable. `result.payments` lists every
+deposit the run asked for (`payment_id`, `amount`, `pay_to`, `explorer_url`,
+`status`, `send_error`, `redeemed`), and a deposit that never bought its request
+is named in the node's error message too — including when a `timeout=` abandoned
+the node that sent it, and when the paid call itself answered an error. `status`
+is the money fact: `sent` means your callback returned, `failed` means it raised
+and nothing was deposited, and the error message says which. A settled deposit
+always gets its request: the run deadline never cancels the one call the user
+has already paid for. The CLI reports the same list as `payments` in its `--json`
+output, so an agent caller never has to re-derive a payment id from stderr.
 
 Copy-paste scripts (CLI, print callback, wallet stub):
 [examples/x402/](examples/x402/).

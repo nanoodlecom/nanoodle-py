@@ -8,17 +8,79 @@ URLs for the MediaRef pipeline.
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 from .errors import NanoodleError
 from .media import MEDIA_INLINE_MAX, make_data_url, parse_data_url, sniff_mime
 
 MAX_FRAMES = 12
+
+
+# ---- children must not outlive this interpreter -----------------------------
+# _run() kills its ffmpeg child from the worker thread, in a `finally`. That is
+# enough while the interpreter WAITS for the worker. Run-pool workers are now
+# daemon threads (workflow._DaemonPool), and a daemon thread is frozen at
+# interpreter finalization, so that `finally` can simply never run: the parent
+# exits and the ffmpeg child keeps going, holding a CPU and a temp file after
+# the caller thinks the run ended.
+#
+# So every child this module starts is registered here, and an atexit hook kills
+# whatever is still alive. atexit callbacks run BEFORE daemon threads are
+# frozen, which is the same door engine.EXIT_MONEY_GRACE holds open. The hook is
+# separate because the two do opposite things: money in flight is WAITED for,
+# an abandoned ffmpeg is KILLED. The hook is hard-bounded (SIGKILL, then at most
+# EXIT_CHILD_GRACE seconds of reaping in total) so it can never re-create the
+# process hang this release removes.
+EXIT_CHILD_GRACE = 2.0
+
+_CHILDREN = {}
+_CHILDREN_LOCK = threading.Lock()
+
+
+def _track_child(p):
+    with _CHILDREN_LOCK:
+        _CHILDREN[id(p)] = p
+
+
+def _forget_child(p):
+    with _CHILDREN_LOCK:
+        _CHILDREN.pop(id(p), None)
+
+
+def _kill_children_at_exit(timeout=EXIT_CHILD_GRACE):
+    """Kill every ffmpeg/ffprobe child still running, and reap it.
+
+    Returns the number of children it had to kill (0 on a clean exit, which is
+    every exit where no worker was abandoned mid-render).
+    """
+    with _CHILDREN_LOCK:
+        live = [p for p in _CHILDREN.values() if p.poll() is None]
+        _CHILDREN.clear()
+    for p in live:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    end = time.monotonic() + timeout
+    for p in live:
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            p.wait(timeout=left)
+        except Exception:
+            pass
+    return len(live)
+
+
+atexit.register(_kill_children_at_exit)
 
 
 def _effective_timeout(default, deadline=None):
@@ -53,6 +115,9 @@ def _run(bin_name, args, timeout=120, cancel_check=None, deadline=None):
         raise NanoodleError(
             "local media nodes need ffmpeg on PATH (not found: %s). "
             "Install ffmpeg, or run this graph in the nanoodle browser app." % bin_name)
+    # From here the child exists, and this thread may be frozen at any moment
+    # (daemon worker). The exit hook owns it until the finally below drops it.
+    _track_child(p)
     end = time.monotonic() + eff
     stdout = stderr = None
     try:
@@ -86,6 +151,7 @@ def _run(bin_name, args, timeout=120, cancel_check=None, deadline=None):
                 p.communicate(timeout=2)
             except Exception:
                 pass
+        _forget_child(p)
     if p.returncode != 0:
         err = (stderr or b"").decode("utf-8", "replace").strip()
         raise NanoodleError("%s failed (exit %s): %s" % (bin_name, p.returncode, err[-400:] or "no stderr"))

@@ -103,6 +103,62 @@ Present-but-zero = known-included (subscription), keep 0. Absent → cost unknow
 - else → error "<status>: <body first 160 chars>".
 No streaming retries needed (engine is non-streaming). Poll GET failures: silently continue the loop until timeout.
 
+## Run deadline (`run(timeout=…)`)
+A run-level timeout sets an absolute deadline on the engine. The deadline outranks every per-node timeout:
+- The video and audio status-poll loops check the deadline before and after each sleep, and stop at once when it passes. `timeout_video` (600 s) and `timeout_audio` (300 s) only apply while the deadline is in the future.
+- The sleep between poll attempts is interruptible. It waits on a cancel event and never sleeps past the deadline.
+- Per-request socket timeouts are capped at the time left, so one read cannot outlive the deadline by up to `http_timeout` (120 s).
+- The x402 settle poll stops at the deadline too, and starts no NEW deposit once the run is cancelled.
+This matters because a live worker can block interpreter exit, not just `run()`. `ThreadPoolExecutor` workers are non-daemon, and both the `concurrent.futures` atexit hook and `threading._shutdown()` join every non-daemon thread, so a thread still polling an abandoned run holds the whole process. The run pool is therefore `workflow._DaemonPool`, whose workers are daemon threads: deadline-aware loops shorten that window, and daemon workers close it. With no `timeout=`, no deadline exists and every loop behaves exactly as it did before.
+
+A daemon thread is frozen at interpreter finalization, which is right for a poll loop and wrong in the middle of a wallet callback. Those spans mark themselves money-critical (`engine._money_critical`) and an atexit hook waits up to `EXIT_MONEY_GRACE` (5 s) for them, then exits anyway.
+
+A frozen daemon also never reaches the `finally` that kills its ffmpeg child. Local media nodes shell out to ffmpeg/ffprobe, so every child `local_media._run` starts is registered and a second atexit hook kills whatever is still alive (`local_media._kill_children_at_exit`, hard-bounded by `EXIT_CHILD_GRACE`, 2 s).
+
+**That hook is the only thing that bounds an orphaned child. Do not remove it. SIGPIPE is not a backstop, because it is a race that the orphan usually wins.**
+
+- A quiet child — `ffprobe -v error`, the flag every `local_media` probe passes — writes nothing until it is done. It never touches the closed pipe, so nothing tells it to stop, ever.
+- A chatty `ffmpeg` writes to stderr about twice a second, so it does touch the closed pipe. Whether that kills it depends on WHEN the parent died: `ffmpeg` sets SIGPIPE to `SIG_IGN` itself (the SIGPIPE bit of `SigIgn` in `/proc/PID/status`, mask `…1000`) a fraction of a second after it starts. Measured with `--when`: 0.08 to 0.11 s on an idle machine, 0.39 to 0.61 s on a busy one, 19 runs in total. Before that point the next write kills the child. After it, the writes fail with `EPIPE`, `av_log` discards the error, and the child runs on to the end of its work.
+
+`scripts/measure-orphan-sigpipe.py` reads the REAL fate of the orphan: it makes itself a child subreaper, so `waitpid()` reports the exit status of a process whose parent is gone. On Linux 6.14, ffmpeg 7.1.1, Python 3.11.10. **Every count below moves with the machine and its load** — the start-up of ffmpeg is what varies, and this box was shared with other work:
+
+| the parent dies … | the orphaned chatty ffmpeg | runs |
+|---|---|---|
+| 0.05 s after the child starts | killed by SIGPIPE, 11 of 11 | 11 |
+| 0.4 s after | killed by SIGPIPE 11 times, alive at the end of the 12 s wait 13 times | 24 |
+| 1.0 s after | alive at the end of the wait 7 times, killed once | 8 |
+| 3.0 s after | alive at the end of the wait, 6 of 6 | 6 |
+
+The 0.4 s row is the one that matters, because that is where an abandoned worker of this library lands, and there the answer is a coin flip. Through the library harness itself (`scripts/measure-timeout-hang.py --chatty --no-reaper`), a chatty ffmpeg was still running 45 s after its parent in 14 of 16 runs, and died 0.33 s and 1.74 s after it in the other 2. Only children that had NOT yet reached their `SIG_IGN` call died; every child that had reached it survived (6 runs, each correlated against `/proc/PID/status`). With the hook, the same chatty child was dead at the first check after the parent exited (0.00 s, 8 runs out of 8).
+
+Two earlier revisions of this document each wrote down one side of that race as a fact — first "a chatty ffmpeg dies on its own about 1.5 to 2.0 s later", then "still running 45 s after its parent, 8 runs out of 8". Both are retracted. The orphan usually survives, sometimes dies, and nothing in this library decides which.
+
+`ffprobe` is the one predictable case: it does not ignore SIGPIPE at all. A chatty probe (`ffprobe -show_frames -of csv` on the same source) died 0.02 to 0.04 s after its parent in 8 runs of `measure-orphan-sigpipe.py --bin ffprobe`, and 0.00 to 0.02 s after it in 5 runs of `measure-timeout-hang.py --chatty-probe --no-reaper`. No `local_media` ffprobe call is chatty, though — they all pass `-v error`. Do not depend on SIGPIPE anywhere.
+
+### What the deadline must NOT bound
+The deadline governs work the run is still doing. Two things have a different lifetime and stay outside it:
+- **Media of a value the run already returned.** Every `MediaRef` carries `engine.fetch_media` as its lazy fetcher, and the caller may call it any time after `run()` returns — the CLI does exactly that in `_save_outputs`. That download uses the full `http_timeout` and never checks the cancel flag, so a successful run keeps its output and a lane that finished keeps its media after a sibling lane timed out. Fetches the run itself makes (`local_fetcher`, inlining hosted audio, transcribe input) pass `run_bound=True` and do stop with the run.
+- **The request a settled x402 deposit paid for.** Once `_settle_402` returns, real XNO has left the wallet. The retry carrying `x-x402-payment-id` is not cancelled by the deadline: a settled payment with no request ever sent is a money bug. Its budget is bounded, though, because it runs on a worker the run may already have abandoned. `_redeem_timeout()` gives it whatever the run has left, never less than `redeem_grace` (15 s) and never more than `http_timeout` (120 s). Exactly:
+
+| run state | socket budget for the paid retry |
+|---|---|
+| no `timeout=` (no deadline) | `http_timeout` — 120 s, unchanged |
+| live, more than 120 s of deadline left | 120 s |
+| live, 60 s of deadline left | 60 s |
+| live, less than 15 s left | 15 s (`redeem_grace`) |
+| cancelled or past the deadline | 15 s (`redeem_grace`) |
+
+So a run WITH a deadline can give the paid retry less than `http_timeout`. That is intentional and it is not a loss: the run dies at its deadline whatever this call does, and `redeem_grace` is the floor that keeps the request itself alive. The full 120 s on an abandoned worker re-created the process hang at 120 s.
+
+### Traceability of a sent deposit
+The engine keeps a ledger of every deposit it asked the callback to send: `node_id`, `payment_id`, `amount`, `pay_to`, `explorer_url`, `trace`, `status`, `send_error`, `redeemed`. `redeemed` turns True only when the request the deposit paid for answered 2xx; a settled deposit whose paid retry answered 500 stays unredeemed, so the payment id reaches the node's error message next to the API's own message.
+
+The record is written BEFORE the callback fires, because the worker thread can be abandoned at any point after that and an abandoned future's exception surfaces nowhere. It therefore opens at `status="sending"`, which claims nothing. It becomes `"sent"` only when the callback RETURNS, and `"failed"` with a `send_error` when the callback raises. A ledger that said "sent" for a wallet callback that failed would send a person hunting an explorer for money that never moved.
+
+`_record_payment` re-checks the cancel flag under the same lock `cancel()` latches it with. So once `cancel()` returns the ledger cannot grow, and every deposit that will ever exist is already visible to the caller that cancelled.
+
+`Workflow` copies the ledger to `result.payments` and names every unredeemed deposit in the error message of the node that sent it, with one sentence per state: "a Nano deposit was already sent …", "a Nano deposit may have been sent …" (callback still in flight), or "no Nano deposit was sent (payment …): the wallet callback failed — …". So a user who sent XNO gets the payment id and explorer URL even when the run timed out and the worker's `NodeCancelled` went nowhere, and a user whose wallet failed is never told money moved.
+
 ## Execution (runGraph 3000-3133)
 1. Alias/filter nodes (materialize): audio→tts, drop unknown types + orphaned links, migrate music/tts inbound "text" port → "prompt".
 2. Kahn topological order; cyclic → error naming the cyclic nodes.

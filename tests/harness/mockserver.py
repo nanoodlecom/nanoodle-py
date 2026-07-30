@@ -192,12 +192,18 @@ class MockNanoGPT(object):
                         mock._in_flight -= 1
 
             def _reply(self, status, headers, payload):
-                self.send_response(status)
-                for k, v in headers.items():
-                    self.send_header(k, v)
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
+                try:
+                    self.send_response(status)
+                    for k, v in headers.items():
+                        self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    # The client hung up mid-response. Timeout tests do this on
+                    # purpose: an abandoned node drops its socket. Normal, and
+                    # the traceback would only be noise in the test log.
+                    self.close_connection = True
 
             def do_GET(self):
                 self._handle("GET")
