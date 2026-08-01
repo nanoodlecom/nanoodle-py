@@ -8,9 +8,11 @@ is by node TYPE only.
 import atexit
 import json
 import re
+import sys
 import threading
 import time
 import urllib.parse
+import warnings as _warnings
 
 from .errors import NanoodleError
 from .graph import (EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name,
@@ -34,6 +36,30 @@ _AUDIO_MIME = {"mp3": "audio/mpeg", "opus": "audio/ogg", "aac": "audio/aac",
 _SONG_COUNT_RE = re.compile(
     r"^(number_of_songs|n|num_songs|song_count|generation_count|generation_count_parameter)$", re.I)
 _SONG_COUNT_LOOSE_RE = re.compile(r"generation_count|num_?songs|song_?count", re.I)
+
+
+def disclose(msg):
+    """Tell the caller something about their own run. This can never fail the run.
+
+    nanoodle-js discloses with process.emitWarning, which is advisory by construction. The
+    Python twin of that is warnings.warn, which is NOT: under PYTHONWARNINGS=error or
+    warnings.simplefilter("error") — the normal setting in a strict CI job or test suite —
+    a warning is raised instead of printed. Raised inside a node, it was collected as that
+    node's error and escalated to RunError, so telling the user about a trim KILLED the run
+    that the trim exists to save. A report must never cost more than what it reports.
+
+    So: warn (a filter, a logging bridge and assertWarns all keep working), and if the
+    warning is configured to raise, catch it and put the same sentence on stderr instead.
+    The disclosure is never lost, and neither is the run. The progress-event channels —
+    ``prompt-trimmed`` / ``node-note`` and ``result.prompt_trims`` — are unaffected either way.
+    """
+    try:
+        _warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    except Exception:   # noqa: BLE001 - warnings-as-errors must not fail a run
+        try:
+            print("nanoodle: %s" % msg, file=sys.stderr)
+        except Exception:   # noqa: BLE001 - a closed stderr must not fail a run either
+            pass
 
 
 def _as_url(value):
@@ -873,6 +899,56 @@ def _run_vision(engine, node, inp, on_cost):
 
 # ---- image family (/v1/images/generations) ---------------------------------
 
+# Edit models that demand a FIXED, ORDERED set of input images. Nothing in the live catalog
+# declares a minimum — a full 215-model scan (2026-07-31) found no min_items/min_input_images
+# field, only free text — so the roles live here. The order IS the slot order: role 1 = the
+# ``image`` port, role 2 = ``image2``, … (flux vto auto-detects the wearer either way, but a
+# garment-first send is charged and drifts the identity toward the garment photo's model).
+IMG_INPUT_ROLES = {
+    "flux-pro/v1/vto": ("person", "garment"),
+}
+
+
+def _img_slot(i):
+    """Slot index (1-based) -> EDIT_IMG_RE port name."""
+    return "image" if i == 1 else "image%d" % i
+
+
+def _guard_input_roles(node, inp):
+    """Refuse a role-model edit BEFORE the paid call unless every slot is wired.
+
+    Read the RAW inp keys, never _collect_ports: that compacts (``if inp[k]``), so wiring
+    only ``image2`` promotes the garment into the person slot and buys a silently wrong
+    result. One image is a plain 400 upstream (uncharged); a swapped pair is charged.
+    """
+    roles = IMG_INPUT_ROLES.get(str(node.fields.get("model") or "").strip())
+    if not roles:
+        return
+    missing = [r for i, r in enumerate(roles) if not inp.get(_img_slot(i + 1))]
+    if not missing:
+        return
+    slots = ", ".join("%s (%s)" % (r, _img_slot(i + 1)) for i, r in enumerate(roles))
+    raise NanoodleError(
+        "%s needs %d images: %s — %d wired (missing: %s)"
+        % (node.fields.get("model"), len(roles), slots,
+           len(roles) - len(missing), ", ".join(missing)))
+
+
+def _kept_first(engine, node, urls):
+    """edit/inpaint have a single image output, but some models always bill (and return) a
+    fixed batch — midjourney/text-to-image and higgsfield-soul declare fixed_image_count: 4.
+    No probed model dishonours ``n: 1``, so this is disclosure, not a clamp: say we dropped
+    the extras the run paid for. The return shape stays one url."""
+    if len(urls) > 1:
+        msg = ("node %s: model returned %d images, kept the first"
+               % (node.id, len(urls)))
+        engine._progress({"type": "node-note", "node_id": node.id,
+                          "name": display_name(node), "message": msg,
+                          "returned": len(urls)})
+        disclose(msg)
+    return urls[0]
+
+
 def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_data_url=None):
     f = node.fields
     body = {"model": _mdl(node), "size": f.get("size") or "1024x1024",
@@ -922,6 +998,7 @@ def _run_image(engine, node, inp, on_cost):
 
 
 def _run_edit(engine, node, inp, on_cost):
+    _guard_input_roles(node, inp)   # role models: refuse holes before spending
     imgs = _collect_ports(inp, EDIT_IMG_RE)
     if not imgs:
         raise NanoodleError("no image input")
@@ -932,7 +1009,7 @@ def _run_edit(engine, node, inp, on_cost):
         raise NanoodleError("reference images too large (~4 MB combined limit) — use fewer or smaller images")
     src = imgs if len(imgs) > 1 else imgs[0]
     urls = _gen_image(engine, node, on_cost, prompt, image_data_url=src)
-    return {"image": urls[0]}
+    return {"image": _kept_first(engine, node, urls)}
 
 
 def _run_inpaint(engine, node, inp, on_cost):
@@ -946,7 +1023,7 @@ def _run_inpaint(engine, node, inp, on_cost):
     # v1 caveat: the browser composites the mask onto black at source size; this
     # library passes the mask through verbatim (white = repaint).
     urls = _gen_image(engine, node, on_cost, prompt, image_data_url=source, mask_data_url=mask)
-    return {"image": urls[0]}
+    return {"image": _kept_first(engine, node, urls)}
 
 
 # ---- video family (submit + poll) ------------------------------------------
