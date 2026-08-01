@@ -8,6 +8,8 @@ Zero runtime dependencies (Python >= 3.9, stdlib only).
     result["Image"].save("out.png")
 """
 
+# edit models whose image ports are ORDERED roles — a caller building graphs needs the slot order
+from .engine import IMG_INPUT_ROLES
 from .errors import NanoodleError, RunError, UnsupportedNodeError
 from .iodef import InputSpec, OutputSpec, SettingSpec
 from .media import MediaRef, media_from_file
@@ -25,6 +27,7 @@ __all__ = [
     "MediaRef", "media_from_file",
     "NanoodleError", "UnsupportedNodeError", "RunError",
     "InputSpec", "OutputSpec", "SettingSpec",
+    "IMG_INPUT_ROLES",
     "PROMPT_CAPS", "prompt_cap", "fit_prompt_text", "is_prompt_too_long",
     "prompt_cap_from_error",
     "decode_share_url", "decode_share_fragment", "is_share_ref",

@@ -206,6 +206,103 @@ class EditNodeTest(MockedTest):
         self.assertEqual(self.mock.requests, [])
 
 
+class EditInputRoleTest(MockedTest):
+    """flux vto and friends need a fixed, ORDERED pair of images (IMG_INPUT_ROLES)."""
+
+    def _wf(self, ports):
+        nodes = [{"id": "u%d" % (i + 1), "type": "upload",
+                  "fields": {"image": "data:image/png;base64,AAA%d" % (i + 1)}}
+                 for i in range(len(ports))]
+        nodes.append({"id": "e1", "type": "edit",
+                      "fields": {"model": "flux-pro/v1/vto", "prompt": "try it on"}})
+        links = [{"id": "l%d" % i, "from": {"node": "u%d" % (i + 1), "port": "image"},
+                  "to": {"node": "e1", "port": p}} for i, p in enumerate(ports)]
+        return self.wf_dict({"nodes": nodes, "links": links})
+
+    def test_missing_garment_is_refused_before_any_paid_call(self):
+        with self.assertRaises(RunError) as ctx:
+            self._wf(["image"]).run()
+        self.assertIn("flux-pro/v1/vto needs 2 images: person (image), garment (image2)"
+                      " — 1 wired (missing: garment)", str(ctx.exception))
+        self.assertEqual(self.mock.requests, [])
+
+    def test_only_image2_wired_is_refused_not_silently_promoted(self):
+        # _collect_ports compacts, so the garment would land in the person slot and buy a
+        # silently wrong (but charged) result — the guard reads the RAW port keys instead.
+        with self.assertRaises(RunError) as ctx:
+            self._wf(["image2"]).run()
+        self.assertIn("missing: person", str(ctx.exception))
+        self.assertEqual(self.mock.requests, [])
+
+    def test_both_slots_wired_sends_person_first(self):
+        self.mock.script("POST", "/v1/images/generations",
+                         image_response(urls=["https://x/vto.png"], cost=0.04))
+        self._wf(["image", "image2"]).run()
+        req = self.mock.requests_to("/v1/images/generations")[0]
+        self.assertEqual(req.json["imageDataUrl"],
+                         ["data:image/png;base64,AAA1", "data:image/png;base64,AAA2"])
+
+    def test_a_model_without_declared_roles_is_untouched(self):
+        self.mock.script("POST", "/v1/images/generations", image_response(urls=["https://x/y.png"]))
+        wf = self.wf_dict({"nodes": [
+            {"id": "n1", "type": "upload", "fields": {"image": "data:image/png;base64,AAA="}},
+            {"id": "n2", "type": "edit", "fields": {"model": "nano-banana-2", "prompt": "p"}},
+        ], "links": [{"id": "l1", "from": {"node": "n1", "port": "image"},
+                      "to": {"node": "n2", "port": "image"}}]})
+        wf.run()
+        self.assertEqual(len(self.mock.requests_to("/v1/images/generations")), 1)
+
+
+class ExtraImagesDisclosureTest(MockedTest):
+    """Fixed-batch models (fixed_image_count: 4) bill for images edit/inpaint drop."""
+
+    def test_edit_says_it_kept_the_first_of_four(self):
+        self.mock.script("POST", "/v1/images/generations",
+                         image_response(urls=["https://x/1.png", "https://x/2.png",
+                                              "https://x/3.png", "https://x/4.png"], cost=0.08))
+        wf = self.wf_dict({"nodes": [
+            {"id": "n1", "type": "upload", "fields": {"image": "data:image/png;base64,AAA="}},
+            {"id": "n2", "type": "edit", "fields": {"model": "higgsfield-soul", "prompt": "restyle"}},
+        ], "links": [{"id": "l1", "from": {"node": "n1", "port": "image"},
+                      "to": {"node": "n2", "port": "image"}}]})
+        events = []
+        with self.assertWarns(RuntimeWarning):
+            result = wf.run(on_progress=events.append)
+
+        self.assertEqual(self.mock.requests_to("/v1/images/generations")[0].json["n"], 1,
+                         "still asks for one — no probed model dishonours n:1")
+        notes = [e for e in events if e["type"] == "node-note"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("model returned 4 images, kept the first", notes[0]["message"])
+        self.assertEqual(notes[0]["returned"], 4)
+        self.assertEqual(result["Edit"].url, "https://x/1.png")   # output shape unchanged
+
+    def test_inpaint_discloses_the_same_way(self):
+        self.mock.script("POST", "/v1/images/generations",
+                         image_response(urls=["https://x/1.png", "https://x/2.png"]))
+        wf = self.wf_dict({"nodes": [
+            {"id": "n1", "type": "inpaint",
+             "fields": {"model": "higgsfield-soul", "prompt": "a hat",
+                        "image": "data:image/png;base64,SRC=",
+                        "mask": "data:image/png;base64,MASK="}}]})
+        events = []
+        with self.assertWarns(RuntimeWarning):
+            wf.run(on_progress=events.append)
+        self.assertEqual([e["message"] for e in events if e["type"] == "node-note"],
+                         ["node n1: model returned 2 images, kept the first"])
+
+    def test_one_image_says_nothing(self):
+        self.mock.script("POST", "/v1/images/generations", image_response(urls=["https://x/1.png"]))
+        wf = self.wf_dict({"nodes": [
+            {"id": "n1", "type": "upload", "fields": {"image": "data:image/png;base64,AAA="}},
+            {"id": "n2", "type": "edit", "fields": {"model": "m", "prompt": "p"}},
+        ], "links": [{"id": "l1", "from": {"node": "n1", "port": "image"},
+                      "to": {"node": "n2", "port": "image"}}]})
+        events = []
+        wf.run(on_progress=events.append)
+        self.assertEqual([e for e in events if e["type"] == "node-note"], [])
+
+
 class InpaintNodeTest(MockedTest):
     def test_field_source_and_mask_pass_through(self):
         self.mock.script("POST", "/v1/images/generations", image_response(urls=["https://x/o.png"]))

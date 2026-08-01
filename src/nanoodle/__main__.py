@@ -194,6 +194,9 @@ def cmd_run(args):
             print("✓ %s — %d ms" % (evt["name"], evt.get("ms") or 0), file=sys.stderr)
         elif evt["type"] == "node-error":
             print("✗ %s — %s" % (evt["name"], evt.get("error")), file=sys.stderr)
+        elif evt["type"] == "node-note":
+            # e.g. a fixed-batch model billed for 4 images and the node keeps 1
+            print("⚠ %s — %s" % (evt["name"], evt["message"]), file=sys.stderr)
         elif evt["type"] == "prompt-trimmed":
             print("✂ %s — prompt trimmed %d → %d characters (cap %d)"
                   % (evt["name"], evt["from"], evt["to"], evt["cap"]), file=sys.stderr)

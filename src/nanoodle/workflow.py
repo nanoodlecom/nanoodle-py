@@ -4,13 +4,12 @@ import copy
 import json
 import queue
 import re
-import sys
 import threading
 import time
-import warnings as _warnings
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 
-from .engine import Engine
+# disclose(): advisory run reports that can never fail the run (see engine.disclose)
+from .engine import Engine, disclose as _disclose
 from .errors import NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, display_name,
                     materialize, topo_order, wired_frames_floor)
@@ -21,30 +20,6 @@ from .prompt_caps import learn_prompt_cap, with_fitted_prompt
 from .share import decode_share_url, is_share_ref
 from .transport import default_http, resolve_api_key
 from .x402 import assert_payment_option
-
-
-def _disclose(msg):
-    """Tell the caller something about their own run. This can never fail the run.
-
-    nanoodle-js discloses with process.emitWarning, which is advisory by construction. The
-    Python twin of that is warnings.warn, which is NOT: under PYTHONWARNINGS=error or
-    warnings.simplefilter("error") — the normal setting in a strict CI job or test suite —
-    a warning is raised instead of printed. Raised inside a node, it was collected as that
-    node's error and escalated to RunError, so telling the user about a trim KILLED the run
-    that the trim exists to save. A report must never cost more than what it reports.
-
-    So: warn (a filter, a logging bridge and assertWarns all keep working), and if the
-    warning is configured to raise, catch it and put the same sentence on stderr instead.
-    The disclosure is never lost, and neither is the run. The other two channels — the
-    ``prompt-trimmed`` progress event and ``result.prompt_trims`` — are unaffected either way.
-    """
-    try:
-        _warnings.warn(msg, RuntimeWarning, stacklevel=3)
-    except Exception:   # noqa: BLE001 - warnings-as-errors must not fail a run
-        try:
-            print("nanoodle: %s" % msg, file=sys.stderr)
-        except Exception:   # noqa: BLE001 - a closed stderr must not fail a run either
-            pass
 
 
 class NodeRun(object):
