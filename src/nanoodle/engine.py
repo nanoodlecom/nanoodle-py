@@ -135,7 +135,10 @@ class Engine(object):
         self.poll_video = pi.get("video", 5.0)
         self.poll_audio = pi.get("audio", 3.0)
         self.poll_x402 = pi.get("x402", 3.0)
-        self.timeout_video = to.get("video", 600.0)
+        # video: no default deadline — NanoGPT jobs keep running server-side and long
+        # renders routinely exceed 10 min. Pass timeouts={"video": N} (seconds) to cap
+        # a headless/CI run. None means wait forever (cancel/run deadline still apply).
+        self.timeout_video = to["video"] if "video" in to else None
         self.timeout_audio = to.get("audio", 300.0)
         self.http_timeout = to.get("http", 120.0)
         # Socket budget for the one request a SETTLED x402 deposit has already
@@ -1060,7 +1063,9 @@ def _gen_video(engine, node, on_cost, prompt, extra_body):
     if not run_id:
         raise NanoodleError("no runId returned")
     t0 = time.monotonic()
-    while time.monotonic() - t0 < engine.timeout_video:
+    # None = wait forever (default). Finite seconds = headless/CI cap. Run deadline
+    # still outranks via check_cancel/sleep.
+    while engine.timeout_video is None or time.monotonic() - t0 < engine.timeout_video:
         # The run deadline outranks timeout_video. Both checks sit OUTSIDE the
         # try below: NodeCancelled is a NanoodleError, and the except there
         # swallows NanoodleError to keep polling.
@@ -1071,7 +1076,7 @@ def _gen_video(engine, node, on_cost, prompt, extra_body):
             resp = engine._get(VIDEO_STATUS + "?requestId=" + urllib.parse.quote(str(run_id)))
             s = json.loads(resp.text())
         except (NanoodleError, ValueError):
-            continue  # poll failures (transport OR body): silently continue until timeout
+            continue  # poll failures (transport OR body): silently continue until complete/cap
         if not (200 <= resp.status < 300):
             continue
         data = s.get("data") if isinstance(s.get("data"), dict) else None
