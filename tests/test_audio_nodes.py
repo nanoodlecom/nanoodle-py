@@ -2,6 +2,7 @@
 song-count purge, and all three response branches (JSON url / runId poll /
 binary body with header cost)."""
 
+import json
 import unittest
 
 from tests._util import FAST, MockedTest
@@ -209,6 +210,72 @@ class MusicPollTest(MockedTest):
         req = self.mock.requests_to("/api/v1/audio/speech")[0]
         self.assertEqual(req.json, {"model": "m", "input": "p", "lyrics": "la la",
                                     "negative_prompt": "no drums", "seed": 11})
+
+
+class MusicStylePromptTest(MockedTest):
+    def test_wired_style_and_lyrics_reach_native_prompt_endpoints(self):
+        models = (
+            "minimax/music-3",
+            "mureka-ai/mureka-v9.5/generate-song",
+            "mureka-ai/mureka-o2/generate-song",
+            "provider/mureka-ai/mureka-v9/generate-song",
+            "mureka-ai/mureka-v9.5/generate-bgm",
+            "mureka-ai/mureka-v9.5/prompt-to-song",
+            "other-lab/generate-bgm",
+            "other-lab/prompt-to-song",
+        )
+        self.mock.script("POST", "/api/v1/audio/speech",
+                         {"status": 200, "json": {"url": "https://cdn/song.mp3"}})
+        for model in models:
+            with self.subTest(model=model):
+                wf = self.wf_dict({"nodes": [
+                    {"id": "style", "type": "text",
+                     "fields": {"text": "75 BPM trip-hop, dusty breaks"}},
+                    {"id": "lyrics", "type": "text",
+                     "fields": {"text": "[Verse]\nThe lights go low"}},
+                    {"id": "song", "type": "music", "fields": {"model": model}},
+                ], "links": [
+                    {"id": "s", "from": {"node": "style", "port": "text"},
+                     "to": {"node": "song", "port": "prompt"}},
+                    {"id": "l", "from": {"node": "lyrics", "port": "text"},
+                     "to": {"node": "song", "port": "lyrics"}},
+                ]}, **FAST)
+                wf.run()
+                self.assertEqual(self.mock.requests_to("/api/v1/audio/speech")[-1].json, {
+                    "model": model, "prompt": "75 BPM trip-hop, dusty breaks",
+                    "lyrics": "[Verse]\nThe lights go low",
+                })
+
+    def test_explicit_prompt_overrides_and_blank_fallback(self):
+        self.mock.script("POST", "/api/v1/audio/speech",
+                         {"status": 200, "json": {"url": "https://cdn/song.mp3"}})
+        for model in ("minimax/music-3", "mureka-ai/mureka-v9.5/generate-song"):
+            for prompt in ("  noir piano  ", "   ", None):
+                with self.subTest(model=model, prompt=prompt):
+                    wf = self.wf_dict({"nodes": [{"id": "song", "type": "music", "fields": {
+                        "model": model, "prompt": "wired arrangement",
+                        "lyrics": "[Verse]\nThe lights go low",
+                        "extraJson": json.dumps({"prompt": prompt, "input": "stale extra input"}),
+                    }}]}, **FAST)
+                    wf.run()
+                    self.assertEqual(self.mock.requests_to("/api/v1/audio/speech")[-1].json, {
+                        "model": model,
+                        "prompt": prompt if prompt and prompt.strip() else "wired arrangement",
+                        "lyrics": "[Verse]\nThe lights go low",
+                    })
+
+    def test_unrelated_music_models_keep_input(self):
+        self.mock.script("POST", "/api/v1/audio/speech",
+                         {"status": 200, "json": {"url": "https://cdn/song.mp3"}})
+        for model in ("other-lab/generate-song", "minimax/music-3-cover", "Minimax-Music-2.6"):
+            with self.subTest(model=model):
+                wf = self.wf_dict({"nodes": [{"id": "song", "type": "music", "fields": {
+                    "model": model, "prompt": "quiet piano", "lyrics": "[Verse]\nThe lights go low",
+                }}]}, **FAST)
+                wf.run()
+                self.assertEqual(self.mock.requests_to("/api/v1/audio/speech")[-1].json, {
+                    "model": model, "input": "quiet piano", "lyrics": "[Verse]\nThe lights go low",
+                })
 
 
 class RemixTest(MockedTest):
