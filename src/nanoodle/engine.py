@@ -33,6 +33,10 @@ TRANSCRIBE_ENDPOINT = "/api/v1/audio/transcriptions"
 _FUNDS_RE = re.compile(r"insufficient|balance|funds|not enough|payment required", re.I)
 _AUDIO_MIME = {"mp3": "audio/mpeg", "opus": "audio/ogg", "aac": "audio/aac",
                "flac": "audio/flac", "wav": "audio/wav", "pcm": "audio/wav"}
+# Native music endpoints use prompt for musical direction; lyrics remain separate.
+_AUDIO_PROMPT_MODEL_RE = re.compile(
+    r"(?:^|/)(?:prompt-to-song|generate-bgm)$|(?:^|/)mureka-ai/[^/]+/generate-song$|^minimax/music-3$",
+    re.I)
 _SONG_COUNT_RE = re.compile(
     r"^(number_of_songs|n|num_songs|song_count|generation_count|generation_count_parameter)$", re.I)
 _SONG_COUNT_LOOSE_RE = re.compile(r"generation_count|num_?songs|song_?count", re.I)
@@ -1233,6 +1237,10 @@ def _poll_audio(engine, node, model, submit_json):
 def _gen_audio(engine, node, on_cost, text, extra):
     body = dict({"model": _mdl(node), "input": text})
     body.update(extra)
+    if _AUDIO_PROMPT_MODEL_RE.search(_mdl(node).strip()):
+        if body.get("prompt") is None or not str(body["prompt"]).strip():
+            body["prompt"] = text
+        body.pop("input", None)
     resp = engine._post_json(AUDIO_ENDPOINT, body)
     ctype = (resp.header("content-type") or "").lower()
     if "application/json" in ctype:
