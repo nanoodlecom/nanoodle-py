@@ -272,7 +272,10 @@ def cmd_run(args):
             else:
                 print("%s:\n%s" % (key, value))
         approx = "" if result.cost_exact else "~"
-        cost_line = "cost: %s$%.4f" % (approx, result.cost_usd)
+        usd = result.cost_usd or 0.0
+        # sub-cent calls (a ⚖️ Decide answer is ~$0.000002) must not print as $0.0000
+        cost_line = "cost: %s$%s" % (approx, ("%.4f" % usd) if (usd == 0 or usd >= 0.0001)
+                                     else ("%.8f" % usd).rstrip("0"))
         if result.remaining_balance is not None:
             cost_line += " · balance: $%s" % result.remaining_balance
         print(cost_line, file=sys.stderr)

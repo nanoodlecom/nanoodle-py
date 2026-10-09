@@ -281,6 +281,7 @@ class DecideCliTest(MockedTest):
             self.assertIn("⛔ Decide (g) gated: gate closed", err)
             self.assertIn("⤼ LLM (l) skipped — gate g said no", err)
             self.assertIn("LLM: (skipped — the gate 'Decide' answered no)", out)
+            self.assertIn("cost: $0.000003", err)
 
 
 if __name__ == "__main__":
