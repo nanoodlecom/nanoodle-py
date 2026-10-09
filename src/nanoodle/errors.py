@@ -27,3 +27,15 @@ class RunError(NanoodleError):
     def __init__(self, message, result):
         super().__init__(message)
         self.result = result
+
+
+class GatedOutputError(NanoodleError, KeyError):
+    """RunResult[key] for an output a closed ⚖️ Decide gate skipped (it never ran).
+
+    A KeyError too, so ``result.get(key)`` / ``key in result`` behave as for any absent output.
+    """
+
+    code = "gated"
+
+    def __str__(self):
+        return Exception.__str__(self)   # KeyError would repr() the message

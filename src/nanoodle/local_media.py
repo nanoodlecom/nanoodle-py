@@ -291,6 +291,50 @@ def resize_crop_image(url, mode, tw, th, fetcher=None, cancel_check=None, deadli
         return result
 
 
+def fit_image_jpeg(url, max_dim, budget, fetcher=None, cancel_check=None, deadline=None):
+    """Shrink an image to fit a decision model's limits (⚖️ Decide).
+
+    Long edge <= max_dim and the data: URL <= budget characters. JPEG on white (a
+    transparent PNG can't turn black), stepping quality down, then size, until it fits —
+    the twin of nanoodle-js fitImageJpeg and the browser's canvas decideFitImage.
+    Needs ffmpeg (decisions without images never touch this).
+    """
+    if cancel_check:
+        cancel_check()
+    ra = _run_args(cancel_check, deadline)
+    with tempfile.TemporaryDirectory(prefix="nanoodle-media-") as d:
+        in_path = _write_input(d, "in", url, fetcher)
+        out, _ = _run("ffprobe", [
+            "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", in_path], **ra)
+        parts = out.decode("utf-8", "replace").strip().split("x")
+        try:
+            sw, sh = int(parts[0]), int(parts[1])
+        except (IndexError, ValueError):
+            sw = sh = 0
+        if not (sw > 0 and sh > 0):
+            raise NanoodleError("couldn't read an image to judge")
+        s = min(1.0, float(max_dim) / max(sw, sh))
+        qs = (3, 5, 8, 12)   # mjpeg -q:v (2 = best … 31 = worst) ≈ canvas quality 0.85 → 0.48
+        for rnd in range(6):
+            w = max(2, int(round(sw * s / 2.0)) * 2)
+            h = max(2, int(round(sh * s / 2.0)) * 2)
+            for q in qs:
+                if cancel_check:
+                    cancel_check()
+                out_path = os.path.join(d, "fit-%d-%d.jpg" % (rnd, q))
+                _run("ffmpeg", [
+                    "-y", "-i", in_path, "-filter_complex",
+                    "color=c=white:s=%dx%d[bg];[0:v]scale=%d:%d,format=rgba[fg];"
+                    "[bg][fg]overlay=shortest=1,format=yuvj420p" % (w, h, w, h),
+                    "-frames:v", "1", "-q:v", str(q), out_path], **ra)
+                result = _data_url_from_file(out_path, "image/jpeg")
+                if len(result) <= budget:
+                    return result
+            s *= 0.75
+        raise NanoodleError("couldn't shrink an image small enough for the decision model")
+
+
 def trim_audio_to_wav(url, start, length, rate=16000, fetcher=None, whole_if_blank=False,
                       cancel_check=None, deadline=None):
     if cancel_check:

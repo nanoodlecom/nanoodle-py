@@ -10,7 +10,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, wait
 
 # disclose(): advisory run reports that can never fail the run (see engine.disclose)
 from .engine import Engine, disclose as _disclose
-from .errors import NanoodleError, RunError, UnsupportedNodeError
+from .decide import DecideGateClosed
+from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, display_name,
                     materialize, topo_order, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
@@ -23,9 +24,15 @@ from .x402 import assert_payment_option
 
 
 class NodeRun(object):
-    """Per-node run record: status ('done'|'error'|'skipped'), out, error, cost, ms."""
+    """Per-node run record: status ('done'|'error'|'gated'|'skipped'), out, error, cost, ms.
 
-    __slots__ = ("status", "out", "error", "cost_usd", "ms")
+    'gated': a ⚖️ Decide yes/no gate that answered no. It ran and billed, ``out`` holds its
+    answer ({"text": "no", "decision": ...}) and ``gate`` is {"yes", "message"}. Not an error.
+    'skipped' with ``gated_by`` = that Decide node's id: downstream of a closed gate — never
+    ran, never billed. (Comment nodes are 'skipped' with gated_by None.)
+    """
+
+    __slots__ = ("status", "out", "error", "cost_usd", "ms", "gate", "gated_by")
 
     def __init__(self):
         self.status = "pending"
@@ -33,10 +40,17 @@ class NodeRun(object):
         self.error = None
         self.cost_usd = None
         self.ms = None
+        self.gate = None
+        self.gated_by = None
 
     def __repr__(self):
-        return "NodeRun(status=%r, error=%r, cost_usd=%r, ms=%r)" % (
-            self.status, self.error, self.cost_usd, self.ms)
+        extra = ""
+        if self.gate is not None:
+            extra = ", gate=%r" % (self.gate,)
+        if self.gated_by is not None:
+            extra += ", gated_by=%r" % (self.gated_by,)
+        return "NodeRun(status=%r, error=%r, cost_usd=%r, ms=%r%s)" % (
+            self.status, self.error, self.cost_usd, self.ms, extra)
 
 
 class _DaemonPool(object):
@@ -133,10 +147,16 @@ def _note_payment(run, payment):
 
 class RunResult(object):
     def __init__(self, outputs, nodes, errors, cost_usd, cost_exact, remaining_balance,
-                 prompt_trims=None, payments=None):
+                 prompt_trims=None, payments=None, gated=None, gated_outputs=None):
         self.outputs = outputs                    # friendly key AND node-id key -> value
         self.nodes = nodes                        # node id -> NodeRun
-        self.errors = errors                      # [{node_id, name, message}]
+        self.errors = errors                      # [{node_id, name, message}] — never gates
+        # every ⚖️ Decide gate that closed this run: [{node_id, name, message, yes, skipped}]
+        # (skipped = ids of the nodes it stopped). A closed gate is a deliberate, successful
+        # outcome: run() returns normally, it never raises for one.
+        self.gated = gated or []
+        # friendly key / node id (lowercased) -> gate name, for outputs a gate skipped
+        self._gated_outputs = gated_outputs or {}
         self.cost_usd = cost_usd
         self.cost_exact = cost_exact
         self.remaining_balance = remaining_balance
@@ -157,6 +177,11 @@ class RunResult(object):
         for k in self.outputs:
             if k.strip().lower() == str(key).strip().lower():
                 return self.outputs[k]
+        gate = self._gated_outputs.get(str(key).strip().lower())
+        if gate is not None:
+            raise GatedOutputError(
+                "output %r was skipped — the gate %r answered no, so it never ran "
+                "(see result.gated)" % (key, gate))
         raise KeyError("no output %r — available: %s" % (key, ", ".join(sorted(self.outputs))))
 
     def get(self, key, default=None):
@@ -438,7 +463,19 @@ class Workflow(object):
                     pass
 
         engine = self._make_engine(progress)
+        engine.catalog = self.catalog
         engine.set_run_deadline(deadline, timeout)
+        gated = []   # closed ⚖️ Decide gates: [{node_id, name, message, yes, skipped}]
+
+        def gate_of(dep):
+            r = runs.get(dep)
+            if r is None:
+                return None
+            if r.status == "gated":
+                return dep
+            if r.status == "skipped" and r.gated_by:
+                return r.gated_by
+            return None
 
         deps = {nid: set() for nid in order}
         for link in graph.links:
@@ -539,11 +576,26 @@ class Workflow(object):
                             settled.add(nid)
                             progressed = True
                         elif failed_dep is not None:
+                            # a real failure upstream wins over a gate (the browser agrees)
                             run.status = "error"
                             run.error = "upstream failed: " + display_name(graph.node(failed_dep))
                             settled.add(nid)
                             progress({"type": "node-error", "node_id": nid,
                                       "name": display_name(graph.node(nid)), "error": run.error})
+                            progressed = True
+                        elif any(gate_of(d) for d in deps[nid]):
+                            # behind a closed ⚖️ Decide gate: skipped, unbilled — not an error
+                            gid = next(gate_of(d) for d in sorted(deps[nid], key=order.index)
+                                       if gate_of(d))
+                            run.status = "skipped"
+                            run.gated_by = gid
+                            for g in gated:
+                                if g["node_id"] == gid:
+                                    g["skipped"].append(nid)
+                            settled.add(nid)
+                            progress({"type": "node-skipped", "node_id": nid,
+                                      "name": display_name(graph.node(nid)),
+                                      "reason": "gated", "gated_by": gid})
                             progressed = True
                         else:
                             fut = pool.submit(exec_node, nid)
@@ -599,6 +651,17 @@ class Workflow(object):
                         progress({"type": "node-done", "node_id": nid,
                                   "name": display_name(node), "ms": run.ms,
                                   "cost_usd": run.cost_usd})
+                    except DecideGateClosed as e:
+                        # the decision ran and billed; "no" stops this branch on purpose
+                        run.status = "gated"
+                        run.out = e.out
+                        yes = (e.decision or {}).get("yes")
+                        run.gate = {"yes": yes, "message": str(e)}
+                        gated.append({"node_id": nid, "name": display_name(node),
+                                      "message": str(e), "yes": yes, "skipped": []})
+                        progress({"type": "node-gated", "node_id": nid,
+                                  "name": display_name(node), "message": str(e), "yes": yes,
+                                  "cost_usd": run.cost_usd})
                     except Exception as e:  # noqa: BLE001 - collected per node
                         run.status = "error"
                         run.error = str(e)
@@ -619,10 +682,16 @@ class Workflow(object):
                 _note_payment(run, p)
         outputs = {}
         failed_sinks = []
+        gated_outputs = {}
         out_specs = derive_outputs(graph)
         for ospec in out_specs:
             run = runs.get(ospec.node_id)
-            if run is not None and run.status == "done":
+            if run is not None and run.status == "skipped" and run.gated_by:
+                gname = display_name(graph.node(run.gated_by))
+                gated_outputs[ospec.key.strip().lower()] = gname
+                gated_outputs[str(ospec.node_id).strip().lower()] = gname
+                continue   # a gate said no: not a failure, just no value
+            if run is not None and (run.status == "done" or (run.status == "gated" and run.out)):
                 primary = NODE_TYPES[ospec.type]["outputs"][0][0]
                 value = (run.out or {}).get(primary)
                 outputs[ospec.key] = value
@@ -637,7 +706,8 @@ class Workflow(object):
                            cost_exact=cost["exact"],
                            remaining_balance=cost["balance"],
                            prompt_trims=prompt_trims,
-                           payments=engine.payments())
+                           payments=engine.payments(),
+                           gated=gated, gated_outputs=gated_outputs)
         if failed_sinks:
             parts = []
             for ospec, run in failed_sinks:

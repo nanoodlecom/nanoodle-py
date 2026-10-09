@@ -41,6 +41,25 @@ Parse: `j.choices[0].message.content` (if array, join `.map(p=>p.text)`); throw 
 
 ### vision → same as llm: one user message [{text: q||"Describe this image."}, {image_url: inp.image}]
 
+### decide → POST /api/v1/decisions (nanoodle-js src/decide.mjs; editor/play "⚖️ DECIDE" twin block)
+```
+body = { model, state, questions: { answer: q } }
+state = text                                   (no images)
+      | [text?, "image_1:", {type:"image_url",image_url:{url}}, "image_2:", ...]   (labels only when >1 image)
+q: pick   → {type:"choice", instructions, criteria:{image_1:"image 1",...}}   (≥2 images)
+   choose → {type:"choice", instructions, criteria:{<label>:null,...}}        (2..255 de-duplicated labels)
+   score  → {type:"score",  instructions, criteria:[levels worst→best]}       (2..10, default poor/okay/good/great)
+   yesno  → {type:"noul",   instructions}
+```
+Images: every wired image is re-encoded as JPEG on white, long edge ≤ maxDimension, each ≤ maxEncodedBytes·0.95/N
+characters (ffmpeg). Limits come from catalog chat[].decision_input.image_limits; absent → {maxImages:4, maxDimension:512,
+maxEncodedBytes:240000}; a known text-only model refuses wired images before any request.
+pick asks twice (in order + reversed), maps reversed slots back and averages probabilities (first-image bias), cost = both.
+Outputs: text = pick "image N" | choose label | score 1-based expected level (2 dp) | yesno "yes"/"no" (P(yes) ≥ 0.5);
+image = pick winner (original, unshrunk) | first wired image. Cost: usage.cost (input tokens only).
+Gate (yesno + fields.gate true/"true" + no): the runner raises (code "decide-gate"); the workflow records status "gated"
+(out kept, billed), every downstream node "skipped" with gated_by, result.gated lists it, run() does not fail.
+
 ### image / edit / inpaint → IMG_ENDPOINT (genImage 1465-1480)
 ```
 body = { model, size: fields.size || "1024x1024", n: variations||1, response_format: "b64_json" }

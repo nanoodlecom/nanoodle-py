@@ -160,10 +160,19 @@ def _print_prerun_failure_json(wf, exc):
                "costUsd": 0.0, "costExact": True, "remainingBalance": None,
                "nodes": {},
                "errors": [{"node_id": None, "name": None, "message": str(exc)}],
-               "promptTrims": [], "payments": []}
+               "gated": [], "promptTrims": [], "payments": []}
     print(json.dumps(payload, indent=2))
     print("error: %s" % exc, file=sys.stderr)
     return 1
+
+
+def _node_json(r):
+    d = {"status": r.status, "error": r.error, "costUsd": r.cost_usd, "ms": r.ms}
+    if r.gate is not None:
+        d["gate"] = r.gate
+    if r.gated_by is not None:
+        d["gatedBy"] = r.gated_by
+    return d
 
 
 def cmd_run(args):
@@ -194,6 +203,12 @@ def cmd_run(args):
             print("✓ %s — %d ms" % (evt["name"], evt.get("ms") or 0), file=sys.stderr)
         elif evt["type"] == "node-error":
             print("✗ %s — %s" % (evt["name"], evt.get("error")), file=sys.stderr)
+        elif evt["type"] == "node-gated":
+            print("⛔ %s (%s) gated: %s" % (evt["name"], evt["node_id"], evt["message"]),
+                  file=sys.stderr)
+        elif evt["type"] == "node-skipped":
+            print("⤼ %s (%s) skipped — gate %s said no" % (evt["name"], evt["node_id"],
+                                                         evt["gated_by"]), file=sys.stderr)
         elif evt["type"] == "node-note":
             # e.g. a fixed-batch model billed for 4 images and the node keeps 1
             print("⚠ %s — %s" % (evt["name"], evt["message"]), file=sys.stderr)
@@ -225,10 +240,10 @@ def cmd_run(args):
     if args.json:
         payload = {"outputs": {}, "costUsd": result.cost_usd, "costExact": result.cost_exact,
                    "remainingBalance": result.remaining_balance,
-                   "nodes": {nid: {"status": r.status, "error": r.error,
-                                   "costUsd": r.cost_usd, "ms": r.ms}
-                             for nid, r in result.nodes.items()},
+                   "nodes": {nid: _node_json(r) for nid, r in result.nodes.items()},
                    "errors": result.errors,
+                   # closed ⚖️ Decide gates — a deliberate stop, not a failure (exit 0)
+                   "gated": result.gated,
                    "promptTrims": result.prompt_trims,
                    # every x402 deposit this run asked for (empty on a keyed run). A
                    # deposit is the one thing an agent caller cannot re-derive from the
@@ -251,10 +266,16 @@ def cmd_run(args):
             value = result.outputs.get(key)
             if isinstance(value, MediaRef):
                 print("%s: %s" % (key, saved.get(key) or value.url[:96]))
+            elif value is None and key.strip().lower() in result._gated_outputs:
+                print("%s: (skipped — the gate %r answered no)"
+                      % (key, result._gated_outputs[key.strip().lower()]))
             else:
                 print("%s:\n%s" % (key, value))
         approx = "" if result.cost_exact else "~"
-        cost_line = "cost: %s$%.4f" % (approx, result.cost_usd)
+        usd = result.cost_usd or 0.0
+        # sub-cent calls (a ⚖️ Decide answer is ~$0.000002) must not print as $0.0000
+        cost_line = "cost: %s$%s" % (approx, ("%.4f" % usd) if (usd == 0 or usd >= 0.0001)
+                                     else ("%.8f" % usd).rstrip("0"))
         if result.remaining_balance is not None:
             cost_line += " · balance: $%s" % result.remaining_balance
         print(cost_line, file=sys.stderr)
