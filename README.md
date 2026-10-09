@@ -243,9 +243,9 @@ is `0.0`, and the reason is in `errors[0].message`:
 |---|---|
 | local | text, upload (image/audio/video), choice, join, comment |
 | local media† | resize, vframes, combine, soundtrack, trim, extractaudio |
-| NanoGPT | llm (incl. vision + audio input), image, edit, inpaint*, vision, decide‡, tvideo, ivideo, vedit, lipsync, music, remix, tts, transcribe |
+| NanoGPT | llm (incl. vision + audio input), image, edit, inpaint*, vision, decide†, tvideo, ivideo, vedit, lipsync, music, remix, tts, transcribe |
 
-‡ `decide` asks a NanoGPT decision model one typed question (`POST /api/v1/decisions`): pick the best of the wired `img1…` images, choose a label, score on a scale, or yes/no. Text-only decisions need nothing extra; wired images are shrunk to the model's limits with ffmpeg. A yes/no gate that answers no is not a failure: that node settles as `gated`, everything downstream is `skipped` unbilled, and the run succeeds (see [Gates](#gates-decide-said-no)).
+† `decide` asks a NanoGPT decision model one typed question (`POST /api/v1/decisions`): pick the best of the wired `img1…` images, choose a label, score on a scale, or yes/no. Text-only decisions need nothing extra; wired images are shrunk to the model's limits with ffmpeg. A yes/no gate that answers no is not a failure: that node settles as `gated`, everything downstream is `skipped` unbilled, and the run succeeds (see [Gates](#gates-decide-said-no)).
 
 † **local media** needs **ffmpeg** on `PATH` (soft dependency — not a PyPI package). Same behaviour as the browser app; clear error if ffmpeg is missing.
 
