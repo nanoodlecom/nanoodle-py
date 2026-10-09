@@ -10,7 +10,7 @@ Zero runtime dependencies (Python >= 3.9, stdlib only).
 
 # edit models whose image ports are ORDERED roles — a caller building graphs needs the slot order
 from .engine import IMG_INPUT_ROLES
-from .errors import NanoodleError, RunError, UnsupportedNodeError
+from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .iodef import InputSpec, OutputSpec, SettingSpec
 from .media import MediaRef, media_from_file
 # prompt length caps — a caller doing its own orchestration needs the same trim-and-say-so
@@ -25,7 +25,7 @@ __version__ = "0.5.0"
 __all__ = [
     "Workflow", "RunResult", "NodeRun",
     "MediaRef", "media_from_file",
-    "NanoodleError", "UnsupportedNodeError", "RunError",
+    "NanoodleError", "UnsupportedNodeError", "RunError", "GatedOutputError",
     "InputSpec", "OutputSpec", "SettingSpec",
     "IMG_INPUT_ROLES",
     "PROMPT_CAPS", "prompt_cap", "fit_prompt_text", "is_prompt_too_long",

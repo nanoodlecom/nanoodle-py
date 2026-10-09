@@ -14,6 +14,7 @@ import time
 import urllib.parse
 import warnings as _warnings
 
+from .decide import DECIDE_ENDPOINT, DecideGateClosed, decide_image_limits, decide_run
 from .errors import NanoodleError
 from .graph import (EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name,
                     optional_node)
@@ -168,6 +169,9 @@ class Engine(object):
         self._payments_lock = threading.Lock()
         # Which node the calling thread is executing, for the payment record.
         self._tls = threading.local()
+        # opt-in raw model catalogs (Workflow(catalog=...)) — data only, never fetched.
+        # decide reads chat[].decision_input for a decision model's image limits.
+        self.catalog = None
 
     def set_run_deadline(self, deadline, timeout_secs=None):
         self._deadline = deadline
@@ -904,6 +908,60 @@ def _run_vision(engine, node, inp, on_cost):
     return {"text": _parse_chat_text(j)}
 
 
+def _catalog_item(catalog, kind, model_id):
+    items = catalog.get(kind) if isinstance(catalog, dict) else None
+    if not isinstance(items, list):
+        return None
+    for it in items:
+        if isinstance(it, dict) and it.get("id") == model_id:
+            return it
+    return None
+
+
+def _run_decide(engine, node, inp, on_cost):
+    """⚖️ Decide: one typed question to a NanoGPT decision model (twin of nanoodle-js / the editor).
+
+    Bills the response's real usage.cost (pick = both calls). A closed yes/no gate raises
+    decide.DecideGateClosed, which Workflow.run() settles as status "gated" (not an error).
+    """
+    model = _mdl(node)
+    it = _catalog_item(engine.catalog, "chat", model)
+    # a catalog row WITHOUT decision_input (e.g. the non-detailed /api/v1/models list) is
+    # "unknown" (permissive launch limits), not text-only
+    di = it.get("decision_input") if it else None
+    lim = decide_image_limits(di, bool(di))
+
+    def send(body):
+        resp = engine._post_json(DECIDE_ENDPOINT, body)
+        j = json.loads(resp.text())
+        usage = j.get("usage") if isinstance(j, dict) else None
+        c = usage.get("cost") if isinstance(usage, dict) else None
+        if isinstance(c, (int, float)) and not isinstance(c, bool):
+            on_cost(*engine._cost_with_headers(dict(j, cost=c), resp))
+        else:
+            on_cost(*engine._cost_with_headers(j, resp))
+        return j
+
+    def fit(url, max_dim, budget):
+        from .local_media import fit_image_jpeg
+        return fit_image_jpeg(url, max_dim, budget, **engine._local_opts())
+
+    text = inp.get("text")
+    if isinstance(text, MediaRef):
+        text = text.url
+    def media(out):
+        if out and out.get("image") and not isinstance(out["image"], MediaRef):
+            out["image"] = engine._media_ref(out["image"])
+        return out
+
+    try:
+        return media(decide_run(node.fields, model, text, _collect_ports(inp, IMG_PORT_RE),
+                                lim, send, fit))
+    except DecideGateClosed as e:
+        media(e.out)
+        raise
+
+
 # ---- image family (/v1/images/generations) ---------------------------------
 
 # Edit models that demand a FIXED, ORDERED set of input images. Nothing in the live catalog
@@ -1499,6 +1557,7 @@ _EXECUTORS = {
     "extractaudio": _run_extractaudio,
     "llm": _run_llm,
     "vision": _run_vision,
+    "decide": _run_decide,
     "image": _run_image,
     "edit": _run_edit,
     "inpaint": _run_inpaint,
