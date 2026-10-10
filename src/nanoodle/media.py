@@ -21,6 +21,7 @@ _EXT_MIME = {
     ".oga": "audio/ogg", ".opus": "audio/ogg", ".flac": "audio/flac",
     ".aac": "audio/aac", ".m4a": "audio/mp4",
     ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+    ".glb": "model/gltf-binary",
     ".txt": "text/plain", ".json": "application/json",
 }
 
@@ -31,6 +32,7 @@ _MIME_EXT = {
     "audio/x-wav": "wav", "audio/ogg": "ogg", "audio/flac": "flac",
     "audio/aac": "aac", "audio/mp4": "m4a",
     "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov",
+    "model/gltf-binary": "glb",
     "text/plain": "txt", "application/json": "json",
 }
 
@@ -59,6 +61,8 @@ def sniff_mime(data, default="application/octet-stream"):
         return "video/mp4"
     if data[:4] == b"\x1a\x45\xdf\xa3":
         return "video/webm"
+    if data[:4] == b"glTF":
+        return "model/gltf-binary"
     return default
 
 

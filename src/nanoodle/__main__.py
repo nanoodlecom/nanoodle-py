@@ -22,7 +22,8 @@ import sys
 from . import (MediaRef, NanoodleError, RunError, Workflow, __version__,
                media_from_file)
 
-_MEDIA_EXT = re.compile(r"\.(png|jpe?g|gif|webp|bmp|mp3|wav|ogg|oga|opus|flac|aac|m4a|mp4|webm|mov)$", re.I)
+_MEDIA_EXT = re.compile(
+    r"\.(png|jpe?g|gif|webp|bmp|mp3|wav|ogg|oga|opus|flac|aac|m4a|mp4|webm|mov|glb)$", re.I)
 
 
 def _parse_kv(pairs, what):
@@ -67,7 +68,7 @@ def _fmt_default(v):
     return v if len(v) <= 48 else v[:45] + "..."
 
 
-_MEDIA_INPUT_KINDS = ("image", "audio", "video")
+_MEDIA_INPUT_KINDS = ("image", "audio", "video", "model3d")
 
 
 def _fmt_media_default(v, kind):

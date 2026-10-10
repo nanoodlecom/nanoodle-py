@@ -278,7 +278,7 @@ class Workflow(object):
     @property
     def inputs(self):
         if self._inputs is None:
-            self._inputs = derive_inputs(self.graph)
+            self._inputs = derive_inputs(self.graph, self.catalog)
         return self._inputs
 
     @property
@@ -292,6 +292,16 @@ class Workflow(object):
         if self._settings is None:
             self._settings = derive_settings(self.graph)
         return self._settings
+
+    def estimate(self, catalogs=None):
+        """USD forecast for one run, from a caller-supplied catalog. Nothing is fetched.
+
+        ``catalogs`` defaults to the catalog passed at construction. Image prices
+        are exact; chat, video, audio and 3D are estimates. Local nodes are free.
+        An untouched video audio switch is priced at the catalog default.
+        """
+        from .estimate import estimate_graph_cost
+        return estimate_graph_cost(self.graph, self.catalog if catalogs is None else catalogs)
 
     def check_balance(self):
         """Optional helper: POST /api/check-balance -> usd balance (float)."""
@@ -418,7 +428,7 @@ class Workflow(object):
                 raise NanoodleError("invalid choice %r for %s — options: %s"
                                     % (v, spec.key, ", ".join(spec.options)))
             return v
-        if spec.kind in ("image", "audio", "video"):
+        if spec.kind in ("image", "audio", "video", "model3d"):
             if not isinstance(value, str):
                 raise NanoodleError(
                     "input %s expects media: pass a data:/https URL string, bytes, "
@@ -692,7 +702,10 @@ class Workflow(object):
                 gated_outputs[str(ospec.node_id).strip().lower()] = gname
                 continue   # a gate said no: not a failure, just no value
             if run is not None and (run.status == "done" or (run.status == "gated" and run.out)):
-                primary = NODE_TYPES[ospec.type]["outputs"][0][0]
+                # ports[0] is the primary. Endpoint's port follows its mode
+                # (text / image / video / audio); vframes' first port is frame1.
+                primary = (ospec.ports[0] if ospec.ports
+                           else NODE_TYPES[ospec.type]["outputs"][0][0])
                 value = (run.out or {}).get(primary)
                 outputs[ospec.key] = value
                 outputs[ospec.node_id] = value
