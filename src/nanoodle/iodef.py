@@ -14,7 +14,7 @@ class InputSpec:
     key: str
     node_id: str
     field: str
-    kind: str                  # textarea | image | audio | video | choice
+    kind: str                  # textarea | image | audio | video | model3d | choice
     label: str
     optional: bool = False
     default: Optional[str] = None
@@ -50,6 +50,7 @@ INPUT_SPECS = {
     "upload":  [("image",  "Image",             "image",    False, None)],
     "aupload": [("audio",  "Audio",             "audio",    False, None)],
     "vupload": [("video",  "Video",             "video",    False, None)],
+    "mupload": [("model",  "3D file",           "model3d",  False, None)],
     "llm":     [("prompt", "Prompt",            "textarea", False, None),
                 ("system", "System prompt",     "textarea", True,
                  "You are a helpful, concise assistant.")],
@@ -58,6 +59,7 @@ INPUT_SPECS = {
     "music":   [("prompt", "Style / prompt",    "textarea", False, None)],
     "remix":   [("prompt", "Style / direction", "textarea", False, None)],
     "tts":     [("prompt", "Text to speak",     "textarea", False, None)],
+    "endpoint": [("prompt", "Prompt",           "textarea", False, None)],
 }
 
 # SETTING_SPECS (play.html 3234-3310) — per-node knobs that are not IO shape.
@@ -118,6 +120,13 @@ SETTING_SPECS = {
             ("instructions", "Voice instructions", "textarea", None, None)],
     "transcribe": [("model", "Model", "model", None, None),
                    ("language", "Language", "text", "auto", None)],
+    "cleanvoice": [("model", "Model", "model", None, None),
+                   ("url", "Public link (when nothing is wired)", "text", None, None)],
+    "model3d": [("model", "Model", "model", None, None)],
+    "endpoint": [("url", "URL", "text", "http://127.0.0.1:8787/v1/chat/completions", None),
+                 ("mode", "Mode", "select", "chat", ["chat", "image", "video", "audio", "json"]),
+                 ("model", "Model", "text", "local", None),
+                 ("auth", "Authorization (optional)", "text", "", None)],
     "join": [("sep", "Separator (use \\n for a line break)", "text", " ", None)],
     "inpaint": [("model", "Model", "model", None, None),
                 ("size", "Image size", "select", "1024x1024", _SIZES),
@@ -145,11 +154,12 @@ def _field_default(node, field, spec_default):
     return spec_default
 
 
-def derive_inputs(graph):
-    """Inputs = INPUT_SPECS fields not fed by a wire (+ inpaint/choice specials).
+def derive_inputs(graph, catalog=None):
+    """Inputs = INPUT_SPECS fields not fed by a wire (+ inpaint/choice/3D specials).
 
     An author-marked optional node (fields.optional, graph.optional_node) makes every
     input it surfaces optional, exactly as nanoodle-js io.mjs does.
+    ``catalog`` shapes the 3D node's image/prompt inputs from the model's modalities.
     """
     out = []
     for node in graph.nodes.values():
@@ -182,14 +192,38 @@ def derive_inputs(graph):
                                  default=sel if sel in opts else (opts[0] if opts else None),
                                  options=opts, node_name=name))
             continue
+        if node.type == "model3d":
+            _append_model3d_inputs(out, node, catalog, author_optional, name, fed)
+            continue
         for (field, label, kind, optional, spec_def) in INPUT_SPECS.get(node.type, []):
             if fed(field):
                 continue  # a wire feeds this field — hide the control
+            # A wired text port is the prompt. The textarea stays optional.
+            if node.type == "endpoint" and field == "prompt" and fed("text"):
+                optional = True
             out.append(InputSpec("", node.id, field, kind, label,
                                  optional=optional or author_optional,
                                  default=_field_default(node, field, spec_def), node_name=name))
     _assign_input_keys(out)
     return out
+
+
+def _append_model3d_inputs(out, node, catalog, author_optional, name, fed):
+    """Image and/or prompt, from the model's modalities. Either one is enough
+    when the model accepts both; the runner says so if neither is present."""
+    from .estimate import model3d_input_mods
+    mods = model3d_input_mods(node.fields.get("model"), catalog)
+    img_fed = fed("image")
+    if mods["image"] and not img_fed:
+        out.append(InputSpec("", node.id, "image", "image", "Image",
+                             optional=author_optional or bool(mods["text"]),
+                             default=_field_default(node, "image", None), node_name=name))
+    if mods["text"] and not fed("prompt"):
+        # Dual-modality models accept a prompt or an image. Both inputs stay
+        # optional here; the runner refuses a run that has neither.
+        out.append(InputSpec("", node.id, "prompt", "textarea", "Prompt",
+                             optional=author_optional or bool(mods["image"]),
+                             default=_field_default(node, "prompt", None), node_name=name))
 
 
 def _assign_input_keys(inputs):
@@ -240,6 +274,9 @@ def derive_outputs(graph):
         used[base] = used.get(base, 0) + 1
         key = base if used[base] == 1 else "%s %d" % (base, used[base])
         ports = [p for (p, _kind) in NODE_TYPES.get(node.type, {}).get("outputs", [])]
+        if node.type == "endpoint":
+            from .endpoint import endpoint_out_port
+            ports = [endpoint_out_port(node)[0]]
         # vframes grows frame1..frameN from max(fields.frames, wired floor)
         if node.type == "vframes":
             try:

@@ -45,6 +45,7 @@ NODE_TYPES = {
     "upload":     {"title": "Image input",      "outputs": [("image", "image")]},
     "aupload":    {"title": "Audio input",      "outputs": [("audio", "audio")]},
     "vupload":    {"title": "Video input",      "outputs": [("video", "video")]},
+    "mupload":    {"title": "3D input",         "outputs": [("model", "model3d")]},
     "choice":     {"title": "Choice",           "outputs": [("text", "text")]},
     "join":       {"title": "Join",             "outputs": [("text", "text")], "static": ["a", "b"]},
     "llm":        {"title": "LLM",              "outputs": [("text", "text")], "static": ["audio"],
@@ -66,6 +67,9 @@ NODE_TYPES = {
                    "dynamic": [REF_PORT_RE], "network": True},
     "ivideo":     {"title": "Image→Video",      "outputs": [("video", "video")],
                    "static": ["image", "endframe"], "network": True},
+    # 🧊 3D: image port is static; prompt is a field override. Output is a GLB.
+    "model3d":    {"title": "3D model",         "outputs": [("model", "model3d")],
+                   "static": ["image"], "network": True},
     "vedit":      {"title": "Video edit",       "outputs": [("video", "video")],
                    "static": ["video"], "network": True},
     "vframes":    {"title": "Video → frames",   "outputs": [("frame1", "image")],
@@ -86,6 +90,13 @@ NODE_TYPES = {
                      "static": ["video"]},
     "transcribe": {"title": "Transcribe",       "outputs": [("text", "text")],
                    "static": ["audio"], "network": True},
+    # 🎧 Clean voice: audio OR video in, cleaned audio out. NanoGPT downloads a public URL.
+    "cleanvoice": {"title": "Clean voice",      "outputs": [("audio", "audio")],
+                   "static": ["audio", "video"], "network": True},
+    # 🔌 Custom endpoint: url/mode stay in the input dict (a Choice path joins the host).
+    # Not a NanoGPT call — network is false so an endpoint-only graph needs no API key.
+    "endpoint":   {"title": "Custom endpoint",  "outputs": [("text", "text")],
+                   "static": ["text", "image", "audio", "video", "url", "mode"]},
     "comment":    {"title": "Comment",          "outputs": [], "note": True},
 }
 
@@ -172,8 +183,11 @@ _MEDIA_FIELD_KEYS = ("image", "mask", "audio", "video")
 _MEDIA_URL_RE = re.compile(r"^\s*(data:|https?:)", re.I)
 
 
-def _scrub_media_placeholders(nid, fields, warnings):
-    for key in _MEDIA_FIELD_KEYS:
+def _scrub_media_placeholders(nid, fields, warnings, ntype=None):
+    # ``model`` is a model id on every generative node. Only the 3D upload stores
+    # a file URL under that key, so only that node scrubs a prose placeholder.
+    keys = _MEDIA_FIELD_KEYS + (("model",) if ntype == "mupload" else ())
+    for key in keys:
         v = fields.get(key)
         if v is None or v == "" or (isinstance(v, str) and _MEDIA_URL_RE.match(v)):
             continue
@@ -217,7 +231,7 @@ def materialize(data, warnings=None):
             warnings.append("unknown node type %r (node %s) — it cannot be executed" % (ntype, nid))
         fields = dict(raw.get("fields") or {})
         if ntype in NODE_TYPES:
-            _scrub_media_placeholders(nid, fields, warnings)
+            _scrub_media_placeholders(nid, fields, warnings, ntype)
         nodes[nid] = Node(nid, ntype, fields, raw.get("name"))
 
     links = []

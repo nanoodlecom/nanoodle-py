@@ -30,6 +30,9 @@ VIDEO_STATUS = "/api/video/status"
 AUDIO_ENDPOINT = "/api/v1/audio/speech"
 AUDIO_STATUS = "/api/tts/status"
 TRANSCRIBE_ENDPOINT = "/api/v1/audio/transcriptions"
+# Image→3D usually lands in a couple of minutes. Stop polling at 25 minutes.
+# A shorter timeouts["video"] still wins, so tests don't wait the full cap.
+MODEL3D_DEADLINE_S = 25 * 60
 
 _FUNDS_RE = re.compile(r"insufficient|balance|funds|not enough|payment required", re.I)
 _AUDIO_MIME = {"mp3": "audio/mpeg", "opus": "audio/ogg", "aac": "audio/aac",
@@ -1105,8 +1108,34 @@ def _video_dims(node):
     return out
 
 
-def _gen_video(engine, node, on_cost, prompt, extra_body):
-    body = {"model": _mdl(node), "prompt": prompt}
+def _model3d_status_url(s):
+    """GLB URL from a completed 3D status. A bare video url is not a model."""
+    data = s.get("data") if isinstance(s.get("data"), dict) else {}
+    out = data.get("output") if isinstance(data.get("output"), dict) else None
+    if out is None:
+        out = s.get("output") if isinstance(s.get("output"), dict) else {}
+    kind = str(out.get("kind") or "").lower()
+    fmt = str(out.get("format") or "").lower()
+    if kind != "3d" and fmt != "glb":
+        return ""
+    listing = out.get("videoUrls") if isinstance(out.get("videoUrls"), list) else []
+    first = listing[0] if listing else None
+    if isinstance(first, str):
+        from_list = first
+    elif isinstance(first, dict):
+        from_list = first.get("url") or ""
+    else:
+        from_list = ""
+    model = out.get("model") if isinstance(out.get("model"), dict) else {}
+    video = out.get("video") if isinstance(out.get("video"), dict) else {}
+    return out.get("model_url") or model.get("url") or video.get("url") or from_list or ""
+
+
+def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
+    body = {"model": _mdl(node)}
+    # 3D omits an empty prompt so an image-only model isn't sent a blank string.
+    if not (media_kind == "model3d" and not str(prompt or "").strip()):
+        body["prompt"] = prompt
     dims = _video_dims(node)
     body.update(dims)
     body.update(extra_body.pop("_sources", {}))
@@ -1118,6 +1147,10 @@ def _gen_video(engine, node, on_cost, prompt, extra_body):
         body.update(model_opts)
     body.update(dims)  # node-owned dims win over stale modelOpts keys
     body.update(extra_body)  # wired refs LAST — a wired port always wins the key
+    if media_kind == "model3d" and len(json.dumps(body)) > MEDIA_INLINE_MAX:
+        raise NanoodleError(
+            "This 3D photo is a bit large (~4 MB max). nanoodle sends it inline rather "
+            "than uploading it, so NanoGPT's edge won't accept it. Use a smaller photo.")
     resp = engine._post_json(VIDEO_SUBMIT, body)
     j = json.loads(resp.text())
     on_cost(*engine._cost_with_headers(j, resp))
@@ -1126,8 +1159,11 @@ def _gen_video(engine, node, on_cost, prompt, extra_body):
         raise NanoodleError("no runId returned")
     t0 = time.monotonic()
     # None = wait forever (default). Finite seconds = headless/CI cap. Run deadline
-    # still outranks via check_cancel/sleep.
-    while engine.timeout_video is None or time.monotonic() - t0 < engine.timeout_video:
+    # still outranks via check_cancel/sleep. 3D always stops at 25 minutes.
+    cap = engine.timeout_video
+    if media_kind == "model3d":
+        cap = MODEL3D_DEADLINE_S if cap is None else min(cap, MODEL3D_DEADLINE_S)
+    while cap is None or time.monotonic() - t0 < cap:
         # The run deadline outranks timeout_video. Both checks sit OUTSIDE the
         # try below: NodeCancelled is a NanoodleError, and the except there
         # swallows NanoodleError to keep polling.
@@ -1146,6 +1182,11 @@ def _gen_video(engine, node, on_cost, prompt, extra_body):
         engine._progress({"type": "poll", "node_id": node.id, "name": display_name(node),
                           "status": st, "elapsed": time.monotonic() - t0})
         if st in ("COMPLETED", "SUCCEEDED"):
+            if media_kind == "model3d":
+                url = _model3d_status_url(s)
+                if not url:
+                    raise NanoodleError("completed but no model url")
+                return engine._media_ref(url, mime="model/gltf-binary")
             out = (data or {}).get("output") or s.get("output") or {}
             url = None
             video = out.get("video")
@@ -1159,9 +1200,14 @@ def _gen_video(engine, node, on_cost, prompt, extra_body):
                 raise NanoodleError("completed but no video url")
             return engine._media_ref(url)
         if st in ("FAILED", "ERROR", "CANCELED"):
-            raise NanoodleError("video failed: " + str((data or {}).get("error") or st))
+            prefix = "3D failed: " if media_kind == "model3d" else "video failed: "
+            raise NanoodleError(prefix + str((data or {}).get("error") or st))
+    if (media_kind == "model3d" and cap >= MODEL3D_DEADLINE_S
+            and (engine.timeout_video is None or engine.timeout_video >= MODEL3D_DEADLINE_S)):
+        raise NanoodleError(
+            "still building after 25 minutes — the job may still be running on NanoGPT's side")
     raise NanoodleError("video timed out (%d s) — the job may still be running on NanoGPT's side"
-                        % int(engine.timeout_video))
+                        % int(cap if cap is not None else engine.timeout_video))
 
 
 def _run_tvideo(engine, node, inp, on_cost):
@@ -1542,11 +1588,91 @@ def _run_extractaudio(engine, node, inp, on_cost):
         _media_url(inp["video"]), start, length, 16000, **engine._local_opts()))}
 
 
+def _run_mupload(engine, node, inp, on_cost):
+    v = node.fields.get("model")
+    if not v:
+        if optional_node(node):
+            return {"model": ""}
+        raise NanoodleError("no 3D file — drop a .glb first")
+    if isinstance(v, MediaRef):
+        if not v.mime:
+            v.mime = "model/gltf-binary"
+        return {"model": v}
+    return {"model": engine._media_ref(_as_url(v), mime="model/gltf-binary")}
+
+
+def _run_model3d(engine, node, inp, on_cost):
+    from .estimate import model3d_input_mods
+    mods = model3d_input_mods(node.fields.get("model"), getattr(engine, "catalog", None))
+    prompt = _fstr(node, "prompt").strip() if mods["text"] else ""
+    image = ""
+    if mods["image"]:
+        raw = inp.get("image") if inp.get("image") not in (None, "") else node.fields.get("image")
+        image = (_as_url(raw) or "") if raw else ""
+        if isinstance(image, str):
+            image = image.strip()
+        else:
+            image = ""
+    if mods["image"] and not mods["text"] and not image:
+        raise NanoodleError("Connect an image first.")
+    if mods["text"] and not mods["image"] and not prompt:
+        raise NanoodleError("Add a prompt first.")
+    if mods["image"] and mods["text"] and not image and not prompt:
+        raise NanoodleError("Add a prompt or connect an image first.")
+    extra = {}
+    if image:
+        extra["_sources"] = {"imageDataUrl": image}
+    return {"model": _gen_video(engine, node, on_cost, prompt, extra, media_kind="model3d")}
+
+
+def _run_cleanvoice(engine, node, inp, on_cost):
+    from . import cleanvoice as cv
+    src = cv.clean_voice_source(inp, node.fields)
+    # Attribute lookup so tests can patch nanoodle.cleanvoice.clean_voice_media_seconds.
+    secs = cv.clean_voice_media_seconds(src["url"])
+    if not str(node.fields.get("model") or "").strip():
+        node.fields["model"] = cv.CLEANVOICE_DEFAULT_MODEL
+    extra = cv.clean_voice_extra(src["url"], secs)
+    try:
+        audio = _gen_audio(engine, node, on_cost, "", extra)
+    except NodeCancelled:
+        raise
+    except NanoodleError as e:
+        mapped = cv.clean_voice_error(e)
+        if mapped is not e:
+            raise mapped from e
+        raise
+    return {"audio": audio}
+
+
+def _run_endpoint(engine, node, inp, on_cost):
+    from . import endpoint as ep
+    target = ep.endpoint_resolve_target(node, inp)
+    ok = ep.endpoint_url_ok(target["url"])
+    if ok is not True:
+        raise NanoodleError(str(ok))
+    engine.check_cancel()
+    body = ep.endpoint_request_body(target["mode"], node, inp)
+    headers = ep.endpoint_headers(node.fields.get("auth"))
+    try:
+        resp = engine.http("POST", target["url"], headers=headers, body=json.dumps(body),
+                           timeout=engine._http_timeout_now())
+    except NodeCancelled:
+        raise
+    except NanoodleError as e:
+        raise NanoodleError(ep.endpoint_fetch_error(e, target["url"])) from e
+    if not (200 <= resp.status < 300):
+        raise NanoodleError(ep.endpoint_http_error(resp.status, resp.text()))
+    # The graph's own server. Never the NanoGPT key, never x402, never on_cost.
+    return ep.endpoint_parse_response(target["mode"], resp, engine)
+
+
 _EXECUTORS = {
     "text": _run_text,
     "upload": _run_upload("image"),
     "aupload": _run_upload("audio"),
     "vupload": _run_upload("video"),
+    "mupload": _run_mupload,
     "choice": _run_choice,
     "join": _run_join,
     "resize": _run_resize,
@@ -1563,10 +1689,13 @@ _EXECUTORS = {
     "inpaint": _run_inpaint,
     "tvideo": _run_tvideo,
     "ivideo": _run_ivideo,
+    "model3d": _run_model3d,
     "vedit": _run_vedit,
     "lipsync": _run_lipsync,
     "music": _run_music,
     "tts": _run_tts,
     "remix": _run_remix,
     "transcribe": _run_transcribe,
+    "cleanvoice": _run_cleanvoice,
+    "endpoint": _run_endpoint,
 }

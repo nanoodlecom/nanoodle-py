@@ -115,6 +115,28 @@ Response handling:
 FormData: file=<audio blob> (field name "file"), model, language?. Local guard: >3.5MB raise.
 Parse: `j.transcription ?? j.text ?? j.data?.transcription ?? j.data?.text`.
 
+### cleanvoice → AUDIO speech endpoint, then the same poll as music/tts
+```
+source = wired audio, else wired video, else fields.url
+refuses data: and blob: before any request (NanoGPT downloads the file)
+body = { model: fields.model || "elevenlabs/audio-isolation", input: "", audio: <public https URL>, duration }
+duration = probed length clamped to 0.6–3600s, else 60 (a quote; the server re-measures)
+```
+POST `/api/v1/audio/speech`. A 202 `{runId}` polls GET `/api/tts/status` like speech. Price on the catalog is per second ($0.121/min for ElevenLabs Audio Isolation; VEED Clean Audio is `per_billing_interval`).
+
+### model3d → same submit + poll as video, media kind 3d
+```
+body = { model, prompt? , imageDataUrl? } + fields.modelOpts
+omit prompt when it is empty
+```
+POST `/api/generate-video`, poll GET `/api/video/status`. A completed payload counts only when `output.kind == "3d"` or `output.format == "glb"`; the URL is `model_url || model.url || video.url || videoUrls[0]`. A bare video url is "completed but no model url". Polling stops at 25 minutes (or `timeouts["video"]` when that is shorter). Modalities come from the catalog (`modalities` or `architecture.input_modalities`); unknown ids accept image and text. `tripo3d/v2.5` is image-only.
+
+### endpoint → POST the graph's own URL (no NanoGPT key, no x402)
+Modes: chat, image, video, audio, json. `http` is allowed for localhost, 127.0.0.1, ::1, RFC1918, link-local, and `.local`; anything else must be `https`. Credentials in the URL are refused. A wired `url` or `mode` (often a Choice path like `/post`) joins onto the authored host and does not replace `fields.url`. The output port follows the mode.
+
+### estimate
+`estimate_graph_cost(graph, catalogs)` / `Workflow.estimate(catalogs)`. Catalogs are caller-supplied and never fetched. Image prices are exact; other billable types are estimates. Local nodes (including endpoint and uploads) are $0 and are not counted as unpriced. An untouched video audio switch — the key absent from `modelOpts` — is priced at the catalog default, which is what NanoGPT bills when the generate-video body omits the key. Explicit false stays on the silent tier. A model with no audio-switch descriptor stays silent.
+
 ## Cost extraction (costFromJson 998-1013)
 USD priority: j.cost (if >0) → j.x_nanogpt_pricing.(costUsd|cost|amount) → j.metadata?.cost → header x-cost / x-nano-cost.
 Balance: header x-remaining-balance (wins) → j.remainingBalance → x_nanogpt_pricing.remainingBalance.

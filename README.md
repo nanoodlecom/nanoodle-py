@@ -241,11 +241,17 @@ is `0.0`, and the reason is in `errors[0].message`:
 
 | runs | node types |
 |---|---|
-| local | text, upload (image/audio/video), choice, join, comment |
+| local | text, upload (image/audio/video/3D `.glb`), choice, join, comment, endpoint‡ |
 | local media† | resize, vframes, combine, soundtrack, trim, extractaudio |
-| NanoGPT | llm (incl. vision + audio input), image, edit, inpaint*, vision, decide†, tvideo, ivideo, vedit, lipsync, music, remix, tts, transcribe |
+| NanoGPT | llm (incl. vision + audio input), image, edit, inpaint*, vision, decide†, tvideo, ivideo, model3d, vedit, lipsync, music, remix, tts, transcribe, cleanvoice |
 
 † `decide` asks a NanoGPT decision model one typed question (`POST /api/v1/decisions`): pick the best of the wired `img1…` images, choose a label, score on a scale, or yes/no. Text-only decisions need nothing extra; wired images are shrunk to the model's limits with ffmpeg. A yes/no gate that answers no is not a failure: that node settles as `gated`, everything downstream is `skipped` unbilled, and the run succeeds (see [Gates](#gates-decide-said-no)).
+
+`model3d` posts to the video job API and returns a GLB (`model/gltf-binary`). `cleanvoice` posts a public audio URL to `/api/v1/audio/speech` (`elevenlabs/audio-isolation` by default, or `veed/clean-audio`) and polls `/api/tts/status`. A `data:` clip is refused before any request.
+
+‡ `endpoint` POSTs a NanoGPT-shaped body to a URL in the graph. It never sends the NanoGPT API key. `http` is only for localhost, loopback, RFC1918, link-local, and `.local`.
+
+`wf.estimate(catalogs)` forecasts one run from a catalog you supply. Nothing is fetched. An untouched video audio switch is priced at the catalog default (what NanoGPT bills when the key is omitted). An explicit audio-off stays on the silent tier.
 
 † **local media** needs **ffmpeg** on `PATH` (soft dependency — not a PyPI package). Same behaviour as the browser app; clear error if ffmpeg is missing.
 
