@@ -23,7 +23,7 @@ agents.
 | | |
 |---|---|
 | **Package** | `nanoodle` on PyPI |
-| **Runtime** | Python ≥ 3.9 · stdlib only · no deps |
+| **Runtime** | Python ≥ 3.11 · stdlib only · no deps |
 | **Sibling** | [JavaScript package](https://github.com/nanoodlecom/nanoodle-js) (same graphs, same semantics) |
 | **Editor** | [nanoodle.com](https://nanoodle.com) — wire nodes, hit 💾, download the graph |
 
