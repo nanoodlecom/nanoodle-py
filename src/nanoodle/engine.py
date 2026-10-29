@@ -20,7 +20,7 @@ from .graph import (EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name,
                     optional_node)
 from .media import (MEDIA_INLINE_MAX, TRANSCRIBE_MAX_BYTES, MediaRef,
                     b64_image_mime, make_data_url, parse_data_url)
-from .transport import HttpResponse, encode_multipart
+from .transport import HttpResponse, default_http, encode_multipart
 from .x402 import assert_payment_option, looks_like_result, parse_json, parse_nano_invoice
 
 IMG_ENDPOINT = "/v1/images/generations"          # note: NOT /api/v1
@@ -526,6 +526,66 @@ class Engine(object):
     def _media_ref(self, url, mime=None):
         return MediaRef(url, mime=mime, fetcher=self.fetch_media)
 
+    def resolve_content_url(self, url):
+        """Resolve NanoGPT content paths before chaining video, without CDN auth.
+
+        An injected HTTP transport must return raw redirect responses, as the
+        default transport does here; the engine owns these authenticated hops.
+        """
+        if not isinstance(url, str) or not url:
+            return url
+        origin = urllib.parse.urlsplit(self.base_url)
+        current = urllib.parse.urljoin(self.base_url + "/", url)
+
+        def content_path(path):
+            return path in ("/api", "/v1") or path.startswith(("/api/", "/v1/"))
+
+        def api_url(value):
+            u = urllib.parse.urlsplit(value)
+            return (u.scheme, u.netloc) == (origin.scheme, origin.netloc) and content_path(u.path)
+
+        if not api_url(current):
+            return current if url.startswith("/") and not url.startswith("//") else url
+        for _ in range(5):
+            self.check_cancel()
+            try:
+                # Authorization stays on the API host; never send x-api-key on
+                # a content request or follow a redirect inside urllib.
+                opts = {"headers": {k: v for k, v in self._auth_headers().items()
+                                    if k.lower() == "authorization"},
+                        "timeout": self._http_timeout_now()}
+                if self.http is default_http:
+                    opts.update(follow_redirects=False, max_bytes=MEDIA_INLINE_MAX)
+                resp = self.http("GET", current, **opts)
+            except NodeCancelled:
+                raise
+            except Exception:
+                # Transport errors may contain signed URLs or credentials.
+                raise NanoodleError("could not fetch provider media") from None
+            if 300 <= resp.status < 400:
+                location = resp.header("location")
+                if not location:
+                    raise NanoodleError("provider media redirect had no location")
+                target = urllib.parse.urljoin(current, location)
+                parsed = urllib.parse.urlsplit(target)
+                if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
+                    raise NanoodleError("provider media redirect had no usable location")
+                if not api_url(target):
+                    return target  # retain signed query for the next provider, never fetch with auth
+                current = target
+                continue
+            if not 200 <= resp.status < 300:
+                raise NanoodleError("could not fetch provider media (HTTP %d)" % resp.status)
+            mime = (resp.header("content-type") or "").split(";")[0].strip().lower()
+            if mime in ("", "application/octet-stream", "binary/octet-stream"):
+                mime = None
+            result = make_data_url(resp.body, mime)
+            if len(result) > MEDIA_INLINE_MAX:
+                raise NanoodleError("provider media is too large to send inline (~4 MB max) "
+                                    "and did not redirect to a fetchable file")
+            return result
+        raise NanoodleError("provider media redirect did not resolve to a fetchable file")
+
     # ---- cost extraction (play.html costFromJson / costFromHeaders) --------
 
     @staticmethod
@@ -1017,6 +1077,15 @@ def _kept_first(engine, node, urls):
     return urls[0]
 
 
+def _image_model_opts(opts):
+    """Model knobs cannot replace node-owned request fields or routing/auth."""
+    if not isinstance(opts, dict):
+        return {}
+    protected = re.compile(r"^(?:model|prompt|size|n|responseformat|image|images|imageurl|imagedataurl|mask|maskurl|maskdataurl|key|apikey|xapikey|token|accesstoken|authorization|auth|headers|url|endpoint|baseurl|method|body|credentials|proxy|runid|requestid|isapirequest|paymentsource|paymentid|tojson|proto|prototype|constructor)$", re.I)
+    return {k: v for k, v in opts.items()
+            if not protected.match(re.sub(r"[_-]", "", k))}
+
+
 def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_data_url=None):
     f = node.fields
     body = {"model": _mdl(node), "size": f.get("size") or "1024x1024",
@@ -1027,6 +1096,7 @@ def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_dat
         body["imageDataUrl"] = image_data_url
     if mask_data_url:
         body["maskDataUrl"] = mask_data_url
+    body.update(_image_model_opts(f.get("modelOpts")))
     body.update(_lora_params(node))  # authored LoRAs ride on image/edit/inpaint (imgExtra)
     seed = f.get("seed")
     if seed is not None and str(seed).strip() != "" and _is_num(seed):
@@ -1071,7 +1141,9 @@ def _run_edit(engine, node, inp, on_cost):
     if not imgs:
         raise NanoodleError("no image input")
     prompt = _fstr(node, "prompt").strip()
-    if not prompt and not re.search(r"upscal", node.fields.get("model") or "", re.I):
+    vector_convert = (node.fields.get("model") == "ideogram/vector"
+                      and _image_model_opts(node.fields.get("modelOpts")).get("vector_operation") == "convert")
+    if not prompt and not re.search(r"upscal", node.fields.get("model") or "", re.I) and not vector_convert:
         raise NanoodleError("no edit instruction")
     if sum(len(u) for u in imgs) > MEDIA_INLINE_MAX:
         raise NanoodleError("reference images too large (~4 MB combined limit) — use fewer or smaller images")
@@ -1198,7 +1270,7 @@ def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
                 url = (video[0] or {}).get("url")
             if not url:
                 raise NanoodleError("completed but no video url")
-            return engine._media_ref(url)
+            return engine._media_ref(engine.resolve_content_url(url))
         if st in ("FAILED", "ERROR", "CANCELED"):
             prefix = "3D failed: " if media_kind == "model3d" else "video failed: "
             raise NanoodleError(prefix + str((data or {}).get("error") or st))
@@ -1233,7 +1305,7 @@ def _run_vedit(engine, node, inp, on_cost):
     if not inp.get("video"):
         raise NanoodleError("no video input")
     prompt = _fstr(node, "prompt").strip()
-    src = _as_url(inp["video"])
+    src = engine.resolve_content_url(_as_url(inp["video"]))
     sources = {"videoUrl": src} if re.match(r"^https?:", src) else {"videoDataUrl": src}
     return {"video": _gen_video(engine, node, on_cost, prompt, {"_sources": sources})}
 
