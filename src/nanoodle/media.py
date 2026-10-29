@@ -3,6 +3,7 @@
 import base64
 import binascii
 import os
+import re
 
 from .errors import NanoodleError
 
@@ -16,7 +17,7 @@ TRANSCRIBE_MAX_BYTES = int(3.5 * 1024 * 1024)
 
 _EXT_MIME = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml",
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
     ".oga": "audio/ogg", ".opus": "audio/ogg", ".flac": "audio/flac",
     ".aac": "audio/aac", ".m4a": "audio/mp4",
@@ -26,7 +27,7 @@ _EXT_MIME = {
 }
 
 _MIME_EXT = {
-    "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+    "image/svg+xml": "svg", "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
     "image/webp": "webp", "image/bmp": "bmp",
     "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/wav": "wav",
     "audio/x-wav": "wav", "audio/ogg": "ogg", "audio/flac": "flac",
@@ -76,6 +77,13 @@ def b64_image_mime(b64):
         return "image/gif"
     if b64.startswith("UklGR"):
         return "image/webp"
+    # Inspect text only, bounded to the same prefix as the JS/browser engines.
+    try:
+        head = base64.b64decode(b64[:8192]).decode("utf-8", "replace").lstrip("\ufeff")
+        if re.match(r"^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg(?:\s|/?>)", head, re.I):
+            return "image/svg+xml"
+    except (ValueError, binascii.Error):
+        pass
     return "image/png"
 
 

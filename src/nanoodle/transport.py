@@ -32,17 +32,28 @@ class HttpResponse(object):
             return self.body.decode("utf-8", "replace")
 
 
-def default_http(method, url, headers=None, body=None, timeout=None):
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def default_http(method, url, headers=None, body=None, timeout=None,
+                 follow_redirects=True, max_bytes=None):
     if isinstance(body, str):
         body = body.encode("utf-8")
     req = urllib.request.Request(url, data=body, method=method)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return HttpResponse(resp.status, dict(resp.headers.items()), resp.read())
+        open_url = (urllib.request.urlopen if follow_redirects else
+                    urllib.request.build_opener(_NoRedirect()).open)
+        with open_url(req, timeout=timeout) as resp:
+            data = resp.read() if max_bytes is None else resp.read(max_bytes + 1)
+            return HttpResponse(resp.status, dict(resp.headers.items()), data)
     except urllib.error.HTTPError as e:
-        return HttpResponse(e.code, dict((e.headers or {}).items()), e.read())
+        with e:
+            return HttpResponse(e.code, dict((e.headers or {}).items()),
+                                e.read() if max_bytes is None else e.read(max_bytes + 1))
     except urllib.error.URLError as e:
         # never echo headers/keys — the reason string is connection-level only
         raise NanoodleError("could not reach %s (%s)" % (url.split("?")[0], e.reason))
