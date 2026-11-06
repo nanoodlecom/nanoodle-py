@@ -158,7 +158,7 @@ class SettleFlowTest(unittest.TestCase):
             return json_resp(402, {"error": "Payment not verified"})
 
         eng = make_engine(http, lambda inv: None)
-        with self.assertRaisesRegex(NanoodleError, "expired.*nano_"):
+        with self.assertRaisesRegex(NanoodleError, "expired before the wallet callback"):
             self.chat(eng)
 
     def test_run_deadline_stops_the_settle_poll_and_stays_traceable(self):
@@ -315,8 +315,8 @@ class SettleFlowTest(unittest.TestCase):
 
 
 class WalletCallbackFailureTest(unittest.TestCase):
-    """MONEY: a wallet callback that RAISES sent nothing. The ledger and the
-    error message must never say a deposit went out.
+    """MONEY: a callback that raises has an unknown send outcome. The ledger
+    records the failure and preserves the payment id for verification.
 
     The ledger entry is opened BEFORE the callback, because the worker can be
     abandoned at any point after that. That is why the entry starts at
@@ -360,7 +360,8 @@ class WalletCallbackFailureTest(unittest.TestCase):
             wf.run()
         message = ctx.exception.result.nodes["n1"].error
         self.assertIn("wallet offline", message)
-        self.assertIn("no Nano deposit was sent", message)
+        self.assertIn("a Nano deposit may have been sent", message)
+        self.assertIn("before paying again", message)
         self.assertNotIn("already sent", message,
                          "nanoodle told the user money moved when the send FAILED")
         self.assertEqual([p["status"] for p in ctx.exception.result.payments], ["failed"])
@@ -393,7 +394,8 @@ class WalletCallbackFailureTest(unittest.TestCase):
         result = ctx.exception.result
         self.assertEqual(result.nodes["n2"].error, "run timed out after 0.4s")
         message = result.nodes["n1"].error
-        self.assertIn("no Nano deposit was sent", message)
+        self.assertIn("a Nano deposit may have been sent", message)
+        self.assertIn("before paying again", message)
         self.assertNotIn("already sent", message)
         self.assertEqual([p["status"] for p in result.payments], ["failed"])
 

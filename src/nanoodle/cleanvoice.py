@@ -14,7 +14,6 @@ server measures the file and bills that.
 import math
 import re
 import shutil
-import subprocess
 
 from .errors import NanoodleError
 
@@ -105,7 +104,7 @@ def clean_voice_error(exc):
     return exc
 
 
-def clean_voice_media_seconds(url):
+def clean_voice_media_seconds(url, cancel_check=None, deadline=None):
     """Best-effort length via ffprobe. None when it can't be read (→ 60 s quote).
 
     This is not a NanoGPT call. A missing ffprobe, a timeout, or an unreadable
@@ -114,12 +113,23 @@ def clean_voice_media_seconds(url):
     ffprobe = shutil.which("ffprobe")
     if not ffprobe or not url:
         return None
+    from .local_media import _run
+    from .engine import NodeCancelled
+    # Use the shared tracked-child lifecycle: cancelled daemon workers must not
+    # leave a probe running after the workflow or interpreter has exited.
+    if cancel_check:
+        cancel_check()
     try:
-        proc = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", url],
-            capture_output=True, text=True, timeout=3)
-        d = float((proc.stdout or "").strip())
-    except (OSError, ValueError, subprocess.SubprocessError):
+        stdout, _ = _run(ffprobe, [
+            "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", url],
+            timeout=3, cancel_check=cancel_check, deadline=deadline)
+        d = float(stdout.decode("utf-8", "replace").strip())
+    except NodeCancelled:
+        raise
+    except (OSError, ValueError, NanoodleError):
+        # Failure to measure is advisory; workflow cancellation is not.
+        if cancel_check:
+            cancel_check()
         return None
     return d if math.isfinite(d) and d > 0 else None

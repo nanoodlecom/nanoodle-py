@@ -11,10 +11,10 @@ nanoodle-js's copy).
 """
 
 import json
+import math
 import re
-import time
-import calendar
 import urllib.parse
+from datetime import datetime, timezone
 
 from .errors import NanoodleError
 
@@ -37,13 +37,16 @@ def _to_ms(v):
     """ISO string or unix seconds → epoch ms (None when absent/unparsable)."""
     if v is None:
         return None
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if not math.isfinite(v):
+            return None
         return int(v * 1000) if v < 1e12 else int(v)
     try:
-        # ISO 8601 like 2026-07-12T03:31:43.000Z
-        s = str(v).replace("Z", "").split(".")[0]
-        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%S")) * 1000
-    except ValueError:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, OverflowError, OSError):
         return None
 
 
@@ -80,6 +83,10 @@ def parse_nano_invoice(body, base_url):
         usd = float(usd) if usd is not None else None
     except (TypeError, ValueError):
         usd = None
+    expires_raw = nano.get("expiresAt", (pay or {}).get("expiresAt"))
+    expires_at = _to_ms(expires_raw)
+    if expires_raw is not None and expires_at is None:
+        return None  # malformed expiry must not become an unlimited payment window
     return {
         "scheme": "nano",
         "paymentId": payment_id,
@@ -91,7 +98,7 @@ def parse_nano_invoice(body, base_url):
         "amountUsd": usd,
         # ready-to-scan/click nano: URI
         "uri": "nano:%s%s" % (nano.get("payTo"), "?amount=" + amount_raw if amount_raw else ""),
-        "expiresAt": _to_ms(nano.get("expiresAt", (pay or {}).get("expiresAt"))),
+        "expiresAt": expires_at,
         "statusUrl": _abs(nano.get("statusUrl") or nano.get("callbackUrl")
                           or (pay or {}).get("statusUrl")
                           or (payment_id and "/api/x402/status/" + payment_id)),

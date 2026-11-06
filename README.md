@@ -138,10 +138,11 @@ result = wf.run(
 )
 ```
 
-`timeout=` bounds the whole run. When it fires, `run()` returns straight away
-and the in-flight nodes stop polling within about a second, so the process is
+`timeout=` bounds the whole run (`None` waits without a run deadline; `0` starts no work).
+It must be a finite, non-negative number of seconds. Ctrl-C cancels pending work promptly.
+When the deadline fires, `run()` returns straight away and the in-flight nodes stop polling within about a second, so the process is
 free to exit. Without `timeout=`, each node still waits out its own limit
-(video 600 s, audio 300 s).
+(video has no default limit, audio 300 s, 3D 25 minutes).
 
 The deadline bounds the run, and nothing else. Media a node already produced
 stays fetchable after it: `result["Image"].save("out.png")` works once the
@@ -283,7 +284,7 @@ Bring your own NanoGPT API key; NanoGPT bills your balance per generation and
 reports the price on each response.
 
 - `result.cost_usd` — total of prices returned
-- `result.cost_exact` — `False` if any call omitted a price (total is then a floor)
+- `result.cost_exact` — `False` if any call omitted a price or work was abandoned at timeout (total is then a floor)
 - `result.remaining_balance` — freshest balance the API reported
 
 A price of `0` means known-included (subscription), not unknown. No telemetry,
@@ -317,8 +318,9 @@ deposit the run asked for (`payment_id`, `amount`, `pay_to`, `explorer_url`,
 `status`, `send_error`, `redeemed`), and a deposit that never bought its request
 is named in the node's error message too — including when a `timeout=` abandoned
 the node that sent it, and when the paid call itself answered an error. `status`
-is the money fact: `sent` means your callback returned, `failed` means it raised
-and nothing was deposited, and the error message says which. A settled deposit
+records the callback outcome: `sent` means your callback returned, `failed` means it raised,
+and `sending` means it had not returned when the result was captured. A raised callback
+may already have broadcast a deposit; verify the payment ID before paying again. A settled deposit
 always gets its request: the run deadline never cancels the one call the user
 has already paid for. The CLI reports the same list as `payments` in its `--json`
 output, so an agent caller never has to re-derive a payment id from stderr.

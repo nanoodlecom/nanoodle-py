@@ -2,6 +2,7 @@
 
 import copy
 import json
+import math
 import queue
 import re
 import threading
@@ -126,16 +127,17 @@ def _note_payment(run, payment):
     be abandoned by a run deadline, and nobody ever reads its exception, so the
     payment id has to ride out on the node record instead.
 
-    The three send states get three different sentences. Saying "a deposit was
-    sent" when the wallet callback in fact failed is worse than saying nothing:
-    it sends a person hunting an explorer for money that never moved.
+    Distinguish a returned callback from an incomplete or raised callback.
+    Raising cannot prove that no money moved: a wallet can broadcast and then
+    lose its connection while waiting for confirmation.
     """
     if payment["payment_id"] in (run.error or ""):
         return
     status = payment.get("status")
     if status == "failed":
-        note = ("no Nano deposit was sent (payment %s): the wallet callback failed — %s"
-                % (payment["payment_id"], payment.get("send_error")))
+        note = ("a Nano deposit may have been sent: the wallet callback failed — %s %s; "
+                "verify the payment before paying again"
+                % (payment.get("send_error"), payment["trace"]))
     elif status == "sent":
         note = "a Nano deposit was already sent " + payment["trace"]
     else:
@@ -313,6 +315,10 @@ class Workflow(object):
     # ---- run ----------------------------------------------------------------
 
     def run(self, inputs=None, settings=None, timeout=None, on_progress=None):
+        if timeout is not None and (isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout < 0):
+            raise NanoodleError("timeout must be a finite non-negative number of seconds or None")
         graph = self._copy_graph()
 
         # Network nodes force the ~4 MB MEDIA_INLINE_MAX guard on user media
@@ -452,7 +458,7 @@ class Workflow(object):
         return str(value)
 
     def _execute(self, graph, order, timeout, on_progress):
-        deadline = (time.monotonic() + timeout) if timeout else None
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
         runs = {nid: NodeRun() for nid in order}
         for nid, n in graph.nodes.items():
             # comment nodes never run but ARE recorded (status 'skipped'),
@@ -464,6 +470,7 @@ class Workflow(object):
         lock = threading.Lock()
         cost = {"total": 0.0, "exact": True, "balance": None, "any": False}
         prompt_trims = []   # every prompt this run had to fit to a model's cap
+        reports_closed = False   # returned results must not change as abandoned workers finish
 
         def progress(evt):
             if on_progress:
@@ -495,6 +502,8 @@ class Workflow(object):
         def make_on_cost(nid):
             def on_cost(usd, balance):
                 with lock:
+                    if reports_closed:
+                        return
                     cost["any"] = True
                     if usd is None:
                         cost["exact"] = False
@@ -539,7 +548,8 @@ class Workflow(object):
                 record = {"node_id": nid, "name": name, "from": trimmed["from"],
                           "to": trimmed["to"], "cap": trimmed["cap"]}
                 with lock:
-                    prompt_trims.append(record)
+                    if not reports_closed:
+                        prompt_trims.append(record)
                 progress(dict(record, type="prompt-trimmed"))
                 _disclose(
                     "node %s: prompt trimmed %d -> %d characters — %s rejects prompts over %d"
@@ -678,7 +688,17 @@ class Workflow(object):
                         progress({"type": "node-error", "node_id": nid,
                                   "name": display_name(node), "error": run.error})
                     settled.add(nid)
+        except BaseException:
+            # Ctrl-C/SystemExit (including one raised by a worker) must not join
+            # an unbounded video poll or let queued nodes begin paid work.
+            abandoned = True
+            engine.cancel()
+            raise
         finally:
+            with lock:
+                reports_closed = True
+                if abandoned:
+                    cost["exact"] = False  # in-flight paid work may report cost after return
             # after a timeout, do NOT block on in-flight nodes — return the
             # timed-out result promptly and let the threads drain in background
             pool.shutdown(wait=not abandoned)
