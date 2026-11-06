@@ -216,13 +216,10 @@ class Engine(object):
     def sleep(self, seconds):
         """Sleep, but wake early when the run is cancelled or the deadline passes.
 
-        A run with no deadline and no cancel gets a plain time.sleep(), so
-        normal runs keep today's behaviour exactly.
+        Always wait on the event, including without a deadline, so an explicit
+        cancel or Ctrl-C wakes a sleeping poll promptly.
         """
         if seconds is None or seconds <= 0:
-            return
-        if self._deadline is None and not self._cancel.is_set():
-            time.sleep(seconds)
             return
         if self._deadline is not None:
             # cap the wait at the remaining deadline so the caller re-checks
@@ -287,8 +284,8 @@ class Engine(object):
         - ``"sending"`` — the wallet callback was entered and has not returned.
           Whether XNO left is not known yet.
         - ``"sent"`` — the callback returned without raising. Money moved.
-        - ``"failed"`` — the callback raised. No deposit was made, and
-          ``send_error`` carries the reason.
+        - ``"failed"`` — the callback raised. The send outcome is unknown:
+          a wallet can broadcast before raising. ``send_error`` carries the reason.
 
         ``redeemed`` is True once the request the deposit paid for came back
         with a 2xx. Any other status leaves it False: the XNO is gone and the
@@ -301,8 +298,8 @@ class Engine(object):
     def unredeemed_payments(self):
         """Deposits whose request never returned a result — any send status.
 
-        A failed send is reported too, because the caller must be able to tell
-        'your money is gone and unspent' from 'your wallet never sent it'.
+        A failed callback is reported too: it may have broadcast before raising,
+        so callers need the payment id to verify before attempting another send.
         """
         return [p for p in self.payments() if not p["redeemed"]]
 
@@ -339,7 +336,7 @@ class Engine(object):
             record["status"] = "sent"
 
     def _mark_send_failed(self, record, exc):
-        """The wallet callback raised. Nothing was deposited — say so."""
+        """The callback raised; whether it broadcast a deposit is unknown."""
         with self._payments_lock:
             record["status"] = "failed"
             record["send_error"] = str(exc) or exc.__class__.__name__
@@ -429,6 +426,10 @@ class Engine(object):
             raise NanoodleError(
                 "payment required, but the 402 response offered no usable Nano option"
                 + (" — " + resp.text()[:200] if body else ""))
+        if not re.fullmatch(r"[0-9]+", invoice.get("amountRaw") or "") or not int(invoice["amountRaw"]):
+            raise NanoodleError("payment required, but the Nano invoice has no positive integer raw amount")
+        if invoice.get("expiresAt") is not None and invoice["expiresAt"] <= time.time() * 1000:
+            raise NanoodleError("payment window expired before the wallet callback — no send attempted")
         trace = ("(payment %s, %s to %s) — check %s"
                  % (invoice["paymentId"], invoice.get("amount") or invoice.get("amountRaw"),
                     invoice.get("payTo"),
@@ -439,9 +440,8 @@ class Engine(object):
         self.check_cancel()
         record = self._record_payment(invoice, trace)   # status "sending"
         # The callback does the actual XNO send. Mark the entry "sent" only
-        # after it RETURNS: a callback that raises deposited nothing, and a
-        # ledger that claimed otherwise would send the user hunting an explorer
-        # for money that never moved.
+        # after it RETURNS. If it raises, it may have broadcast before losing
+        # its connection; keep the attempt traceable without claiming no send.
         with _money_critical():
             try:
                 self._payment(invoice)
@@ -505,6 +505,29 @@ class Engine(object):
     def _get(self, path):
         return self.http("GET", self.base_url + path, headers=self._auth_headers(),
                          timeout=self._http_timeout_now())
+
+    def _poll_json(self, path):
+        """Retry transport/transient failures; terminate permanent HTTP failures.
+
+        Returning None means retry this status GET, never resubmit the job.
+        HTTP errors must be checked before parsing (even non-JSON 401s), and
+        outside the NanoodleError handler that tolerates connection failures.
+        """
+        try:
+            resp = self._get(path)
+        except NodeCancelled:
+            raise
+        except NanoodleError:
+            return None
+        if not (200 <= resp.status < 300):
+            if 400 <= resp.status < 500 and resp.status not in (408, 409, 425, 429):
+                self._raise_http(resp)
+            return None
+        try:
+            value = json.loads(resp.text())
+        except ValueError:
+            return None
+        return value if isinstance(value, dict) else None
 
     def fetch_media(self, url, run_bound=False):
         """Download bytes of an https media URL (no auth headers — provider CDNs).
@@ -1113,6 +1136,7 @@ def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_dat
         body["customCivitaiAir"] = air
     resp = engine._post_json(IMG_ENDPOINT, body)
     j = json.loads(resp.text())
+    on_cost(*engine._cost_with_headers(j, resp))
     urls = []
     for d in (j.get("data") or []):
         if d.get("b64_json"):
@@ -1121,7 +1145,6 @@ def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_dat
             urls.append(d["url"])
     if not urls:
         raise NanoodleError("no image in response")
-    on_cost(*engine._cost_with_headers(j, resp))
     return [engine._media_ref(u) for u in urls]
 
 
@@ -1237,17 +1260,12 @@ def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
         cap = MODEL3D_DEADLINE_S if cap is None else min(cap, MODEL3D_DEADLINE_S)
     while cap is None or time.monotonic() - t0 < cap:
         # The run deadline outranks timeout_video. Both checks sit OUTSIDE the
-        # try below: NodeCancelled is a NanoodleError, and the except there
-        # swallows NanoodleError to keep polling.
+        # transport helper: cancellation is terminal even during a status GET.
         engine.check_cancel()
         engine.sleep(engine.poll_video)   # wakes early on cancel/deadline
         engine.check_cancel()
-        try:
-            resp = engine._get(VIDEO_STATUS + "?requestId=" + urllib.parse.quote(str(run_id)))
-            s = json.loads(resp.text())
-        except (NanoodleError, ValueError):
-            continue  # poll failures (transport OR body): silently continue until complete/cap
-        if not (200 <= resp.status < 300):
+        s = engine._poll_json(VIDEO_STATUS + "?requestId=" + urllib.parse.quote(str(run_id)))
+        if s is None:
             continue
         data = s.get("data") if isinstance(s.get("data"), dict) else None
         st = str((data or {}).get("status") or s.get("status") or "").upper()
@@ -1271,7 +1289,7 @@ def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
             if not url:
                 raise NanoodleError("completed but no video url")
             return engine._media_ref(engine.resolve_content_url(url))
-        if st in ("FAILED", "ERROR", "CANCELED"):
+        if st in ("FAILED", "ERROR", "CANCELED", "CANCELLED"):
             prefix = "3D failed: " if media_kind == "model3d" else "video failed: "
             raise NanoodleError(prefix + str((data or {}).get("error") or st))
     if (media_kind == "model3d" and cap >= MODEL3D_DEADLINE_S
@@ -1385,16 +1403,13 @@ def _poll_audio(engine, node, model, submit_json):
     query = urllib.parse.urlencode(qs)
     t0 = time.monotonic()
     while time.monotonic() - t0 < engine.timeout_audio:
-        # See _gen_video: the run deadline outranks timeout_audio, and both
-        # checks must stay outside the NanoodleError-swallowing try below.
+        # The run deadline outranks timeout_audio, including during a status GET.
         engine.check_cancel()
         engine.sleep(engine.poll_audio)   # wakes early on cancel/deadline
         engine.check_cancel()
-        try:
-            resp = engine._get(AUDIO_STATUS + "?" + query)
-            s = json.loads(resp.text())
-        except (NanoodleError, ValueError):
-            continue  # poll failures (transport OR body): silently continue until timeout
+        s = engine._poll_json(AUDIO_STATUS + "?" + query)
+        if s is None:
+            continue
         st = str(s.get("status") or "").lower()
         engine._progress({"type": "poll", "node_id": node.id, "name": display_name(node),
                           "status": st, "queue": s.get("queuePosition"),
@@ -1405,7 +1420,7 @@ def _poll_audio(engine, node, model, submit_json):
             if not url:
                 raise NanoodleError("completed but no audio url")
             return url
-        if st in ("error", "failed", "content_policy_violation"):
+        if st in ("error", "failed", "content_policy_violation", "canceled", "cancelled"):
             raise NanoodleError("audio failed: " + str(s.get("error") or s.get("message") or st))
     raise NanoodleError("audio timed out (%d s)" % int(engine.timeout_audio))
 
@@ -1701,7 +1716,8 @@ def _run_cleanvoice(engine, node, inp, on_cost):
     from . import cleanvoice as cv
     src = cv.clean_voice_source(inp, node.fields)
     # Attribute lookup so tests can patch nanoodle.cleanvoice.clean_voice_media_seconds.
-    secs = cv.clean_voice_media_seconds(src["url"])
+    secs = cv.clean_voice_media_seconds(src["url"], cancel_check=engine.check_cancel,
+                                       deadline=engine._deadline)
     if not str(node.fields.get("model") or "").strip():
         node.fields["model"] = cv.CLEANVOICE_DEFAULT_MODEL
     extra = cv.clean_voice_extra(src["url"], secs)
