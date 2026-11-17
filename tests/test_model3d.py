@@ -183,5 +183,90 @@ class Model3dRunTest(MockedTest):
         self.assertTrue(ref.url.startswith("data:model/gltf-binary;base64,"))
 
 
+class Model3dRiggingTest(MockedTest):
+    """Mesh-processing models (Hyper3D Rigging): an existing model on the
+    `model` wire is sent as the `model_url` parameter."""
+
+    CATALOG = {"model3d": [
+        {"id": "hyper3d/rigging",
+         "architecture": {"modality": "3d+image->3d", "input_modalities": ["3d", "image"]}},
+        {"id": "tripo3d/v2.5",
+         "architecture": {"modality": "image->3d", "input_modalities": ["image"]}},
+    ]}
+
+    def test_mupload_mesh_wire_sent_as_model_url(self):
+        self.mock.script("POST", "/api/generate-video",
+                         {"status": 200, "json": {"runId": "rig-1", "cost": 0.2}})
+        self.mock.script("GET", "/api/video/status",
+                         _status({"kind": "3d", "model_url": "https://cdn/rigged.glb"}))
+        wf = self.wf_dict({"nodes": [
+            {"id": "u", "type": "mupload", "fields": {"model": "https://cdn/hero.glb"}},
+            {"id": "r", "type": "model3d", "name": "Rigged",
+             "fields": {"model": "hyper3d/rigging",
+                        "modelOpts": {"bone_template": "human", "geometry_file_format": "glb"}}},
+        ], "links": [
+            {"id": "l", "from": {"node": "u", "port": "model"}, "to": {"node": "r", "port": "model"}},
+        ]}, catalog=self.CATALOG, **FAST)
+        result = wf.run()
+        body = self.mock.requests_to("/api/generate-video")[0].json
+        self.assertEqual(body["model"], "hyper3d/rigging")
+        self.assertEqual(body["model_url"], "https://cdn/hero.glb")
+        self.assertEqual(body["bone_template"], "human")
+        self.assertEqual(body["geometry_file_format"], "glb")
+        self.assertNotIn("prompt", body)
+        self.assertEqual(result["Rigged"].url, "https://cdn/rigged.glb")
+
+    def test_chain_generated_mesh_is_rigged(self):
+        # one script() call per route with a list — a second call replaces the queue
+        self.mock.script("POST", "/api/generate-video", [
+            {"status": 200, "json": {"runId": "gen-1", "cost": 0.3}},
+            {"status": 200, "json": {"runId": "rig-1", "cost": 0.2}},
+        ])
+        self.mock.script("GET", "/api/video/status", [
+            _status({"kind": "3d", "model_url": "https://cdn/statue.glb"}),
+            _status({"kind": "3d", "model_url": "https://cdn/rigged.glb"}),
+        ])
+        wf = self.wf_dict({"nodes": [
+            {"id": "u", "type": "upload", "fields": {"image": "https://cdn/photo.png"}},
+            {"id": "g", "type": "model3d", "fields": {"model": "tripo3d/v2.5"}},
+            {"id": "r", "type": "model3d", "name": "Rigged",
+             "fields": {"model": "hyper3d/rigging"}},
+        ], "links": [
+            {"id": "l1", "from": {"node": "u", "port": "image"}, "to": {"node": "g", "port": "image"}},
+            {"id": "l2", "from": {"node": "g", "port": "model"}, "to": {"node": "r", "port": "model"}},
+        ]}, catalog=self.CATALOG, **FAST)
+        result = wf.run()
+        rig_body = self.mock.requests_to("/api/generate-video")[1].json
+        self.assertEqual(rig_body["model_url"], "https://cdn/statue.glb")
+        self.assertEqual(result["Rigged"].url, "https://cdn/rigged.glb")
+
+    def test_no_mesh_wired_fails_before_any_request(self):
+        wf = self.wf_dict({"nodes": [
+            {"id": "r", "type": "model3d", "fields": {"model": "hyper3d/rigging"}},
+        ]}, catalog=self.CATALOG, **FAST)
+        with self.assertRaises(RunError) as ctx:
+            wf.run()
+        self.assertIn("Connect a model first.", str(ctx.exception))
+        self.assertEqual(self.mock.requests, [])
+
+    def test_generation_model_ignores_model_wire(self):
+        self.mock.script("POST", "/api/generate-video",
+                         {"status": 200, "json": {"runId": "gen-1", "cost": 0.3}})
+        self.mock.script("GET", "/api/video/status",
+                         _status({"kind": "3d", "model_url": "https://cdn/gen.glb"}))
+        wf = self.wf_dict({"nodes": [
+            {"id": "u", "type": "mupload", "fields": {"model": "https://cdn/hero.glb"}},
+            {"id": "p", "type": "upload", "fields": {"image": "https://cdn/photo.png"}},
+            {"id": "g", "type": "model3d", "fields": {"model": "tripo3d/v2.5"}},
+        ], "links": [
+            {"id": "l1", "from": {"node": "u", "port": "model"}, "to": {"node": "g", "port": "model"}},
+            {"id": "l2", "from": {"node": "p", "port": "image"}, "to": {"node": "g", "port": "image"}},
+        ]}, catalog=self.CATALOG, **FAST)
+        wf.run()
+        body = self.mock.requests_to("/api/generate-video")[0].json
+        self.assertNotIn("model_url", body)
+        self.assertEqual(body["imageDataUrl"], "https://cdn/photo.png")
+
+
 if __name__ == "__main__":
     unittest.main()

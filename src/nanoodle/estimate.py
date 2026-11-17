@@ -774,12 +774,12 @@ def model3d_input_mods(model_id, catalogs=None):
             arch = it.get("architecture") or {}
             mods = arch.get("input_modalities") if isinstance(arch, dict) else None
     if isinstance(mods, list):
-        return {"image": "image" in mods, "text": "text" in mods}
+        return {"image": "image" in mods, "text": "text" in mods, "mesh": "3d" in mods}
     if model_id == MODEL3D_IMAGE_DEFAULT:
-        return {"image": True, "text": False}
+        return {"image": True, "text": False, "mesh": False}
     if model_id == MODEL3D_TEXT_DEFAULT:
-        return {"image": True, "text": True}
-    return {"image": True, "text": True}
+        return {"image": True, "text": True, "mesh": False}
+    return {"image": True, "text": True, "mesh": False}
 
 
 def model3d_has_span(pricing, fields, defaults):

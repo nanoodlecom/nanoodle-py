@@ -67,9 +67,9 @@ NODE_TYPES = {
                    "dynamic": [REF_PORT_RE], "network": True},
     "ivideo":     {"title": "Image→Video",      "outputs": [("video", "video")],
                    "static": ["image", "endframe"], "network": True},
-    # 🧊 3D: image port is static; prompt is a field override. Output is a GLB.
+    # 🧊 3D: image + model ports are static; prompt is a field override. Output is a GLB.
     "model3d":    {"title": "3D model",         "outputs": [("model", "model3d")],
-                   "static": ["image"], "network": True},
+                   "static": ["image", "model"], "network": True},
     "vedit":      {"title": "Video edit",       "outputs": [("video", "video")],
                    "static": ["video"], "network": True},
     "vframes":    {"title": "Video → frames",   "outputs": [("frame1", "image")],
