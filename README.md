@@ -376,3 +376,13 @@ Same contract as the [JavaScript package](https://github.com/nanoodlecom/nanoodl
 
 MIT — see [LICENSE](LICENSE). Not affiliated with NanoGPT. Build workflows at
 [nanoodle.com](https://nanoodle.com).
+
+## Publishing to PyPI
+
+A merge to `main` publishes the tested wheel and source distribution when the
+version in `pyproject.toml` is absent from PyPI. Bump that version and
+`src/nanoodle/__init__.py` together in a release PR.
+
+Configure PyPI Trusted Publishing for [nanoodle](https://pypi.org/manage/project/nanoodle/settings/publishing/)
+with owner `nanoodlecom`, repository `nanoodle-py`, workflow `publish.yml`,
+and environment `pypi`. The GitHub environment allows publishes from `main`.
