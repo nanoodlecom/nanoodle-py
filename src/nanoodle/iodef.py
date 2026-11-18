@@ -215,8 +215,10 @@ def _append_model3d_inputs(out, node, catalog, author_optional, name, fed):
     mods = model3d_input_mods(node.fields.get("model"), catalog)
     img_fed = fed("image")
     if mods["image"] and not img_fed:
+        # Mesh models (rigging): the model wire is the required input and
+        # the image is only a reference — never promote it to required.
         out.append(InputSpec("", node.id, "image", "image", "Image",
-                             optional=author_optional or bool(mods["text"]),
+                             optional=author_optional or bool(mods["text"]) or bool(mods.get("mesh")),
                              default=_field_default(node, "image", None), node_name=name))
     if mods["text"] and not fed("prompt"):
         # Dual-modality models accept a prompt or an image. Both inputs stay

@@ -1700,15 +1700,24 @@ def _run_model3d(engine, node, inp, on_cost):
             image = image.strip()
         else:
             image = ""
-    if mods["image"] and not mods["text"] and not image:
+    mesh = ""
+    if mods.get("mesh"):
+        raw = inp.get("model")
+        mesh = (_as_url(raw) or "") if raw else ""
+        mesh = mesh.strip() if isinstance(mesh, str) else ""
+    if mods.get("mesh") and not mesh:
+        raise NanoodleError("Connect a model first.")
+    if not mods.get("mesh") and mods["image"] and not mods["text"] and not image:
         raise NanoodleError("Connect an image first.")
-    if mods["text"] and not mods["image"] and not prompt:
+    if not mods.get("mesh") and mods["text"] and not mods["image"] and not prompt:
         raise NanoodleError("Add a prompt first.")
-    if mods["image"] and mods["text"] and not image and not prompt:
+    if not mods.get("mesh") and mods["image"] and mods["text"] and not image and not prompt:
         raise NanoodleError("Add a prompt or connect an image first.")
     extra = {}
     if image:
         extra["_sources"] = {"imageDataUrl": image}
+    if mesh:
+        extra["model_url"] = mesh
     return {"model": _gen_video(engine, node, on_cost, prompt, extra, media_kind="model3d")}
 
 
