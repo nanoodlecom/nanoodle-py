@@ -223,6 +223,8 @@ def materialize(data, warnings=None):
         ntype = raw.get("type")
         if ntype == "audio":  # legacy alias
             ntype = "tts"
+        if ntype == "decide-branch":
+            ntype = "decide"
         nid = raw.get("id")
         if not nid:
             warnings.append("skipped a node with no id")
@@ -230,6 +232,8 @@ def materialize(data, warnings=None):
         if ntype not in NODE_TYPES:
             warnings.append("unknown node type %r (node %s) — it cannot be executed" % (ntype, nid))
         fields = dict(raw.get("fields") or {})
+        if raw.get("type") == "decide-branch":
+            fields["branch"] = True
         if ntype in NODE_TYPES:
             _scrub_media_placeholders(nid, fields, warnings, ntype)
         nodes[nid] = Node(nid, ntype, fields, raw.get("name"))

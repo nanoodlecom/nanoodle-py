@@ -52,6 +52,8 @@ def _num(v):
 
 
 def decide_mode(f):
+    if (f or {}).get("branch") is True:
+        return "yesno"
     m = (f or {}).get("mode")
     return m if m in ("choose", "score", "yesno") else "pick"
 
@@ -232,7 +234,19 @@ def decide_run(f, model, text, imgs, lim, send, fit):
     else:
         j = send({"model": model, "state": decide_state(text, sent), "questions": {"answer": q}})
     j = j or {}
-    out = decide_outputs(mode, (j.get("answers") or {}).get("answer"), q, imgs, j.get("usage"), model)
+    answer = (j.get("answers") or {}).get("answer")
+    branching = f.get("branch") is True
+    if branching:
+        probability = answer.get("noul") if isinstance(answer, dict) else None
+        if (type(probability) not in (int, float) or not 0 <= probability <= 1
+                or answer.get("type") != "noul"):
+            raise NanoodleError("Decide needs a valid yes/no answer to select a branch")
+    out = decide_outputs(mode, answer, q, imgs, j.get("usage"), model)
+    if branching:
+        branch = out["text"]
+        out["decision"]["branch"] = branch
+        out[branch] = text or branch
+        return out
     if mode == "yesno" and f.get("gate") in (True, "true") and out["decision"]["yes"] < 0.5:
         raise DecideGateClosed(out["decision"], out)
     return out

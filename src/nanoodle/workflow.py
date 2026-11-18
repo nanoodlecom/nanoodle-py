@@ -11,6 +11,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, wait
 
 # disclose(): advisory run reports that can never fail the run (see engine.disclose)
 from .engine import Engine, disclose as _disclose
+from .branches import plan_branches
 from .decide import DecideGateClosed
 from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, display_name,
@@ -33,7 +34,7 @@ class NodeRun(object):
     ran, never billed. (Comment nodes are 'skipped' with gated_by None.)
     """
 
-    __slots__ = ("status", "out", "error", "cost_usd", "ms", "gate", "gated_by")
+    __slots__ = ("status", "out", "error", "cost_usd", "ms", "gate", "gated_by", "skip_reason")
 
     def __init__(self):
         self.status = "pending"
@@ -43,6 +44,7 @@ class NodeRun(object):
         self.ms = None
         self.gate = None
         self.gated_by = None
+        self.skip_reason = None
 
     def __repr__(self):
         extra = ""
@@ -515,14 +517,16 @@ class Workflow(object):
                         cost["balance"] = balance
             return on_cost
 
-        def exec_node(nid):
+        active_links = plan_branches(graph, order)
+
+        def exec_node(nid, inbound):
             # Honour deadline before starting (local media especially can be long).
             engine.check_cancel()
             node = graph.node(nid)
             name = display_name(node)
             progress({"type": "node-start", "node_id": nid, "name": name})
             t0 = time.monotonic()
-            inputs, overrides = classify_inbound(node, graph.inbound(nid))
+            inputs, overrides = classify_inbound(node, inbound)
             inp = {}
             for port, (src, sport) in inputs.items():
                 out = runs[src].out or {}
@@ -530,6 +534,8 @@ class Workflow(object):
             if overrides:
                 node = copy.deepcopy(node)
                 for port, (src, sport) in overrides.items():
+                    if node.type == "decide" and port == "branch":
+                        continue  # routing is authored in the graph
                     v = (runs[src].out or {}).get(sport)
                     if v is None:
                         continue  # play.html: if(v!=null) — a null upstream value
@@ -586,7 +592,10 @@ class Workflow(object):
                         if not deps[nid] <= settled:
                             continue
                         run = runs[nid]
-                        failed_dep = next((d for d in deps[nid]
+                        inbound = (active_links(nid, lambda d: runs[d].out if runs[d].status == "done" else None)
+                                   if active_links else graph.inbound(nid))
+                        active_deps = {link.from_node for link in inbound} & deps[nid] if inbound is not None else set()
+                        failed_dep = next((d for d in active_deps
                                            if runs[d].status == "error"), None)
                         if timed_out:
                             # timeout wins the message — an upstream marked
@@ -603,9 +612,16 @@ class Workflow(object):
                             progress({"type": "node-error", "node_id": nid,
                                       "name": display_name(graph.node(nid)), "error": run.error})
                             progressed = True
-                        elif any(gate_of(d) for d in deps[nid]):
+                        elif inbound is None:
+                            run.status = "skipped"
+                            run.skip_reason = "branch"
+                            settled.add(nid)
+                            progress({"type": "node-skipped", "node_id": nid,
+                                      "name": display_name(graph.node(nid)), "reason": "branch"})
+                            progressed = True
+                        elif any(gate_of(d) for d in active_deps):
                             # behind a closed ⚖️ Decide gate: skipped, unbilled — not an error
-                            gid = next(gate_of(d) for d in sorted(deps[nid], key=order.index)
+                            gid = next(gate_of(d) for d in sorted(active_deps, key=order.index)
                                        if gate_of(d))
                             run.status = "skipped"
                             run.gated_by = gid
@@ -618,7 +634,7 @@ class Workflow(object):
                                       "reason": "gated", "gated_by": gid})
                             progressed = True
                         else:
-                            fut = pool.submit(exec_node, nid)
+                            fut = pool.submit(exec_node, nid, inbound)
                             pending[fut] = nid
                 if not pending:
                     if len(settled) < len(order):
@@ -716,6 +732,8 @@ class Workflow(object):
         out_specs = derive_outputs(graph)
         for ospec in out_specs:
             run = runs.get(ospec.node_id)
+            if run is not None and run.skip_reason == "branch":
+                continue
             if run is not None and run.status == "skipped" and run.gated_by:
                 gname = display_name(graph.node(run.gated_by))
                 gated_outputs[ospec.key.strip().lower()] = gname
