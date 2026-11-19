@@ -6,6 +6,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to publish from main
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -37,9 +43,27 @@ jobs:
           python -m unittest discover -s tests -t . -v
       - name: Check the exact version on PyPI
         id: registry
-        if: github.repository == 'nanoodlecom/nanoodle-py' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: >-
+          github.repository == 'nanoodlecom/nanoodle-py' && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          BEFORE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           version="$(python -c 'from importlib.metadata import version; print(version("nanoodle"))')"
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            if [[ "$REQUESTED_VERSION" != "$version" ]]; then
+              echo "The requested release version differs from the tested wheel" >&2
+              exit 1
+            fi
+          else
+            qualified="$(python .github/scripts/publish_source.py qualify --package nanoodle)"
+            if [[ -z "$qualified" ]]; then
+              echo "No Python version change on main"
+              exit 0
+            fi
+            grep -Fxq "version=$version" <<< "$qualified"
+          fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           status="$(curl --silent --show-error --retry 2 --max-time 30 \
             --output /dev/null --write-out '%{http_code}' \
@@ -58,7 +82,9 @@ jobs:
 
   publish:
     name: Publish tested distributions
-    if: needs.package.outputs.publish == 'true'
+    if: >-
+      github.repository == 'nanoodlecom/nanoodle-py' && github.ref == 'refs/heads/main' &&
+      needs.package.outputs.publish == 'true'
     needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 10
