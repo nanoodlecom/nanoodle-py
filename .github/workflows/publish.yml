@@ -1,0 +1,106 @@
+name: Publish to PyPI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to publish from main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build and test distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.registry.outputs.version }}
+      publish: ${{ steps.registry.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build, check and test distributions
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+          wheels=(dist/*.whl)
+          python -m pip install "${wheels[0]}"
+          version="$(python -c 'from importlib.metadata import version; print(version("nanoodle"))')"
+          test "$(nanoodle-py --version)" = "nanoodle $version"
+          python -m unittest discover -s tests -t . -v
+      - name: Check the exact version on PyPI
+        id: registry
+        if: >-
+          github.repository == 'nanoodlecom/nanoodle-py' && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          BEFORE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          version="$(python -c 'from importlib.metadata import version; print(version("nanoodle"))')"
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            if [[ "$REQUESTED_VERSION" != "$version" ]]; then
+              echo "The requested release version differs from the tested wheel" >&2
+              exit 1
+            fi
+          else
+            qualified="$(python .github/scripts/publish_source.py qualify --package nanoodle)"
+            if [[ -z "$qualified" ]]; then
+              echo "No Python version change on main"
+              exit 0
+            fi
+            grep -Fxq "version=$version" <<< "$qualified"
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          status="$(curl --silent --show-error --retry 2 --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://pypi.org/pypi/nanoodle/$version/json")"
+          case "$status" in
+            200) echo "nanoodle $version already exists on PyPI" ;;
+            404) echo 'publish=true' >> "$GITHUB_OUTPUT" ;;
+            *) echo "PyPI version lookup returned HTTP $status" >&2; exit 1 ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        if: steps.registry.outputs.publish == 'true'
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish tested distributions
+    if: >-
+      github.repository == 'nanoodlecom/nanoodle-py' && github.ref == 'refs/heads/main' &&
+      needs.package.outputs.publish == 'true'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: pypi-${{ needs.package.outputs.version }}
+      cancel-in-progress: false
+    environment:
+      name: pypi
+      url: https://pypi.org/project/nanoodle/${{ needs.package.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
