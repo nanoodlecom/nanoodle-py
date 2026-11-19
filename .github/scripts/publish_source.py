@@ -1,4 +1,4 @@
-"""Publish the tested commit when a main merge changes the package version."""
+"""Publish a tested main version to GitHub Releases."""
 
 import argparse
 import ast
@@ -38,18 +38,28 @@ def qualify(package, before):
     current = Version(declared_version(metadata, metadata.read_text()))
     if current != Version(version(package)):
         raise ValueError("Source version differs from the installed tested wheel")
-    if not before or before == "0" * 40:
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        if os.environ.get("REQUESTED_VERSION") != str(current):
+            raise ValueError("Requested source version differs from the installed tested wheel")
+    elif not version_changed(current, before):
         return
+    print(f"version={current}")
+    print(f"prerelease={str(current.is_prerelease).lower()}")
+
+
+def version_changed(current, before):
+    from packaging.version import Version
+
+    if not before or before == "0" * 40:
+        return False
     if not re.fullmatch(r"[0-9a-f]{40}", before):
         raise ValueError("Expected the full commit before the main push")
     previous_files = output("git", "ls-tree", "--name-only", before, "--", "pyproject.toml", "setup.py").splitlines()
     if not previous_files:
-        return
+        return False
     previous_path = Path("pyproject.toml" if "pyproject.toml" in previous_files else "setup.py")
     previous = Version(declared_version(previous_path, output("git", "show", f"{before}:{previous_path}")))
-    if previous != current:
-        print(f"version={current}")
-        print(f"prerelease={str(current.is_prerelease).lower()}")
+    return previous != current
 
 
 def tag_commit(repository, tag):
@@ -75,15 +85,17 @@ def release_record(repository, tag):
 
 def publish(repository, release_version, prerelease):
     source = os.environ["GITHUB_SHA"]
+    event = os.environ["GITHUB_EVENT_NAME"]
+    recovery = event == "workflow_dispatch" and os.environ.get("REQUESTED_VERSION") == release_version
     if (
         os.environ["GITHUB_REPOSITORY"] != repository
         or os.environ["GITHUB_REF"] != "refs/heads/main"
-        or os.environ["GITHUB_EVENT_NAME"] != "push"
+        or (event != "push" and not recovery)
         or not re.fullmatch(r"[0-9a-f]{40}", source)
         or source != output("git", "rev-parse", "HEAD")
         or not re.fullmatch(r"[0-9][0-9a-z.!+]*", release_version)
     ):
-        raise ValueError("Expected a tested main push from the release repository")
+        raise ValueError("Expected a tested main release from the release repository")
 
     tag = f"v{release_version}"
     current = tag_commit(repository, tag)
@@ -110,7 +122,7 @@ def publish(repository, release_version, prerelease):
         "name": tag,
         "generate_release_notes": True,
         "prerelease": prerelease,
-        "body": f"Tested source commit {source}.\n\n"
+        "body": f"Tested GitHub source release from commit {source}.\n\n"
                 f"[Build and distribution checks](https://github.com/{repository}/actions/runs/{run})",
     }
     record = json.loads(output(
