@@ -84,7 +84,7 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(len(imgs), 1)
         img = imgs[0]
         self.assertEqual(img.json, {
-            "model": "nano-banana-2-lite",
+            "model": "nano-banana-2-fast",
             "size": "1k",
             "n": 1,
             "response_format": "b64_json",
