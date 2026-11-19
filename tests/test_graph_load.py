@@ -9,6 +9,25 @@ from nanoodle import NanoodleError, UnsupportedNodeError, Workflow
 from nanoodle.graph import display_name, materialize, topo_order
 
 
+class DuplicateNodeIdTest(unittest.TestCase):
+    def test_duplicate_node_id_raises_instead_of_silently_overwriting(self):
+        # Regression (D4): the second node with an id used to silently
+        # replace the first, so a graph ran with a node its author never
+        # saw. JS graph.mjs throws; Py now throws the same error.
+        graph = {
+            "nodes": [
+                {"id": "a", "type": "text", "fields": {"text": "first"}},
+                {"id": "a", "type": "text", "fields": {"text": "second"}},
+            ],
+            "links": [],
+        }
+        with self.assertRaises(NanoodleError) as ctx:
+            Workflow.from_dict(graph, api_key="<redacted>")
+        self.assertIn('duplicate node id "a"', str(ctx.exception))
+        with self.assertRaises(NanoodleError):
+            materialize(graph)
+
+
 class LoaderSemanticsTest(unittest.TestCase):
     def test_audio_alias_and_text_port_migration(self):
         wf = Workflow.from_dict({

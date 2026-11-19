@@ -229,6 +229,10 @@ def materialize(data, warnings=None):
         if not nid:
             warnings.append("skipped a node with no id")
             continue
+        if nid in nodes:
+            # twin of JS graph.mjs: a duplicate id is a load error, never a
+            # silent overwrite of the first node (D4, fixed 2026-11-18)
+            raise NanoodleError('duplicate node id "%s" — every node must have a unique id' % nid)
         if ntype not in NODE_TYPES:
             warnings.append("unknown node type %r (node %s) — it cannot be executed" % (ntype, nid))
         fields = dict(raw.get("fields") or {})
