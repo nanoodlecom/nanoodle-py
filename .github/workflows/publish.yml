@@ -65,14 +65,21 @@ jobs:
             grep -Fxq "version=$version" <<< "$qualified"
           fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-          status="$(curl --silent --show-error --retry 2 --max-time 30 \
-            --output /dev/null --write-out '%{http_code}' \
-            "https://pypi.org/pypi/nanoodle/$version/json")"
-          case "$status" in
-            200) echo "nanoodle $version already exists on PyPI" ;;
-            404) echo 'publish=true' >> "$GITHUB_OUTPUT" ;;
-            *) echo "PyPI version lookup returned HTTP $status" >&2; exit 1 ;;
-          esac
+          index="$(curl --fail --silent --show-error --retry 2 --max-time 30 \
+            --header 'Accept: application/vnd.pypi.simple.v1+json' \
+            https://pypi.org/simple/nanoodle/)"
+          status="$(jq -er --arg version "$version" '
+            if .name != "nanoodle" or (.versions | type) != "array" then
+              error("PyPI returned unexpected project metadata")
+            elif .versions | index($version) != null then "present"
+            else "missing"
+            end
+          ' <<< "$index")"
+          if [[ "$status" == 'present' ]]; then
+            echo "nanoodle $version already exists on PyPI"
+          else
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/upload-artifact@v4
         if: steps.registry.outputs.publish == 'true'
         with:
@@ -116,28 +123,31 @@ jobs:
           from pathlib import Path
           import time
           from urllib.error import HTTPError
-          from urllib.parse import quote
-          from urllib.request import urlopen
+          from urllib.request import Request, urlopen
 
           version = os.environ['VERSION']
           expected = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                       for path in Path('dist').iterdir() if path.is_file()}
           if not expected:
               raise SystemExit('The tested distribution directory is empty')
-          url = f'https://pypi.org/pypi/nanoodle/{quote(version, safe="")}/json'
+          request = Request(
+              'https://pypi.org/simple/nanoodle/',
+              headers={'Accept': 'application/vnd.pypi.simple.v1+json'},
+          )
           missing = expected.keys()
-          for wait in (0, 2, 2, 2, 2):
+          for wait in (0, 2, 4, 8, 16, 30):
               time.sleep(wait)
               try:
-                  with urlopen(url, timeout=10) as response:
-                      release = json.load(response)
+                  with urlopen(request, timeout=10) as response:
+                      index = json.load(response)
               except HTTPError as error:
                   if error.code == 404:
                       continue
                   raise
-              if (release['info']['name'], release['info']['version']) != ('nanoodle', version):
-                  raise SystemExit('PyPI returned a different project or version')
-              public = {file['filename']: file['digests']['sha256'] for file in release['urls']}
+              if index['name'] != 'nanoodle':
+                  raise SystemExit('PyPI returned a different project')
+              public = {file['filename']: file['hashes']['sha256']
+                        for file in index['files'] if file['filename'] in expected}
               mismatched = [name for name in expected.keys() & public.keys() if expected[name] != public[name]]
               if mismatched:
                   raise SystemExit('PyPI has different bytes for ' + ', '.join(sorted(mismatched)))
