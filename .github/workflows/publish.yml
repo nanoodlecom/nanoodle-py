@@ -103,6 +103,7 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          password: ${{ secrets.PYPY_API_TOKEN }}
           skip-existing: true
       - name: Verify the tested distributions on PyPI
         env:
