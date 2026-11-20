@@ -1085,19 +1085,18 @@ def _guard_input_roles(node, inp):
            len(roles) - len(missing), ", ".join(missing)))
 
 
-def _kept_first(engine, node, urls):
-    """edit/inpaint have a single image output, but some models always bill (and return) a
-    fixed batch — midjourney/text-to-image and higgsfield-soul declare fixed_image_count: 4.
-    No probed model dishonours ``n: 1``, so this is disclosure, not a clamp: say we dropped
-    the extras the run paid for. The return shape stays one url."""
-    if len(urls) > 1:
-        msg = ("node %s: model returned %d images, kept the first"
-               % (node.id, len(urls)))
-        engine._progress({"type": "node-note", "node_id": node.id,
-                          "name": display_name(node), "message": msg,
-                          "returned": len(urls)})
-        disclose(msg)
-    return urls[0]
+def _multi_out(urls, layers):
+    """edit/inpaint surface EVERY image a model returns. ``image`` stays the
+    first — the long-standing single-output contract, unchanged for existing
+    graphs — ``images`` carries them all in response order (mirroring the
+    image node's variations output), and when response items carry layer
+    metadata (layer-decomposition models), ``layers`` carries it aligned by
+    index with ``images``. Fixed-batch models (midjourney fixed_image_count: 4)
+    surface their variants the same way; nothing returned is dropped silently."""
+    out = {"image": urls[0], "images": urls}
+    if layers is not None:
+        out["layers"] = layers
+    return out
 
 
 def _image_model_opts(opts):
@@ -1109,7 +1108,7 @@ def _image_model_opts(opts):
             if not protected.match(re.sub(r"[_-]", "", k))}
 
 
-def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_data_url=None):
+def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_data_url=None, items=False):
     f = node.fields
     body = {"model": _mdl(node), "size": f.get("size") or "1024x1024",
             "n": n, "response_format": "b64_json"}
@@ -1137,15 +1136,23 @@ def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_dat
     resp = engine._post_json(IMG_ENDPOINT, body)
     j = json.loads(resp.text())
     on_cost(*engine._cost_with_headers(j, resp))
-    urls = []
+    pairs = []
     for d in (j.get("data") or []):
         if d.get("b64_json"):
-            urls.append("data:%s;base64,%s" % (b64_image_mime(d["b64_json"]), d["b64_json"]))
+            pairs.append(("data:%s;base64,%s" % (b64_image_mime(d["b64_json"]), d["b64_json"]), d.get("layer")))
         elif d.get("url"):
-            urls.append(d["url"])
-    if not urls:
+            pairs.append((d["url"], d.get("layer")))
+    if not pairs:
         raise NanoodleError("no image in response")
-    return [engine._media_ref(u) for u in urls]
+    urls = [engine._media_ref(u) for u, _layer in pairs]
+    if not items:
+        return urls
+    # items=True: also return the per-item `layer` metadata aligned by index
+    # (layer-decomposition models return {z_index, name, description,
+    # bounding_box} per item), or None when no item carries any. Items with
+    # neither b64_json nor url drop out of both lists.
+    layers = [layer for _u, layer in pairs]
+    return urls, (layers if any(l is not None for l in layers) else None)
 
 
 def _run_image(engine, node, inp, on_cost):
@@ -1171,8 +1178,8 @@ def _run_edit(engine, node, inp, on_cost):
     if sum(len(u) for u in imgs) > MEDIA_INLINE_MAX:
         raise NanoodleError("reference images too large (~4 MB combined limit) — use fewer or smaller images")
     src = imgs if len(imgs) > 1 else imgs[0]
-    urls = _gen_image(engine, node, on_cost, prompt, image_data_url=src)
-    return {"image": _kept_first(engine, node, urls)}
+    urls, layers = _gen_image(engine, node, on_cost, prompt, image_data_url=src, items=True)
+    return _multi_out(urls, layers)
 
 
 def _run_inpaint(engine, node, inp, on_cost):
@@ -1185,8 +1192,8 @@ def _run_inpaint(engine, node, inp, on_cost):
     prompt = _prompt_of(node, err="no prompt — say what to paint into the brushed area")
     # v1 caveat: the browser composites the mask onto black at source size; this
     # library passes the mask through verbatim (white = repaint).
-    urls = _gen_image(engine, node, on_cost, prompt, image_data_url=source, mask_data_url=mask)
-    return {"image": _kept_first(engine, node, urls)}
+    urls, layers = _gen_image(engine, node, on_cost, prompt, image_data_url=source, mask_data_url=mask, items=True)
+    return _multi_out(urls, layers)
 
 
 # ---- video family (submit + poll) ------------------------------------------

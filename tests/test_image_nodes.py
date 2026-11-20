@@ -253,10 +253,12 @@ class EditInputRoleTest(MockedTest):
         self.assertEqual(len(self.mock.requests_to("/v1/images/generations")), 1)
 
 
-class ExtraImagesDisclosureTest(MockedTest):
-    """Fixed-batch models (fixed_image_count: 4) bill for images edit/inpaint drop."""
+class ExtraImagesSurfaceTest(MockedTest):
+    """Fixed-batch models (fixed_image_count: 4) return images edit/inpaint used
+    to drop with a disclosure note. Now every returned image surfaces on the
+    `images` output; `image` stays the first, and there is no drop to disclose."""
 
-    def test_edit_says_it_kept_the_first_of_four(self):
+    def test_edit_surfaces_all_four(self):
         self.mock.script("POST", "/v1/images/generations",
                          image_response(urls=["https://x/1.png", "https://x/2.png",
                                               "https://x/3.png", "https://x/4.png"], cost=0.08))
@@ -266,18 +268,18 @@ class ExtraImagesDisclosureTest(MockedTest):
         ], "links": [{"id": "l1", "from": {"node": "n1", "port": "image"},
                       "to": {"node": "n2", "port": "image"}}]})
         events = []
-        with self.assertWarns(RuntimeWarning):
-            result = wf.run(on_progress=events.append)
+        result = wf.run(on_progress=events.append)
 
         self.assertEqual(self.mock.requests_to("/v1/images/generations")[0].json["n"], 1,
                          "still asks for one — no probed model dishonours n:1")
-        notes = [e for e in events if e["type"] == "node-note"]
-        self.assertEqual(len(notes), 1)
-        self.assertIn("model returned 4 images, kept the first", notes[0]["message"])
-        self.assertEqual(notes[0]["returned"], 4)
-        self.assertEqual(result["Edit"].url, "https://x/1.png")   # output shape unchanged
+        self.assertEqual([e for e in events if e["type"] == "node-note"], [])
+        self.assertEqual(result["Edit"].url, "https://x/1.png")   # image stays the first
+        out = result.nodes["n2"].out
+        self.assertEqual([u.url for u in out["images"]],
+                         ["https://x/1.png", "https://x/2.png", "https://x/3.png", "https://x/4.png"])
+        self.assertNotIn("layers", out)   # no layer metadata in a variant batch
 
-    def test_inpaint_discloses_the_same_way(self):
+    def test_inpaint_surfaces_all(self):
         self.mock.script("POST", "/v1/images/generations",
                          image_response(urls=["https://x/1.png", "https://x/2.png"]))
         wf = self.wf_dict({"nodes": [
@@ -286,10 +288,10 @@ class ExtraImagesDisclosureTest(MockedTest):
                         "image": "data:image/png;base64,SRC=",
                         "mask": "data:image/png;base64,MASK="}}]})
         events = []
-        with self.assertWarns(RuntimeWarning):
-            wf.run(on_progress=events.append)
-        self.assertEqual([e["message"] for e in events if e["type"] == "node-note"],
-                         ["node n1: model returned 2 images, kept the first"])
+        result = wf.run(on_progress=events.append)
+        self.assertEqual([e for e in events if e["type"] == "node-note"], [])
+        self.assertEqual([u.url for u in result.nodes["n1"].out["images"]],
+                         ["https://x/1.png", "https://x/2.png"])
 
     def test_one_image_says_nothing(self):
         self.mock.script("POST", "/v1/images/generations", image_response(urls=["https://x/1.png"]))
