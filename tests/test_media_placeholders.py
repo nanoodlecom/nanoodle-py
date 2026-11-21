@@ -50,6 +50,18 @@ class MediaPlaceholderTest(unittest.TestCase):
         self.assertEqual(g.node("n3").fields["video"], "http://example.com/c.mp4")
         self.assertEqual(g.warnings, [])
 
+    def test_saved_editor_example_resolves_to_public_url(self):
+        graph = materialize({
+            "nodes": [
+                {"id": "mesh", "type": "mupload", "fields": {"model": "examples/product-shot/sample.glb"}},
+                {"id": "bad", "type": "upload", "fields": {"image": "examples/../outside.png"}},
+            ],
+            "links": [],
+        })
+        self.assertEqual(graph.node("mesh").fields["model"], "https://nanoodle.com/examples/product-shot/sample.glb")
+        self.assertEqual(graph.node("bad").fields["image"], "")
+        self.assertEqual(len(graph.warnings), 1)
+
     def test_placeholder_upload_is_required_with_no_default(self):
         wf = Workflow.from_dict({
             "nodes": [{"id": "n1", "type": "upload",

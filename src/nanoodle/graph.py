@@ -193,6 +193,10 @@ def _scrub_media_placeholders(nid, fields, warnings, ntype=None):
     keys = _MEDIA_FIELD_KEYS + (("model",) if ntype == "mupload" else ())
     for key in keys:
         v = fields.get(key)
+        # The editor serializes its built-in samples relative to its own origin.
+        if isinstance(v, str) and re.fullmatch(r"examples/[A-Za-z0-9_./-]+", v) and ".." not in v:
+            fields[key] = "https://nanoodle.com/" + v
+            continue
         if v is None or v == "" or (isinstance(v, str) and _MEDIA_URL_RE.match(v)):
             continue
         if isinstance(v, str):
