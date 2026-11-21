@@ -253,11 +253,11 @@ is `0.0`, and the reason is in `errors[0].message`:
 
 | runs | node types |
 |---|---|
-| local | text, upload (image/audio/video/3D `.glb`), choice, join, comment, endpoint‡, slice-3d, sprite-stack-render |
+| local | text, upload (image/audio/video/3D model), choice, join, comment, endpoint‡, slice-3d, sprite-stack-render |
 | local media† | resize, vframes, combine, soundtrack, trim, extractaudio |
 | NanoGPT | llm (incl. vision + audio input), image, edit, inpaint*, vision, decide†, tvideo, ivideo, model3d, vedit, lipsync, music, remix, tts, transcribe, cleanvoice |
 
-Wire `mupload.model` or Idol Max Turbo’s `model` output to `slice-3d.model`, then connect `slice-3d.sheet` to `sprite-stack-render.sheet`. The slicer accepts self-contained glTF/GLB triangle meshes, including skinned characters, and uncompressed Gaussian PLY. A single frame with the clip field empty slices the authored rest pose. Select `preset: "character"` for 128-pixel tiles, 80 layers, source colors and an outline. Explicit fields override individual preset values.
+Wire `mupload.model` or Idol Max Turbo’s `model` output to `slice-3d.model`, then connect `slice-3d.sheet` to `sprite-stack-render.sheet`. The slicer accepts self-contained glTF/GLB triangle meshes, including skinned characters, and uncompressed Gaussian PLY. For CLI file inputs, use `--input m.model=@knight.gltf` or `--input m.model=@cloud.ply`, replacing `m` with the model upload node’s ID. A single frame with the clip field empty slices the authored rest pose. Select `preset: "character"` for 128-pixel tiles, 80 layers, source colors and an outline. Explicit fields override individual preset values.
 
 For an animated model, set `frames` to 2–64 and optionally set `clip` to the exact animation name. For example, `{"clip":"Walk","frames":12,"preset":"character"}` samples twelve poses over one walk cycle. A blank clip selects the first animation when multiple poses are requested. All poses share bounds, scale and baseline. The sheet output is a PNG for a single pose and a looping APNG of horizontal layer strips for multiple poses. The layout output contains the world bounds plus the selected clip, duration and sample times for a sequence.
 

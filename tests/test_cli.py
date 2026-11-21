@@ -1,13 +1,16 @@
 """CLI: python -m nanoodle run|inspect — flags, --json shape, media saving,
 @file inputs, error exit codes. All against the mock harness."""
 
+import base64
 import contextlib
 import io
 import json
 import os
+import struct
 import tempfile
 import unittest
 import unittest.mock
+from pathlib import Path
 
 from tests import fixture
 from tests._util import MockedTest
@@ -24,6 +27,77 @@ def run_cli(argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = main(argv)
     return code, out.getvalue(), err.getvalue()
+
+
+class SpriteFilesTest(unittest.TestCase):
+    def test_at_file_slices_gltf_and_binary_ply_and_preserves_upload_extension(self):
+        graph = json.loads(Path(fixture("sprite-stack.json")).read_text())
+        ply = base64.b64decode(graph["nodes"][0]["fields"]["model"].partition(",")[2])
+        graph["nodes"][0]["fields"] = {}
+        graph["nodes"][2]["fields"]["turntable"] = False
+
+        # Unpack the fixture GLB into a self-contained JSON glTF with its original animation.
+        glb = Path(fixture("media/sprite-knight.glb")).read_bytes()
+        size = struct.unpack_from("<I", glb, 12)[0]
+        model = json.loads(glb[20:20 + size])
+        model["buffers"][0]["uri"] = "data:application/octet-stream;base64," + base64.b64encode(glb[28 + size:]).decode()
+        gltf = json.dumps(model).encode()
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            saved = root / "graph.json"
+            for name, data, mime in (("knight.GLTF", gltf, "model/gltf+json"), ("cloud.PLY", ply, "model/ply")):
+                with self.subTest(name=name):
+                    mesh = root / name
+                    mesh.write_bytes(data)
+                    graph["nodes"][1]["fields"]["frames"] = 2 if name.endswith("GLTF") else 1
+                    saved.write_text(json.dumps(graph))
+                    code, out, err = run_cli(["run", str(saved), "--input", "m.model=@" + str(mesh), "--json"])
+                    self.assertEqual(code, 0, err or out)
+                    self.assertEqual(json.loads(out)["nodes"]["r"]["status"], "done")
+
+                    saved.write_text(json.dumps({"nodes": [dict(graph["nodes"][0], name="Model")]}))
+                    code, out, err = run_cli(["run", str(saved), "--input", "m.model=@" + str(mesh),
+                                              "--out", d, "--json"])
+                    self.assertEqual(code, 0, err or out)
+                    self.assertEqual((root / ("Model" + mesh.suffix.lower())).read_bytes(), data)
+                    self.assertEqual(json.loads(out)["outputs"]["Model"]["mime"], mime)
+
+    def test_at_file_reads_sprite_palettes_and_animated_sheet(self):
+        from nanoodle.sprite_codecs import encode_png
+        from tests.test_sprite_bmp import icon
+
+        graph = json.loads(Path(fixture("sprite-stack.json")).read_text())
+        graph["nodes"].append({"id": "p", "type": "upload", "fields": {}})
+        graph["nodes"][1]["fields"]["palette"] = 2
+        graph["nodes"][2]["fields"]["turntable"] = False
+        graph["links"].append({"from": {"node": "p", "port": "image"},
+                               "to": {"node": "s", "port": "paletteImage"}})
+        ico = icon([(1, 1, 32, encode_png(1, 1, bytes((235, 77, 41, 255))))])
+        cur = b"\0\0\x02\0" + ico[4:]
+        avif = Path(fixture("media/sprite-alpha.avif")).read_bytes()
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            saved = root / "graph.json"
+            saved.write_text(json.dumps(graph))
+            for name, data in (("palette.AVIF", avif), ("palette.ico", ico), ("palette.cur", cur)):
+                with self.subTest(name=name):
+                    path = root / name
+                    path.write_bytes(data)
+                    code, out, err = run_cli(["run", str(saved), "--input", "p.image=@" + str(path), "--json"])
+                    self.assertEqual(code, 0, err or out)
+                    self.assertEqual(json.loads(out)["nodes"]["s"]["status"], "done")
+
+            saved.write_text(json.dumps({
+                "nodes": [graph["nodes"][-1], graph["nodes"][2]],
+                "links": [{"from": {"node": "p", "port": "image"}, "to": {"node": "r", "port": "sheet"}}],
+            }))
+            code, out, err = run_cli(["run", str(saved), "--input",
+                                      "p.image=@" + fixture("media/sprite-sequence.apng"), "--json"])
+            self.assertEqual(code, 0, err or out)
+            self.assertEqual(json.loads(out)["nodes"]["r"]["status"], "done")
+
 
 
 class InspectTest(unittest.TestCase):

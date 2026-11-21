@@ -15,25 +15,31 @@ MEDIA_INLINE_MAX = int(4.4 * 1024 * 1024)
 # Transcribe uploads raw bytes (multipart) — its cap is on the byte size.
 TRANSCRIBE_MAX_BYTES = int(3.5 * 1024 * 1024)
 
+MODEL_FILE_MIMES = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json", ".ply": "model/ply"}
+
 _EXT_MIME = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml",
+    ".apng": "image/apng", ".avif": "image/avif",
+    ".ico": "image/vnd.microsoft.icon", ".cur": "image/x-win-bitmap",
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
     ".oga": "audio/ogg", ".opus": "audio/ogg", ".flac": "audio/flac",
     ".aac": "audio/aac", ".m4a": "audio/mp4",
     ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
-    ".glb": "model/gltf-binary",
+    **MODEL_FILE_MIMES,
     ".txt": "text/plain", ".json": "application/json",
 }
 
 _MIME_EXT = {
     "image/svg+xml": "svg", "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
-    "image/webp": "webp", "image/bmp": "bmp",
+    "image/webp": "webp", "image/bmp": "bmp", "image/avif": "avif", "image/apng": "apng",
+    "image/vnd.microsoft.icon": "ico", "image/x-icon": "ico", "image/x-win-bitmap": "cur",
     "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/wav": "wav",
     "audio/x-wav": "wav", "audio/ogg": "ogg", "audio/flac": "flac",
     "audio/aac": "aac", "audio/mp4": "m4a",
     "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov",
-    "model/gltf-binary": "glb",
+    **{mime: ext[1:] for ext, mime in MODEL_FILE_MIMES.items()},
+    "application/ply": "ply", "application/x-ply": "ply",
     "text/plain": "txt", "application/json": "json",
 }
 
@@ -62,6 +68,8 @@ def sniff_mime(data, default="application/octet-stream"):
         return "video/mp4"
     if data[:4] == b"\x1a\x45\xdf\xa3":
         return "video/webm"
+    if re.match(rb"^ply\r?\nformat (ascii|binary_little_endian|binary_big_endian) 1\.0\r?\n", data[:64]):
+        return "model/ply"
     if data[:4] == b"glTF":
         return "model/gltf-binary"
     return default

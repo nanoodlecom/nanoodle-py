@@ -7,6 +7,7 @@ is by node TYPE only.
 
 import atexit
 import json
+import os
 import re
 import sys
 import threading
@@ -18,7 +19,7 @@ from .decide import DECIDE_ENDPOINT, DecideGateClosed, decide_image_limits, deci
 from .errors import NanoodleError
 from .graph import (EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name,
                     optional_node)
-from .media import (MEDIA_INLINE_MAX, TRANSCRIBE_MAX_BYTES, MediaRef,
+from .media import (MEDIA_INLINE_MAX, MODEL_FILE_MIMES, TRANSCRIBE_MAX_BYTES, MediaRef,
                     b64_image_mime, make_data_url, parse_data_url)
 from .transport import HttpResponse, default_http, encode_multipart
 from .x402 import assert_payment_option, looks_like_result, parse_json, parse_nano_invoice
@@ -1692,12 +1693,12 @@ def _run_mupload(engine, node, inp, on_cost):
     if not v:
         if optional_node(node):
             return {"model": ""}
-        raise NanoodleError("no 3D file — drop a .glb first")
-    if isinstance(v, MediaRef):
-        if not v.mime:
-            v.mime = "model/gltf-binary"
-        return {"model": v}
-    return {"model": engine._media_ref(_as_url(v), mime="model/gltf-binary")}
+        raise NanoodleError("no 3D file — supply a .glb, self-contained .gltf or Gaussian .ply")
+    ref = v if isinstance(v, MediaRef) else engine._media_ref(_as_url(v))
+    if not ref.mime:
+        path = urllib.parse.urlsplit(ref.url).path
+        ref.mime = MODEL_FILE_MIMES.get(os.path.splitext(path)[1].lower(), "model/gltf-binary")
+    return {"model": ref}
 
 
 def _run_model3d(engine, node, inp, on_cost):

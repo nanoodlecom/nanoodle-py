@@ -21,9 +21,10 @@ import sys
 
 from . import (MediaRef, NanoodleError, RunError, Workflow, __version__,
                media_from_file)
+from .media import MODEL_FILE_MIMES
 
 _MEDIA_EXT = re.compile(
-    r"\.(png|jpe?g|gif|webp|bmp|mp3|wav|ogg|oga|opus|flac|aac|m4a|mp4|webm|mov|glb)$", re.I)
+    r"\.(png|apng|jpe?g|gif|webp|bmp|avif|ico|cur|mp3|wav|ogg|oga|opus|flac|aac|m4a|mp4|webm|mov)$", re.I)
 
 
 def _parse_kv(pairs, what):
@@ -34,7 +35,7 @@ def _parse_kv(pairs, what):
         key, _, value = item.partition("=")
         if value.startswith("@"):
             path = value[1:]
-            if _MEDIA_EXT.search(path):
+            if os.path.splitext(path)[1].lower() in MODEL_FILE_MIMES or _MEDIA_EXT.search(path):
                 out[key] = media_from_file(path)
             else:
                 with open(path, "r", encoding="utf-8") as f:
