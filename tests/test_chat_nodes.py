@@ -178,6 +178,7 @@ class LlmHostedAudioTest(MockedTest):
         self.assertNotIn("http", part["input_audio"]["data"])
         # the CDN download carries no auth headers
         media_req = self.mock.requests_to("/media/song.wav")[0]
+        self.assertEqual(media_req.headers.get("user-agent"), "nanoodle-py")
         self.assertNotIn("authorization", media_req.headers)
         self.assertNotIn("x-api-key", media_req.headers)
 

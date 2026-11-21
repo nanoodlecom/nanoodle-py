@@ -541,7 +541,7 @@ class Engine(object):
         with the run.
         """
         timeout = self._http_timeout_now() if run_bound else self.http_timeout
-        resp = self.http("GET", url, headers={}, timeout=timeout)
+        resp = self.http("GET", url, headers={"User-Agent": "nanoodle-py"}, timeout=timeout)
         if not (200 <= resp.status < 300):
             raise NanoodleError("could not download media (%d)" % resp.status)
         return resp.body, resp.header("content-type") or ""
