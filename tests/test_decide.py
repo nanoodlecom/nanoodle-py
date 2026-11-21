@@ -237,7 +237,7 @@ class DecideRunTest(MockedTest):
         g = {"nodes": [
             {"id": "a", "type": "upload", "fields": {"image": PNG}},
             {"id": "b", "type": "upload", "fields": {"image": PNG}},
-            {"id": "d", "type": "decide", "fields": {"model": "perplexity/pplx-decider-v1.1-27b"}},
+            {"id": "d", "type": "decide", "fields": {"model": "perplexity/pplx-decider-v1.2"}},
         ], "links": [
             {"id": "l1", "from": {"node": "a", "port": "image"}, "to": {"node": "d", "port": "img1"}},
             {"id": "l2", "from": {"node": "b", "port": "image"}, "to": {"node": "d", "port": "img2"}},
