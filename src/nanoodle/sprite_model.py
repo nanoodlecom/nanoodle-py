@@ -1,14 +1,15 @@
-"""Read static glTF scenes and anisotropic Gaussian PLYs for the sprite slicer."""
+"""Read and pose glTF scenes and anisotropic Gaussian PLYs for the sprite slicer."""
 
 import io
 import json
 import math
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .errors import NanoodleError
 from .media import parse_data_url
+from .sprite_gltf_tracks import animation_selection, compile_tracks, unit_quat
 
 
 @dataclass(slots=True)
@@ -40,7 +41,7 @@ _GL_TYPES = {
     5120: ("b", 127), 5121: ("B", 255), 5122: ("h", 32767),
     5123: ("H", 65535), 5125: ("I", 4294967295), 5126: ("f", 1),
 }
-_WIDTHS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
+_WIDTHS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
 _PLY_TYPES = {
     "char": "b", "int8": "b", "uchar": "B", "uint8": "B",
     "short": "h", "int16": "h", "ushort": "H", "uint16": "H",
@@ -121,7 +122,9 @@ class _Scene:
         self.check_cancel = check_cancel
         self.buffers = []
         self.images = {}
-        self.meshes = []
+        self.accessors = {}
+        self.geometry = {}
+        self.skins = {}
         for i, spec in enumerate(doc.get("buffers", [])):
             data = _embedded(spec["uri"]) if spec.get("uri") else (binary if i == 0 else None)
             size = spec.get("byteLength")
@@ -140,28 +143,57 @@ class _Scene:
             raise NanoodleError("Meshopt-compressed buffers are unsupported.")
         return data[start:start + size], bv
 
-    def accessor(self, index, shapes, expected=None):
-        msg = "Unsupported glTF accessor type or sparse encoding."
-        spec = _item(self.doc.get("accessors", []), index, msg)
-        shape, component = spec.get("type"), spec.get("componentType")
-        if shape not in shapes or component not in _GL_TYPES or "sparse" in spec:
-            raise NanoodleError(msg)
-        buf, view = self.buffer_view(spec.get("bufferView"))
-        code, maximum = _GL_TYPES[component]
-        row = struct.Struct("<" + code * _WIDTHS[shape])
-        count, offset, stride = spec.get("count"), spec.get("byteOffset", 0), view.get("byteStride", row.size)
-        if (type(count) is not int or count < 1 or (expected is not None and expected != count)
-                or type(offset) is not int or offset < 0 or type(stride) is not int or stride < row.size
-                or offset + (count - 1) * stride + row.size > len(buf)):
-            raise NanoodleError("Invalid glTF accessor bounds or count.")
+    def get(self, field, index):
+        return _item(self.doc.get(field, []), index, f"Invalid glTF {field} index.")
+
+    def rows(self, row, count, view_id, offset=0, *, packed=False):
+        data, view = self.buffer_view(view_id)
+        stride = view.get("byteStride", row.size)
+        if ((packed and "byteStride" in view) or type(offset) is not int or offset < 0
+                or type(stride) is not int or stride < row.size
+                or offset + (count - 1) * stride + row.size > len(data)):
+            raise NanoodleError("Invalid glTF accessor bounds or stride.")
         if stride == row.size:
-            values = list(row.iter_unpack(buf[offset:offset + count * stride]))
+            return list(row.iter_unpack(data[offset:offset + count * stride]))
+        return [row.unpack_from(data, offset + i * stride) for i in range(count)]
+
+    def accessor(self, index, shapes, expected=None):
+        spec = self.get("accessors", index)
+        shape, component, count = spec.get("type"), spec.get("componentType"), spec.get("count")
+        if (shape not in shapes or component not in _GL_TYPES or type(count) is not int
+                or count < 1 or (expected is not None and expected != count)):
+            raise NanoodleError("Invalid glTF accessor type or count.")
+        if index in self.accessors:
+            return self.accessors[index]
+        code, maximum = _GL_TYPES[component]
+        width = _WIDTHS[shape]
+        row = struct.Struct("<" + code * width)
+        if "bufferView" in spec:
+            values = self.rows(row, count, spec["bufferView"], spec.get("byteOffset", 0))
         else:
-            values = [row.unpack_from(buf, offset + i * stride) for i in range(count)]
+            if count > 8_388_608 or spec.get("byteOffset", 0):
+                raise NanoodleError("Invalid or oversized zero-initialized glTF accessor.")
+            values = [(0,) * width] * count
+        if "sparse" in spec:
+            sparse = spec["sparse"]
+            n = sparse["count"]
+            ids, replacements = sparse["indices"], sparse["values"]
+            kind = ids.get("componentType")
+            if type(n) is not int or not 1 <= n <= count or kind not in (5121, 5123, 5125):
+                raise NanoodleError("Invalid sparse glTF accessor.")
+            indices = self.rows(struct.Struct("<" + _GL_TYPES[kind][0]), n, ids["bufferView"],
+                                ids.get("byteOffset", 0), packed=True)
+            updates = self.rows(row, n, replacements["bufferView"], replacements.get("byteOffset", 0), packed=True)
+            previous = -1
+            for (i,), value in zip(indices, updates):
+                if not previous < i < count:
+                    raise NanoodleError("Invalid sparse glTF accessor indices.")
+                values[i], previous = value, i
         if code == "f" and not all(math.isfinite(v) for point in values for v in point):
             raise NanoodleError("Non-finite glTF attribute.")
         if spec.get("normalized"):
             values = [tuple(max(-1, v / maximum) for v in point) for point in values]
+        self.accessors[index] = values
         return values
 
     def texture(self, info):
@@ -190,7 +222,10 @@ class _Scene:
         sampler = {} if "sampler" not in texture else _item(self.doc.get("samplers", []), texture["sampler"], msg)
         return pixels, sampler
 
-    def emit(self, index, world):
+    def primitives(self, index):
+        if index in self.geometry:
+            return self.geometry[index]
+        primitives = []
         mesh = _item(self.doc.get("meshes", []), index, "Missing glTF mesh.")
         for primitive in mesh["primitives"]:
             if self.check_cancel:
@@ -198,16 +233,10 @@ class _Scene:
             mode = primitive.get("mode", 4)
             if mode not in (4, 5, 6):
                 raise NanoodleError("Slice 3D requires triangles. For a point-cloud preview, supply the original Gaussian PLY.")
-            if primitive.get("targets") or "KHR_draco_mesh_compression" in primitive.get("extensions", {}):
-                raise NanoodleError("Morph targets and Draco-compressed meshes are unsupported.")
+            if "KHR_draco_mesh_compression" in primitive.get("extensions", {}):
+                raise NanoodleError("Draco-compressed meshes are unsupported.")
             attrs = primitive["attributes"]
             positions = self.accessor(attrs.get("POSITION"), ("VEC3",))
-            if world != _IDENTITY:
-                positions = [(world[0]*x + world[4]*y + world[8]*z + world[12],
-                              world[1]*x + world[5]*y + world[9]*z + world[13],
-                              world[2]*x + world[6]*y + world[10]*z + world[14]) for x, y, z in positions]
-                if not all(math.isfinite(v) for point in positions for v in point):
-                    raise NanoodleError("Invalid glTF scene transform.")
             count = len(positions)
             indices = None
             if "indices" in primitive:
@@ -236,48 +265,153 @@ class _Scene:
                 info = pbr["baseColorTexture"]
                 uv = self.accessor(attrs.get(f"TEXCOORD_{info.get('texCoord', 0)}"), ("VEC2",), count)
                 texture = self.texture(info)
-            self.meshes.append(Mesh(positions, indices, mode, length, color, uv, texture,
-                                    factor, alpha, mat.get("alphaCutoff", 0.5)))
+            template = Mesh(positions, indices, mode, length, color, uv, texture,
+                            factor, alpha, mat.get("alphaCutoff", 0.5))
+            targets = [self.accessor(target["POSITION"], ("VEC3",), count) if "POSITION" in target else None
+                       for target in primitive.get("targets", [])]
+            primitives.append((template, targets, attrs))
+        self.geometry[index] = primitives
+        return primitives
 
-    def read(self):
-        nodes = self.doc.get("nodes", [])
-        if nodes:
-            scenes = self.doc.get("scenes", [])
-            if scenes:
-                scene = _item(scenes, self.doc.get("scene", 0), "Invalid glTF scene.")
+    def skin(self, index, visible):
+        if index not in self.skins:
+            skin = self.get("skins", index)
+            joints = skin["joints"]
+            if (not joints or any(type(j) is not int or j not in visible for j in joints)
+                    or len(set(joints)) != len(joints)):
+                raise NanoodleError("Invalid glTF skin joints in the selected scene.")
+            if "inverseBindMatrices" in skin:
+                index_id = skin["inverseBindMatrices"]
+                if self.get("accessors", index_id)["componentType"] != 5126:
+                    raise NanoodleError("glTF inverse bind matrices require floats.")
+                inverse = self.accessor(index_id, ("MAT4",))
+                if len(inverse) < len(joints):
+                    raise NanoodleError("Missing glTF inverse bind matrices.")
             else:
-                scene = {}
-            roots = scene.get("nodes")
-            if roots is None:
-                children = {i for node in nodes for i in node.get("children", [])}
-                roots = [i for i in range(len(nodes)) if i not in children]
-            stack = [(i, _IDENTITY) for i in reversed(roots)]
-            visited = set()
-            while stack:
-                index, parent = stack.pop()
-                msg = "Invalid or cyclic glTF node tree."
-                node = _item(nodes, index, msg)
-                if index in visited:
-                    raise NanoodleError(msg)
-                visited.add(index)
-                if "skin" in node:
-                    raise NanoodleError("Skinned meshes require a static mesh export.")
-                if "matrix" in node:
-                    local = _vector(node["matrix"], 16)
-                else:
-                    local = _trs(_vector(node.get("translation", (0, 0, 0)), 3),
-                                 _vector(node.get("rotation", (0, 0, 0, 1)), 4),
-                                 _vector(node.get("scale", (1, 1, 1)), 3))
-                world = _multiply(parent, local)
-                if "mesh" in node:
-                    self.emit(node["mesh"], world)
-                stack.extend((child, world) for child in reversed(node.get("children", [])))
-        else:
-            for index in range(len(self.doc.get("meshes", []))):
-                self.emit(index, _IDENTITY)
-        if not self.meshes:
+                inverse = [_IDENTITY] * len(joints)
+            self.skins[index] = joints, inverse
+        return self.skins[index]
+
+    def influences(self, attrs, count, joints):
+        sets = {key[7:] for key in attrs if key.startswith("JOINTS_")}
+        weights = {key[8:] for key in attrs if key.startswith("WEIGHTS_")}
+        if "0" not in sets or sets != weights or not all(i.isdigit() for i in sets):
+            raise NanoodleError("A skinned primitive requires paired JOINTS_n and WEIGHTS_n attributes.")
+        influences = [[] for _ in range(count)]
+        for suffix in sorted(sets, key=int):
+            jid, wid = attrs["JOINTS_" + suffix], attrs["WEIGHTS_" + suffix]
+            js, ws = self.get("accessors", jid), self.get("accessors", wid)
+            if js["componentType"] not in (5121, 5123) or js.get("normalized"):
+                raise NanoodleError("glTF joint indices must be unsigned bytes or shorts.")
+            if (ws["componentType"] != 5126 and not (ws["componentType"] in (5121, 5123) and ws.get("normalized"))):
+                raise NanoodleError("glTF weights must be floats or normalized unsigned bytes or shorts.")
+            indices = self.accessor(jid, ("VEC4",), count)
+            values = self.accessor(wid, ("VEC4",), count)
+            for v, (ids, factors) in enumerate(zip(indices, values)):
+                for j, w in zip(ids, factors):
+                    if j >= len(joints) or w < 0:
+                        raise NanoodleError("Invalid glTF skin joint index or weight.")
+                    if w:
+                        influences[v].append((j, w))
+        for i, vertex in enumerate(influences):
+            total = sum(w for j, w in vertex)
+            if not total:
+                raise NanoodleError("A skinned vertex has zero total weight.")
+            influences[i] = [(j, w / total) for j, w in vertex]
+        return influences
+
+    def prepare(self):
+        nodes = self.doc.get("nodes", [])
+        order = []
+        visible = set()
+        scenes = self.doc.get("scenes", [])
+        roots = self.get("scenes", self.doc.get("scene", 0)).get("nodes", []) if scenes else None
+        if roots is None:
+            children = {i for node in nodes for i in node.get("children", [])}
+            roots = [i for i in range(len(nodes)) if i not in children]
+        stack = [(i, None) for i in reversed(roots)]
+        while stack:
+            i, parent = stack.pop()
+            node = self.get("nodes", i)
+            if i in visible:
+                raise NanoodleError("Invalid or cyclic glTF node tree.")
+            visible.add(i)
+            trs = (_vector(node.get("translation", (0, 0, 0)), 3),
+                   unit_quat(_vector(node.get("rotation", (0, 0, 0, 1)), 4)),
+                   _vector(node.get("scale", (1, 1, 1)), 3))
+            local = _vector(node["matrix"], 16) if "matrix" in node else _trs(*trs)
+            order.append((i, parent, local, trs))
+            stack.extend((child, i) for child in reversed(node.get("children", [])))
+        instances = [(i, nodes[i]["mesh"], nodes[i]) for i, _, _, _ in order if "mesh" in nodes[i]]
+        if not nodes:
+            instances = [(None, i, {}) for i in range(len(self.doc.get("meshes", [])))]
+        draws = []
+        for i, mesh_index, node in instances:
+            mesh = self.get("meshes", mesh_index)
+            primitives = self.primitives(mesh_index)
+            width = len(mesh["primitives"][0].get("targets", [])) if primitives else 0
+            rest_weights = _vector(node.get("weights", mesh.get("weights", (0,) * width)), width)
+            skin_id = node.get("skin")
+            for template, targets, attrs in primitives:
+                if len(targets) != width:
+                    raise NanoodleError("A glTF mesh must have the same morph target count on all primitives.")
+                influences = None
+                if skin_id is not None:
+                    joints, _ = self.skin(skin_id, visible)
+                    influences = self.influences(attrs, len(template.positions), joints)
+                draws.append((i, template, targets, rest_weights, skin_id, influences))
+        if not draws:
             raise NanoodleError("No triangles in the selected glTF scene.")
-        return self.meshes
+        self.order, self.draws = order, draws
+
+    def pose(self, tracks, time):
+        if self.check_cancel:
+            self.check_cancel()
+        animated = {}
+        for track in tracks:
+            animated.setdefault(track.node, {})[track.path] = track.sample(time)
+        worlds = {None: _IDENTITY}
+        for i, parent, local, (t, r, s) in self.order:
+            if i in animated:
+                ch = animated[i]
+                if any(path != "weights" for path in ch):
+                    local = _trs(ch.get("translation", t), ch.get("rotation", r), ch.get("scale", s))
+            worlds[i] = _multiply(worlds[parent], local)
+        palettes = {i: [_multiply(worlds[j], bind) for j, bind in zip(joints, inverse)]
+                    for i, (joints, inverse) in self.skins.items()}
+        result = []
+        for i, template, targets, rest_weights, skin_id, influences in self.draws:
+            weights = animated.get(i, {}).get("weights", rest_weights)
+            pos = template.positions
+            for w, offsets in zip(weights, targets):
+                if w and offsets is not None:
+                    pos = [(x+w*dx, y+w*dy, z+w*dz) for (x, y, z), (dx, dy, dz) in zip(pos, offsets)]
+            if influences is not None:
+                palette = palettes[skin_id]
+                posed = []
+                for v, (point, weighted) in enumerate(zip(pos, influences)):
+                    if self.check_cancel and v % 2048 == 0:
+                        self.check_cancel()
+                    x = y = z = 0.0
+                    for joint, w in weighted:
+                        a, b, c = _transform(palette[joint], *point)
+                        x += w*a
+                        y += w*b
+                        z += w*c
+                    posed.append((x, y, z))
+                pos = posed
+            elif worlds[i] != _IDENTITY:
+                pos = [_transform(worlds[i], *point) for point in pos]
+            if pos is not template.positions and not all(math.isfinite(v) for point in pos for v in point):
+                raise NanoodleError("Invalid glTF posed vertex.")
+            result.append(replace(template, positions=pos) if pos is not template.positions else template)
+        return result
+
+
+def _transform(m, x, y, z):
+    return (m[0]*x + m[4]*y + m[8]*z + m[12],
+            m[1]*x + m[5]*y + m[9]*z + m[13],
+            m[2]*x + m[6]*y + m[10]*z + m[14])
 
 
 def _ply_rows(data, offset, count, encoding, properties, keys):
@@ -382,11 +516,13 @@ def _splats(data, check_cancel):
     return splats
 
 
-def read_model(raw_bytes, decode_image, *, check_cancel=None):
-    """Return (source kind, primitives). decode_image converts embedded image bytes to (w, h, RGBA)."""
+def read_model_poses(raw_bytes, decode_image, clip, frames, *, check_cancel=None):
+    """Return (kind, clip name, start, duration, pose_at_index); decode shared geometry once."""
     try:
         if raw_bytes.startswith(b"ply"):
-            return "splat", _splats(raw_bytes, check_cancel)
+            animation_selection([], clip, frames)
+            splats = _splats(raw_bytes, check_cancel)
+            return "splat", None, 0.0, 0.0, lambda _: splats
         if raw_bytes.startswith(b"glTF"):
             doc, binary = _unpack_glb(raw_bytes)
         else:
@@ -395,6 +531,26 @@ def read_model(raw_bytes, decode_image, *, check_cancel=None):
             except (ValueError, UnicodeError):
                 raise NanoodleError("Expected a GLB, a self-contained glTF 2 mesh, or a Gaussian PLY.") from None
             binary = None
-        return "mesh", _Scene(doc, binary, decode_image, check_cancel).read()
+        scene = _Scene(doc, binary, decode_image, check_cancel)
+        name, anim = animation_selection(doc.get("animations", []), clip, frames)
+        scene.prepare()
+        tracks = compile_tracks(scene, anim) if anim is not None else []
+        start = min((track.times[0] for track in tracks), default=0.0)
+        duration = max((track.times[-1] for track in tracks), default=0.0) - start
+        if frames > 1 and duration <= 0:
+            raise NanoodleError("The selected animation has zero duration. Use frames=1 for a single pose.")
+
+        def pose_at(index):
+            if type(index) is not int or not 0 <= index < frames:
+                raise NanoodleError("Animation frame index is out of range.")
+            return scene.pose(tracks, start + index * duration / frames)
+
+        return "mesh", name, start, duration, pose_at
     except (TypeError, KeyError, ValueError, AttributeError, OverflowError, struct.error) as exc:
         raise NanoodleError(f"Invalid sprite model: {exc}") from exc
+
+
+def read_model(raw_bytes, decode_image, *, check_cancel=None):
+    """Return (source kind, primitives) in the authored rest pose."""
+    kind, _, _, _, pose_at = read_model_poses(raw_bytes, decode_image, None, 1, check_cancel=check_cancel)
+    return kind, pose_at(0)
