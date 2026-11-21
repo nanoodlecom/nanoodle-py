@@ -226,7 +226,7 @@ def _u32(*numbers):
 
 
 def _movie(width, height, duration, sizes, avcc, chunk_offset):
-    timescale = 90000
+    timescale = min(90000, max(1, math.floor(0xFFFFFFFF / duration)))
     ticks = math.floor(duration * timescale + 0.5)
     count = len(sizes)
     edges = [(i * ticks + count // 2) // count for i in range(count + 1)]

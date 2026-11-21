@@ -1,6 +1,7 @@
 """Local sprite slicing, orthographic projection and turntable rendering."""
 import json
 import math
+from itertools import chain
 
 from .errors import NanoodleError
 from .local_media import _url_bytes
@@ -126,38 +127,64 @@ def run_sprite(engine, node, inp, on_cost):
     def media(data, mime):
         return engine._media_ref(make_data_url(data, mime), mime)
 
+    animation = None
     if node.type == "slice-3d":
-        from .sprite_geometry import slice_model
+        from .sprite_animation import encode_stack_animation
+        from .sprite_geometry import preset_fields, slice_sequence
 
+        fields = preset_fields(fields)
         palette = None
         if _number(fields, "palette", 16, 0, 64, integer=True) and inp.get("paletteImage"):
             palette = decode_image(_url_bytes(inp["paletteImage"], fetch))
-        width, height, pixels, layout = slice_model(raw, fields, palette, decode_image, check_cancel=check_cancel)
-        sheet = (width, height, pixels)
-        out["sheet"] = media(encode_png(*sheet), "image/png")
+        width, height, atlases, layout = slice_sequence(raw, fields, palette, decode_image, check_cancel=check_cancel)
+        first = next(atlases)
+        motion = layout.get("animation")
+        if motion:
+            data = encode_stack_animation(width, height, chain((first,), atlases), motion["frames"], motion["duration"])
+        else:
+            data = encode_png(width, height, first)
+        out["sheet"] = media(data, "image/png")
         out["layout"] = json.dumps(layout, separators=(",", ":"), allow_nan=False)
-        view = _Projection(sheet, {})
+        view = _Projection((width, height, first), {})
         yaw = 35
     else:
-        view = _Projection(decode_image(raw), fields)
+        from .sprite_animation import read_stack_animation
+
+        animation = read_stack_animation(raw)
+        view = _Projection(animation.sheet(0) if animation else decode_image(raw), fields)
         yaw = _number(fields, "yaw", 35, -3600, 3600)
     frame = view.frame(yaw, check_cancel)
     out["image"] = media(encode_png(view.width, view.height, frame), "image/png")
 
-    if node.type == "sprite-stack-render" and (fields.get("turntable") is True or fields.get("turntable") == "true"):
+    turntable = fields.get("turntable") is True or fields.get("turntable") == "true"
+    if node.type == "sprite-stack-render" and (animation or turntable):
         from .sprite_video import encode_mp4
 
-        fps = _number(fields, "fps", 24, 1, 60, integer=True)
-        duration = _number(fields, "duration", 3, 0.25, 30)
-        count = max(2, math.floor(fps * duration + 0.5))
-        start = _number(fields, "yawStart", 0, -3600, 3600)
-        end = _number(fields, "yawEnd", 360, -3600, 3600)
+        if turntable:
+            fps = _number(fields, "fps", 24, 1, 60, integer=True)
+            duration = _number(fields, "duration", 3, 0.25, 30)
+            count = max(2, math.floor(fps * duration + 0.5))
+            start = _number(fields, "yawStart", 0, -3600, 3600)
+            end = _number(fields, "yawEnd", 360, -3600, 3600)
+        else:
+            count = len(animation.data)
+            duration = count * animation.delays[0]
 
         def frames():
+            current_index, current_view = 0, view
             for i in range(count):
                 check_cancel()
-                angle = start + (end - start) * i / (count - 1)
-                yield frame if angle == yaw else view.frame(angle, check_cancel)
+                angle = start + (end - start) * i / (count - 1) if turntable else yaw
+                if animation:
+                    index = i
+                    if turntable:
+                        elapsed = i * duration / count
+                        poses = len(animation.data)
+                        index = math.floor(elapsed * poses / (animation.delays[0] * poses)) % poses
+                    if index != current_index:
+                        current_view = view if index == 0 else _Projection(animation.sheet(index), fields)
+                        current_index = index
+                yield frame if current_index == 0 and angle == yaw else current_view.frame(angle, check_cancel)
 
         out["video"] = media(encode_mp4(view.width, view.height, frames(), duration), "video/mp4")
     check_cancel()

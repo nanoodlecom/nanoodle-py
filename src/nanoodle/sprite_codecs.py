@@ -20,16 +20,11 @@ def _dimensions(width, height):
         raise NanoodleError("Sprite image dimensions are out of range")
 
 
-def encode_png(width, height, rgba):
-    """Encode straight-alpha 8-bit RGBA rows as a lossless PNG."""
+def _compressed_rgba_rows(width, height, rgba):
     _dimensions(width, height)
     stride = width * 4
     if len(rgba) != stride * height:
         raise NanoodleError("Invalid sprite frame dimensions")
-
-    def chunk(kind, body):
-        crc = zlib.crc32(body, zlib.crc32(kind))
-        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", crc)
 
     # Sprite sheets contain long transparent and repeated pixel runs. The
     # None filter compresses those directly and avoids a per-pixel encoder.
@@ -40,8 +35,22 @@ def encode_png(width, height, rgba):
         compressed.extend(compressor.compress(b"\0"))
         compressed.extend(compressor.compress(pixels[offset:offset + stride]))
     compressed.extend(compressor.flush())
-    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
-    return _PNG + chunk(b"IHDR", header) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
+    return compressed
+
+
+def _chunk(kind, body):
+    crc = zlib.crc32(body, zlib.crc32(kind))
+    return b"".join((struct.pack(">I", len(body)), kind, body, struct.pack(">I", crc)))
+
+
+def _rgba_header(width, height):
+    return _PNG + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+
+
+def encode_png(width, height, rgba):
+    """Encode straight-alpha 8-bit RGBA rows as a lossless PNG."""
+    compressed = _compressed_rgba_rows(width, height, rgba)
+    return b"".join((_rgba_header(width, height), _chunk(b"IDAT", compressed), _chunk(b"IEND", b"")))
 
 
 def _unfilter(kind, row, prev, bpp):

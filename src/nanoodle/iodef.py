@@ -132,7 +132,9 @@ SETTING_SPECS = {
                 ("size", "Image size", "select", "1024x1024", _SIZES),
                 ("seed", "Seed", "number", None, None)],
     # local media knobs (play.html SETTING_SPECS) — shape-affecting for vframes
-    "slice-3d": [("slices", "Slices", "number", "48", None), ("resolution", "Tile resolution", "number", "48", None),
+    "slice-3d": [("preset", "Preset", "select", "default", ["default", "character"]),
+                 ("clip", "Animation clip", "text", "", None), ("frames", "Pose frames", "number", "1", None),
+                 ("slices", "Slices", "number", "48", None), ("resolution", "Tile resolution", "number", "48", None),
                  ("palette", "Palette colors", "number", "16", None), ("outline", "Outline", "boolean", True, None),
                  ("upAxis", "Up axis", "select", "auto", ["auto", "x", "y", "z"])],
     "sprite-stack-render": [("yaw", "Yaw (degrees)", "number", "35", None), ("pitch", "Pitch (degrees)", "number", "30", None),
@@ -312,6 +314,13 @@ def derive_settings(graph):
             if node.type == "vframes" and field == "frames":
                 smin = max(1, wired_frames_floor(graph, node.id))
                 smax = MAX_FRAMES
+            if node.type == "slice-3d":
+                if field == "frames":
+                    smin, smax = 1, 64
+                if node.fields.get("preset") == "character":
+                    from .sprite_geometry import preset_fields
+                    value = preset_fields(node.fields).get(field, default)
+                    default = str(value) if kind == "number" else value
             out.append(SettingSpec("%s.%s" % (node.id, field), node.id, field, kind, label,
                                    default=_field_default(node, field, default),
                                    options=options, node_name=name,

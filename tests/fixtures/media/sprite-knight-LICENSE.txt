@@ -1,0 +1,1 @@
+Knight and all generated rigid poses: CC0 1.0 Universal. Original geometry, animation, fixtures and QA scripts generated for Mikkel. https://creativecommons.org/publicdomain/zero/1.0/

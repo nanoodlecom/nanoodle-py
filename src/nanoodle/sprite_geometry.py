@@ -1,11 +1,11 @@
-"""Slice a static glTF mesh or a Gaussian PLY into bottom-to-top RGBA tiles."""
+"""Slice glTF poses or a Gaussian PLY into bottom-to-top RGBA tiles."""
 from array import array
-from itertools import pairwise
+from itertools import chain, pairwise
 from math import ceil, exp, floor, inf, isfinite
 from struct import iter_unpack
 
 from .errors import NanoodleError
-from .sprite_model import read_model
+from .sprite_model import read_model_poses
 
 _AXES = {"x": (1, 2, 0, -1), "y": (0, 2, 1, 1), "z": (0, 1, 2, -1)}
 _PLANES = ((0, 1, 2), (1, 2, 0), (2, 0, 1))
@@ -357,34 +357,44 @@ def _quantize(rgba, palette_image, limit, outline, check_cancel):
 
 
 def _outline(rgba, size, width, ink, check_cancel):
-    # Only the original alpha plane contributes, so outlines stay one pixel
-    # thick and never leak from one tile into the next.
-    alpha = rgba[3::4]
-    for i, value in enumerate(alpha):
-        if check_cancel and i % 32768 == 0:
+    from PIL import Image, ImageChops, ImageOps
+
+    # Dilation over a four-neighbour cross preserves thin silhouettes. Padding
+    # each tile separately keeps colours from leaking across atlas seams.
+    image = Image.frombytes("RGBA", (width, size), bytes(rgba))
+
+    def neighbour(padded, dx, dy):
+        x, y = 1 + dx, 1 + dy
+        return padded.crop((x, y, x + size, y + size))
+
+    for left in range(0, width, size):
+        if check_cancel:
             check_cancel()
-        if value:
-            continue
-        x, y = i % size, i // width
-        coverage = max(alpha[i - 1] if x else 0, alpha[i + 1] if x + 1 < size else 0,
-                       alpha[i - width] if y else 0, alpha[i + width] if y + 1 < size else 0)
-        if coverage:
-            pos = i * 4
-            rgba[pos:pos + 3] = ink
-            rgba[pos + 3] = coverage
+        box = (left, 0, left + size, size)
+        alpha = image.crop(box).getchannel("A")
+        padded = ImageOps.expand(alpha, border=1)
+        horizontal = ImageChops.lighter(neighbour(padded, -1, 0), neighbour(padded, 1, 0))
+        vertical = ImageChops.lighter(neighbour(padded, 0, -1), neighbour(padded, 0, 1))
+        coverage = ImageChops.lighter(horizontal, vertical)
+        halo = ImageChops.multiply(coverage, alpha.point([255] + [0] * 255))
+        outline = Image.new("RGBA", (size, size), tuple(ink) + (255,))
+        outline.putalpha(halo)
+        image.paste(outline, box, halo.point([0] + [255] * 255))
+    return image.tobytes()
 
 
-def slice_model(model_bytes, fields, palette_image, decode_image, *, check_cancel=None):
-    """Return (atlas width, height, straight RGBA bytes, JSON-serializable layout)."""
-    size = _integer(fields, "resolution", 48, 16, 128)
-    layers = _integer(fields, "slices", 48, 8, 128)
-    limit = _integer(fields, "palette", 16, 0, 64)
-    kind, primitives = read_model(model_bytes, decode_image, check_cancel=check_cancel)
-    axis = fields.get("upAxis") or "auto"
-    if axis == "auto":
-        axis = "z" if kind == "splat" else "y"
-    outline = fields.get("outline") is None or fields["outline"] is True or fields["outline"] == "true"
-    grid = _Grid(kind, primitives, axis, size, layers)
+_CHARACTER = {"resolution": 128, "slices": 80, "palette": 0, "outline": True}
+
+
+def preset_fields(fields):
+    """Apply the character defaults while preserving authored values, including zero/false."""
+    if fields.get("preset") != "character":
+        return fields
+    return {**_CHARACTER, **{k: v for k, v in fields.items() if v is not None and v != ""}}
+
+
+def _rasterize(kind, primitives, grid, palette_image, limit, outline, check_cancel):
+    size, layers = grid.size, grid.layers
     width = size * layers
     rgba = bytearray(width * size * 4)
     if kind == "mesh":
@@ -395,7 +405,34 @@ def slice_model(model_bytes, fields, palette_image, decode_image, *, check_cance
     if limit and (palette_image is not None or any(rgba[3::4])):
         ink = _quantize(rgba, palette_image, limit, outline, check_cancel)
     if outline:
-        _outline(rgba, size, width, ink, check_cancel)
+        return _outline(rgba, size, width, ink, check_cancel)
+    return bytes(rgba)
+
+
+def slice_sequence(model_bytes, fields, palette_image, decode_image, *, check_cancel=None):
+    """Return a shared layout and an iterator of packed full-size RGBA layer atlases."""
+    fields = preset_fields(fields)
+    size = _integer(fields, "resolution", 48, 16, 128)
+    layers = _integer(fields, "slices", 48, 8, 128)
+    limit = _integer(fields, "palette", 16, 0, 64)
+    count = _integer(fields, "frames", 1, 1, 64)
+    kind, clip, start, duration, pose_at = read_model_poses(
+        model_bytes, decode_image, fields.get("clip") or "", count, check_cancel=check_cancel)
+    axis = fields.get("upAxis") or "auto"
+    if axis == "auto":
+        axis = "z" if kind == "splat" else "y"
+    outline = fields.get("outline") is None or fields["outline"] is True or fields["outline"] == "true"
+    first = pose_at(0)
+
+    def later_poses():
+        for index in range(1, count):
+            if check_cancel:
+                check_cancel()
+            yield pose_at(index)
+
+    # Fit all sampled poses together and keep just one additional pose resident.
+    grid = _Grid(kind, chain(first, chain.from_iterable(later_poses())), axis, size, layers)
+
     # Keep integer coordinates in the same JSON spelling as saved JS layouts.
     def json_number(value):
         return int(value) if abs(value) < 1e21 and int(value) == value else value
@@ -404,4 +441,19 @@ def slice_model(model_bytes, fields, palette_image, decode_image, *, check_cance
               "tileWidth": size, "tileHeight": size, "upAxis": axis, "source": kind,
               "bounds": {"min": [json_number(x) for x in grid.low], "max": [json_number(x) for x in grid.high]},
               "pixelSize": json_number(grid.unit), "layerHeight": json_number(grid.step)}
-    return width, size, bytes(rgba), layout
+    if count > 1:
+        layout["animation"] = {"clip": clip, "frames": count, "duration": duration,
+                               "times": [start + i * duration / count for i in range(count)]}
+
+    def atlases():
+        for primitives in chain((first,), later_poses()):
+            yield _rasterize(kind, primitives, grid, palette_image, limit, outline, check_cancel)
+
+    return size * layers, size, atlases(), layout
+
+
+def slice_model(model_bytes, fields, palette_image, decode_image, *, check_cancel=None):
+    """Return the first atlas and layout (static slice helper)."""
+    width, height, atlases, layout = slice_sequence(
+        model_bytes, fields, palette_image, decode_image, check_cancel=check_cancel)
+    return width, height, next(atlases), layout
