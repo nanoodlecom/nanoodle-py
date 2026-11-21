@@ -256,6 +256,9 @@ def _decode_pillow(raw, fmt):
             _dimensions(*image.size)
             if fmt == "JPEG" and image.width * image.height > 16_777_216:
                 raise NanoodleError("JPEG texture exceeds 16 megapixels")
+            if fmt == "AVIF":
+                from .sprite_avif import present_avif
+                image = present_avif(image, raw)
             return image.width, image.height, image.convert("RGBA").tobytes()
     except (ValueError, OSError, SyntaxError, Image.DecompressionBombError) as exc:
         raise NanoodleError(f"Invalid {fmt} sprite texture: {exc}") from exc
