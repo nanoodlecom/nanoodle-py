@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nanoodle"
-version = "0.8.0"
+version = "0.8.1"
 description = "Run nanoodle visual AI workflows from Python — local and API executor for saved noodle-graph.json files"
 readme = "README.md"
 license = { text = "MIT" }
@@ -33,7 +33,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Multimedia :: Graphics",
 ]
-dependencies = ["quickjs-ng>=0.18.0.2,<0.19"]
+dependencies = []
 
 [project.urls]
 Homepage = "https://nanoodle.com"
@@ -43,9 +43,6 @@ Issues = "https://github.com/nanoodlecom/nanoodle-py/issues"
 
 [project.scripts]
 nanoodle-py = "nanoodle.__main__:main"
-
-[tool.setuptools.package-data]
-nanoodle = ["sprite-core.js"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
