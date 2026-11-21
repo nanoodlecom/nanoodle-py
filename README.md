@@ -5,7 +5,7 @@
 and re-run them here — same graph, same [NanoGPT](https://nano-gpt.com) API,
 your own key.
 
-Zero runtime dependencies (stdlib only). Library + CLI in one install.
+The package installs the library, CLI and embedded QuickJS runtime together.
 
 Looking for JavaScript / Node? → **[nanoodle-js](https://github.com/nanoodlecom/nanoodle-js)**
 Running graphs in GitHub CI → [run-noodle-action](https://github.com/nanoodlecom/run-noodle-action) · saved graphs as AI-agent tools → [nanoodle-mcp](https://github.com/nanoodlecom/nanoodle-mcp) · Agent Skills → [nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill) / [noodle-skills](https://github.com/nanoodlecom/noodle-skills)
@@ -23,7 +23,7 @@ agents.
 | | |
 |---|---|
 | **Package** | `nanoodle` on PyPI |
-| **Runtime** | Python ≥ 3.11 · stdlib only · no deps |
+| **Runtime** | Python ≥ 3.11 · quickjs-ng for local sprite rendering |
 | **Sibling** | [JavaScript package](https://github.com/nanoodlecom/nanoodle-js) (same graphs, same semantics) |
 | **Editor** | [nanoodle.com](https://nanoodle.com) — wire nodes, hit 💾, download the graph |
 
@@ -254,8 +254,10 @@ is `0.0`, and the reason is in `errors[0].message`:
 | runs | node types |
 |---|---|
 | local | text, upload (image/audio/video/3D `.glb`), choice, join, comment, endpoint‡ |
-| local media† | resize, vframes, combine, soundtrack, trim, extractaudio |
+| local media† | resize, vframes, combine, soundtrack, trim, extractaudio, slice-3d, sprite-stack-render |
 | NanoGPT | llm (incl. vision + audio input), image, edit, inpaint*, vision, decide†, tvideo, ivideo, model3d, vedit, lipsync, music, remix, tts, transcribe, cleanvoice |
+
+Wire `mupload.model` to `slice-3d.model` and `slice-3d.sheet` to `sprite-stack-render.sheet`. The slicer accepts self-contained triangle glTF/GLB or uncompressed Gaussian PLY. Its horizontal PNG strip, JSON layout text and preview are separate outputs. The renderer produces an image and, with `turntable` enabled, an MP4. Python runs the renderer in-process and uses FFmpeg on PATH for image decoding and video encoding.
 
 † `decide` asks a NanoGPT decision model one typed question (`POST /api/v1/decisions`): pick the best of the wired `img1…` images, choose a label, score on a scale, or yes/no. Text-only decisions need nothing extra; wired images are shrunk to the model's limits with ffmpeg. A yes/no gate that answers no is not a failure: that node settles as `gated`, everything downstream is `skipped` unbilled, and the run succeeds (see [Gates](#gates-decide-said-no)).
 

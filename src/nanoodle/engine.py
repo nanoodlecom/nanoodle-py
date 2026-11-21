@@ -1572,6 +1572,11 @@ def _media_url(v):
     return v
 
 
+def _run_sprite(engine, node, inp, on_cost):
+    from .sprite_stack import run_sprite
+    return run_sprite(engine, node, inp, on_cost)
+
+
 def _run_resize(engine, node, inp, on_cost):
     from .local_media import resize_crop_image
     engine.check_cancel()
@@ -1779,6 +1784,8 @@ _EXECUTORS = {
     "mupload": _run_mupload,
     "choice": _run_choice,
     "join": _run_join,
+    "slice-3d": _run_sprite,
+    "sprite-stack-render": _run_sprite,
     "resize": _run_resize,
     "vframes": _run_vframes,
     "combine": _run_combine,

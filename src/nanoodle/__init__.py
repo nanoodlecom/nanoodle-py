@@ -1,6 +1,6 @@
 """nanoodle — re-execute nanoodle (https://nanoodle.com) workflow saves against NanoGPT.
 
-Zero runtime dependencies (Python >= 3.9, stdlib only).
+Python 3.11 or later. Sprite nodes use the bundled renderer and quickjs-ng.
 
     from nanoodle import Workflow
     wf = Workflow.load("noodle-graph.json", api_key="...")
@@ -21,7 +21,7 @@ from .share import decode_share_fragment, decode_share_url, is_share_ref
 from .workflow import NodeRun, RunResult, Workflow
 from .x402 import parse_nano_invoice
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
 __all__ = [
     "Workflow", "RunResult", "NodeRun",
