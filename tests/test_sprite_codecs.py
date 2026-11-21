@@ -1,6 +1,7 @@
 import base64
 import struct
 import unittest
+import zlib
 
 from nanoodle.errors import NanoodleError
 from nanoodle.sprite_codecs import decode_image, encode_png
@@ -19,6 +20,21 @@ class SpriteCodecTest(unittest.TestCase):
         self.assertEqual(decode_image(encode_png(11, 9, expected)), (11, 9, expected))
         with self.assertRaises(NanoodleError):
             decode_image(raw[:-20])
+
+    def test_animation_replaces_its_poster_on_a_transparent_canvas(self):
+        def chunk(name, body):
+            crc = zlib.crc32(body, zlib.crc32(name))
+            return struct.pack(">I", len(body)) + name + body + struct.pack(">I", crc)
+
+        poster = encode_png(3, 2, bytes((255, 0, 0, 255)) * 6)
+        # The fallback IDAT is red. The first displayed frame blends a single
+        # translucent green pixel at (2, 1) onto a transparent canvas.
+        animation = chunk(b"acTL", struct.pack(">II", 1, 0))
+        rect = struct.pack(">5IHHBB", 0, 1, 1, 2, 1, 1, 30, 0, 1)
+        frame = chunk(b"fcTL", rect) + chunk(b"fdAT", bytes((0, 0, 0, 1))
+                                               + zlib.compress(bytes((0, 0, 255, 0, 128))))
+        raw = poster[:33] + animation + poster[33:-12] + frame + poster[-12:]
+        self.assertEqual(decode_image(raw), (3, 2, bytes(20) + bytes((0, 255, 0, 128))))
 
     def test_interlaced_gif_with_transparent_pixels(self):
         raw = base64.b64decode(

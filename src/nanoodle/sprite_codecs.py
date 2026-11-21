@@ -1,9 +1,11 @@
 """In-process texture decoding and sprite sheet encoding for the local nodes."""
 
+import io
 import struct
 import zlib
 
 from .errors import NanoodleError
+from .sprite_orientation import orient_image
 
 _PNG = b"\x89PNG\r\n\x1a\n"
 _DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
@@ -117,6 +119,9 @@ def _decode_png(data):
     pos = len(_PNG)
     header = colors = transparency = None
     compressed = bytearray()
+    frame_total = frame_index = sequence = 0
+    first_rect = None
+    seen_idat = False
     while pos + 12 <= len(data):
         size, kind = struct.unpack_from(">I4s", data, pos)
         end = pos + 8 + size
@@ -138,7 +143,37 @@ def _decode_png(data):
             colors = body.tobytes()
         elif kind == b"tRNS":
             transparency = body.tobytes()
+        elif kind == b"acTL":
+            if frame_total or seen_idat or size != 8:
+                raise NanoodleError("Invalid APNG animation header")
+            frame_total = struct.unpack_from(">I", body)[0]
+            if not frame_total:
+                raise NanoodleError("Empty APNG animation")
+        elif kind in (b"fcTL", b"fdAT") and frame_total:
+            if size < 4 or struct.unpack_from(">I", body)[0] != sequence:
+                raise NanoodleError("Invalid APNG sequence")
+            sequence += 1
+            if kind == b"fcTL":
+                if size != 26:
+                    raise NanoodleError("Invalid APNG frame control")
+                frame_index += 1
+                fw, fh, x, y = struct.unpack_from(">4I", body, 4)
+                if (not fw or not fh or x + fw > header[0] or y + fh > header[1]
+                        or body[24] > 2 or body[25] > 1 or frame_index > frame_total):
+                    raise NanoodleError("Invalid APNG frame rectangle or operation")
+                if frame_index == 1:
+                    first_rect = fw, fh, x, y
+                    if seen_idat:
+                        # IDAT held the fallback poster, excluded from the animation.
+                        compressed.clear()
+                    elif (fw, fh) != header[:2]:
+                        raise NanoodleError("Invalid APNG default frame dimensions")
+            elif frame_index == 0:
+                raise NanoodleError("Missing APNG frame control")
+            elif frame_index == 1:
+                compressed.extend(body[4:])
         elif kind == b"IDAT":
+            seen_idat = True
             compressed.extend(body)
         elif kind == b"IEND":
             if size:
@@ -150,8 +185,11 @@ def _decode_png(data):
     else:
         raise NanoodleError("Missing PNG end marker")
 
-    width, height, depth, mode, compress, filtering, interlace = header
-    _dimensions(width, height)
+    canvas_width, canvas_height, depth, mode, compress, filtering, interlace = header
+    _dimensions(canvas_width, canvas_height)
+    if frame_index != frame_total:
+        raise NanoodleError("APNG frame count does not match its animation header")
+    width, height, frame_x, frame_y = first_rect or (canvas_width, canvas_height, 0, 0)
     if depth not in _DEPTHS.get(mode, ()) or compress or filtering or interlace not in (0, 1):
         raise NanoodleError("Unsupported PNG header")
     palette = transparent = None
@@ -186,7 +224,9 @@ def _decode_png(data):
         raise NanoodleError("Invalid compressed PNG data") from exc
     if not inflater.eof or len(raw) != expected_size:
         raise NanoodleError("PNG scanline length does not match its dimensions")
-    rgba = bytearray(width * height * 4)
+    # The first displayed frame starts on a transparent canvas. Both source
+    # and source-over blending therefore place the first frame at its offset.
+    rgba = bytearray(canvas_width * canvas_height * 4)
     offset = 0
     for x, first_y, dx, dy, columns, row_bytes in passes:
         prev = bytearray(row_bytes)
@@ -197,7 +237,7 @@ def _decode_png(data):
             offset += row_bytes
             _unfilter(kind, row, prev, max(1, (bits + 7) // 8))
             expanded = _rgba_row(row, columns, depth, mode, palette, transparent)
-            start = (y * width + x) * 4
+            start = ((y + frame_y) * canvas_width + x + frame_x) * 4
             if dx == 1:
                 rgba[start:start + columns * 4] = expanded
             else:
@@ -205,17 +245,44 @@ def _decode_png(data):
                     a = start + channel
                     rgba[a:a + columns * dx * 4:dx * 4] = expanded[channel::4]
             prev = row
-    return width, height, bytes(rgba)
+    return canvas_width, canvas_height, bytes(rgba)
+
+
+def _decode_pillow(raw, fmt):
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(raw), formats=[fmt]) as image:
+            _dimensions(*image.size)
+            if fmt == "JPEG" and image.width * image.height > 16_777_216:
+                raise NanoodleError("JPEG texture exceeds 16 megapixels")
+            return image.width, image.height, image.convert("RGBA").tobytes()
+    except (ValueError, OSError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise NanoodleError(f"Invalid {fmt} sprite texture: {exc}") from exc
 
 
 def decode_image(raw):
     """Decode an embedded texture or palette into straight RGBA pixels."""
     if raw.startswith(_PNG):
-        return _decode_png(raw)
+        return orient_image(raw, _decode_png(raw))
     if raw.startswith(b"\xff\xd8"):
-        from .sprite_jpeg import decode_jpeg
-        return decode_jpeg(raw)
+        return orient_image(raw, _decode_pillow(raw, "JPEG"))
     if raw[:6] in (b"GIF87a", b"GIF89a"):
         from .sprite_gif import decode_gif
         return decode_gif(raw)
-    raise NanoodleError("Expected a PNG, JPEG or GIF sprite texture")
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return _decode_pillow(raw, "WEBP")
+    if raw[:2] == b"BM" or raw[:4] in (b"\x00\x00\x01\x00", b"\x00\x00\x02\x00"):
+        from .sprite_bmp import decode_bmp, decode_ico
+        return decode_bmp(raw) if raw[:2] == b"BM" else decode_ico(raw)
+    if raw[4:8] == b"ftyp":
+        end = int.from_bytes(raw[:4], "big")
+        offset = 8
+        if end == 1:
+            end = int.from_bytes(raw[8:16], "big")
+            offset = 16
+        end = len(raw) if end == 0 else min(end, len(raw))
+        brands = (raw[i:i + 4] for i in range(offset, end - 3, 4) if i != offset + 4)
+        if any(brand in (b"avif", b"avis") for brand in brands):
+            return _decode_pillow(raw, "AVIF")
+    raise NanoodleError("Expected a PNG, JPEG, GIF, WebP, BMP, ICO, CUR or AVIF sprite texture")

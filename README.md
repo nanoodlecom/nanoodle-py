@@ -5,7 +5,7 @@
 and re-run them here — same graph, same [NanoGPT](https://nano-gpt.com) API,
 your own key.
 
-The package installs the library and CLI. Both use the Python standard library.
+The package installs the library and CLI. Sprite nodes use the Python standard library and Pillow for JPEG, WebP and AVIF image decoding.
 
 Looking for JavaScript / Node? → **[nanoodle-js](https://github.com/nanoodlecom/nanoodle-js)**
 Running graphs in GitHub CI → [run-noodle-action](https://github.com/nanoodlecom/run-noodle-action) · saved graphs as AI-agent tools → [nanoodle-mcp](https://github.com/nanoodlecom/nanoodle-mcp) · Agent Skills → [nanoodle-skill](https://github.com/nanoodlecom/nanoodle-skill) / [noodle-skills](https://github.com/nanoodlecom/noodle-skills)
@@ -23,7 +23,7 @@ agents.
 | | |
 |---|---|
 | **Package** | `nanoodle` on PyPI |
-| **Runtime** | Python ≥ 3.11 · standard library |
+| **Runtime** | Python ≥ 3.11 · Pillow for image codecs |
 | **Sibling** | [JavaScript package](https://github.com/nanoodlecom/nanoodle-js) (same graphs, same semantics) |
 | **Editor** | [nanoodle.com](https://nanoodle.com) — wire nodes, hit 💾, download the graph |
 
@@ -257,7 +257,7 @@ is `0.0`, and the reason is in `errors[0].message`:
 | local media† | resize, vframes, combine, soundtrack, trim, extractaudio |
 | NanoGPT | llm (incl. vision + audio input), image, edit, inpaint*, vision, decide†, tvideo, ivideo, model3d, vedit, lipsync, music, remix, tts, transcribe, cleanvoice |
 
-Wire `mupload.model` to `slice-3d.model` and `slice-3d.sheet` to `sprite-stack-render.sheet`. The slicer accepts self-contained triangle glTF/GLB or uncompressed Gaussian PLY. Its horizontal PNG strip, JSON layout text and preview are separate outputs. The renderer produces an image and, with `turntable` enabled, an MP4. Python reads PNG, JPEG and GIF images, projects the layers and encodes the H.264 turntable in-process. These two nodes run with a standard Python installation.
+Wire `mupload.model` to `slice-3d.model` and `slice-3d.sheet` to `sprite-stack-render.sheet`. The slicer accepts self-contained triangle glTF/GLB or uncompressed Gaussian PLY. Its horizontal PNG strip, JSON layout text and preview are separate outputs. The renderer produces an image and, with `turntable` enabled, an MP4. Python reads PNG, JPEG, GIF, WebP, BMP, ICO, CUR and AVIF images, projects the layers and encodes the H.264 turntable in-process. glTF materials can select WebP textures with `EXT_texture_webp`. Installing `nanoodle` also installs Pillow.
 
 † `decide` asks a NanoGPT decision model one typed question (`POST /api/v1/decisions`): pick the best of the wired `img1…` images, choose a label, score on a scale, or yes/no. Text-only decisions need nothing extra; wired images are shrunk to the model's limits with ffmpeg. A yes/no gate that answers no is not a failure: that node settles as `gated`, everything downstream is `skipped` unbilled, and the run succeeds (see [Gates](#gates-decide-said-no)).
 

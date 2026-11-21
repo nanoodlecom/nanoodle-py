@@ -77,7 +77,22 @@ def _configuration(width, height, frame_count, duration, payload_bytes):
     if crop:
         for value in (0, (across * 16 - width) // 2, 0, (down * 16 - height) // 2):
             sps.ue(value)
-    sps.put(0)  # no VUI; track supplies timing
+    # Signal square pixels and the matrix/range used by the RGBA conversion.
+    sps.put(1)  # vui_parameters_present_flag
+    sps.put(1)
+    sps.put(1, 8)  # aspect_ratio_idc: square pixels
+    sps.put(0)  # no overscan
+    sps.put(1)
+    sps.put(5, 3)  # unspecified source video format
+    sps.put(0)  # limited range
+    sps.put(1)
+    sps.put(1, 8)   # BT.709 primaries
+    sps.put(13, 8)  # sRGB transfer
+    sps.put(6, 8)   # SMPTE 170M / BT.601 matrix
+    sps.put(1)
+    sps.ue(1)  # centered 4:2:0 chroma
+    sps.ue(1)
+    sps.put(0, 5)  # timing comes from the MP4 track; no HRD or bitstream restrictions
 
     pps = _Bits()
     pps.ue(0)

@@ -113,8 +113,9 @@ class _Scene:
     def __init__(self, doc, binary, decode_image, check_cancel):
         if not isinstance(doc, dict) or doc.get("asset", {}).get("version") != "2.0":
             raise NanoodleError("Expected glTF 2.0.")
-        if doc.get("extensionsRequired"):
-            raise NanoodleError("Unsupported required glTF extensions: " + ", ".join(doc["extensionsRequired"]))
+        unsupported = [ext for ext in doc.get("extensionsRequired", ()) if ext != "EXT_texture_webp"]
+        if unsupported:
+            raise NanoodleError("Unsupported required glTF extensions: " + ", ".join(unsupported))
         self.doc = doc
         self.decode_image = decode_image
         self.check_cancel = check_cancel
@@ -168,13 +169,26 @@ class _Scene:
         if "KHR_texture_transform" in info.get("extensions", {}):
             raise NanoodleError(msg)
         texture = _item(self.doc.get("textures", []), info.get("index"), msg)
-        source = texture.get("source")
+        extensions = texture.get("extensions", {})
+        if not isinstance(extensions, dict):
+            raise NanoodleError(msg)
+        use_webp = "EXT_texture_webp" in extensions
+        index = extensions["EXT_texture_webp"] if use_webp else texture
+        if not isinstance(index, dict):
+            raise NanoodleError(msg)
+        source = index.get("source")
         image = _item(self.doc.get("images", []), source, msg)
+        if use_webp and "bufferView" in image and image.get("mimeType") != "image/webp":
+            raise NanoodleError("EXT_texture_webp buffer view must use image/webp.")
         if source not in self.images:
             data = _embedded(image["uri"]) if image.get("uri") else bytes(self.buffer_view(image.get("bufferView"))[0])
-            self.images[source] = self.decode_image(data)
+            is_webp = data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+            self.images[source] = (self.decode_image(data), is_webp)
+        pixels, is_webp = self.images[source]
+        if use_webp and not is_webp:
+            raise NanoodleError("EXT_texture_webp requires WebP image data.")
         sampler = {} if "sampler" not in texture else _item(self.doc.get("samplers", []), texture["sampler"], msg)
-        return self.images[source], sampler
+        return pixels, sampler
 
     def emit(self, index, world):
         mesh = _item(self.doc.get("meshes", []), index, "Missing glTF mesh.")

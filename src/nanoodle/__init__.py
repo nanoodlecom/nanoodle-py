@@ -1,6 +1,6 @@
 """nanoodle — re-execute nanoodle (https://nanoodle.com) workflow saves against NanoGPT.
 
-Python 3.11 or later. Sprite nodes run in-process using the standard library.
+Python 3.11 or later. Sprite nodes run in-process using the standard library and Pillow image codecs.
 
     from nanoodle import Workflow
     wf = Workflow.load("noodle-graph.json", api_key="...")
@@ -21,7 +21,7 @@ from .share import decode_share_fragment, decode_share_url, is_share_ref
 from .workflow import NodeRun, RunResult, Workflow
 from .x402 import parse_nano_invoice
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 __all__ = [
     "Workflow", "RunResult", "NodeRun",
