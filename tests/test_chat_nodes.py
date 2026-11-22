@@ -98,6 +98,38 @@ class LlmPayloadTest(MockedTest):
         self.assertEqual([p["image_url"]["url"] for p in content if p["type"] == "image_url"],
                          ["data:image/png;base64,ONE", "data:image/png;base64,TWO"])
 
+    def test_llm_bare_img_port_delivers_image(self):
+        # Regression (D24): IMG_PORT_RE required a digit, so a wire to the bare
+        # `img` port matched no dynamic family, was classified as a field
+        # override, and the image vanished silently — the model answered as if
+        # no photo existed. Bare `img` is slot 1, like edit's bare `image`.
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("seen"))
+        wf = self.wf_dict({"nodes": [
+            {"id": "n1", "type": "upload", "fields": {"image": "data:image/png;base64,ONE"}},
+            {"id": "n3", "type": "llm", "fields": {"model": "m", "prompt": "look"}},
+        ], "links": [
+            {"id": "l1", "from": {"node": "n1", "port": "image"}, "to": {"node": "n3", "port": "img"}},
+        ]})
+        wf.run()
+        content = self.mock.requests_to("/api/v1/chat/completions")[0].json["messages"][-1]["content"]
+        self.assertEqual([p["image_url"]["url"] for p in content if p["type"] == "image_url"],
+                         ["data:image/png;base64,ONE"])
+
+    def test_llm_bare_img_and_img2_order(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("both"))
+        wf = self.wf_dict({"nodes": [
+            {"id": "n1", "type": "upload", "fields": {"image": "data:image/png;base64,ONE"}},
+            {"id": "n2", "type": "upload", "fields": {"image": "data:image/png;base64,TWO"}},
+            {"id": "n3", "type": "llm", "fields": {"model": "m", "prompt": "compare"}},
+        ], "links": [
+            {"id": "l1", "from": {"node": "n2", "port": "image"}, "to": {"node": "n3", "port": "img2"}},
+            {"id": "l2", "from": {"node": "n1", "port": "image"}, "to": {"node": "n3", "port": "img"}},
+        ]})
+        wf.run()
+        content = self.mock.requests_to("/api/v1/chat/completions")[0].json["messages"][-1]["content"]
+        self.assertEqual([p["image_url"]["url"] for p in content if p["type"] == "image_url"],
+                         ["data:image/png;base64,ONE", "data:image/png;base64,TWO"])
+
     def test_llm_wired_audio_becomes_input_audio_part(self):
         wav = "data:audio/wav;base64,UklGRgAAAABXQVZF"
         self.mock.script("POST", "/api/v1/chat/completions", chat_response("heard it"))
