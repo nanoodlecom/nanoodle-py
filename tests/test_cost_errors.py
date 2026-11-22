@@ -81,6 +81,26 @@ class CostPriorityTest(MockedTest):
         result = self._one_llm().run()
         self.assertAlmostEqual(result.nodes["n1"].cost_usd, 0.003)
 
+    def test_wire_truncation_keeps_billing_headers(self):
+        self.mock.script("POST", "/api/v1/chat/completions",
+                         {"status": 200, "body": b'{"choices":', "headers": {
+                             "Content-Length": "128", "Content-Type": "application/json",
+                             "x-nano-cost": "0.2", "x-remaining-balance": "4.5"}})
+        with self.assertRaisesRegex(RunError, "could not read HTTP response body") as ctx:
+            self._one_llm().run()
+        result = ctx.exception.result
+        self.assertEqual(result.cost_usd, 0.2)
+        self.assertEqual(result.nodes["n1"].cost_usd, 0.2)
+        self.assertTrue(result.cost_exact)
+        self.assertEqual(result.remaining_balance, 4.5)
+
+    def test_valid_body_cost_wins_without_adding_header_cost(self):
+        self._chat_with({"cost": 0.1}, {"x-cost": "0.2"})
+        result = self._one_llm().run()
+        self.assertEqual(result.cost_usd, 0.1)
+        self.assertEqual(result.nodes["n1"].cost_usd, 0.1)
+        self.assertTrue(result.cost_exact)
+
 
 class BalanceTest(MockedTest):
     def _one_llm(self):

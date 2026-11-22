@@ -196,7 +196,8 @@ class MockNanoGPT(object):
                     self.send_response(status)
                     for k, v in headers.items():
                         self.send_header(k, v)
-                    self.send_header("Content-Length", str(len(payload)))
+                    if not any(name.lower() == "content-length" for name in headers):
+                        self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
                 except (BrokenPipeError, ConnectionResetError):

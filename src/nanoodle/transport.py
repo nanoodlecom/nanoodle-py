@@ -10,17 +10,29 @@ import os
 import urllib.error
 import urllib.request
 import uuid
+from http.client import IncompleteRead
 
 from .errors import NanoodleError
 
 
-class HttpResponse(object):
-    __slots__ = ("status", "headers", "body")
+class HttpBodyReadError(NanoodleError):
+    """The response headers arrived, but its body could not be read."""
 
-    def __init__(self, status, headers, body):
+
+class HttpResponse(object):
+    __slots__ = ("_body", "_body_error", "headers", "status")
+
+    def __init__(self, status, headers, body, *, body_error=None):
         self.status = status
         self.headers = {str(k).lower(): v for k, v in (headers or {}).items()}
-        self.body = body if body is not None else b""
+        self._body = body if body is not None else b""
+        self._body_error = body_error
+
+    @property
+    def body(self):
+        if self._body_error is not None:
+            raise self._body_error
+        return self._body
 
     def header(self, name):
         return self.headers.get(str(name).lower())
@@ -37,6 +49,18 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _read_response(resp, max_bytes):
+    headers = dict((resp.headers or {}).items())
+    try:
+        data = resp.read() if max_bytes is None else resp.read(max_bytes + 1)
+    except (IncompleteRead, OSError):
+        # A failed read can still carry the provider's charge in the headers.
+        # Do not pass incomplete content off as a usable JSON or media body.
+        return HttpResponse(resp.code, headers, None, body_error=HttpBodyReadError(
+            "could not read HTTP response body"))
+    return HttpResponse(resp.code, headers, data)
+
+
 def default_http(method, url, headers=None, body=None, timeout=None,
                  follow_redirects=True, max_bytes=None):
     if isinstance(body, str):
@@ -48,12 +72,10 @@ def default_http(method, url, headers=None, body=None, timeout=None,
         open_url = (urllib.request.urlopen if follow_redirects else
                     urllib.request.build_opener(_NoRedirect()).open)
         with open_url(req, timeout=timeout) as resp:
-            data = resp.read() if max_bytes is None else resp.read(max_bytes + 1)
-            return HttpResponse(resp.status, dict(resp.headers.items()), data)
+            return _read_response(resp, max_bytes)
     except urllib.error.HTTPError as e:
         with e:
-            return HttpResponse(e.code, dict((e.headers or {}).items()),
-                                e.read() if max_bytes is None else e.read(max_bytes + 1))
+            return _read_response(e, max_bytes)
     except urllib.error.URLError as e:
         # never echo headers/keys — the reason string is connection-level only
         raise NanoodleError("could not reach %s (%s)" % (url.split("?")[0], e.reason))
