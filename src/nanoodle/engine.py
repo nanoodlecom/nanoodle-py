@@ -1233,7 +1233,97 @@ def _model3d_status_url(s):
     return out.get("model_url") or model.get("url") or video.get("url") or from_list or ""
 
 
-def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
+# ---- S1: labeled companion assets (twin of nanoodle-js parseStatusAssets) ----
+# Completed jobs return more than the primary output: MoGe-3 ships depth /
+# normals / mask / point cloud beside its GLB; LTX AlphaGen ships an alpha
+# matte + ProRes cutout beside its video — as output.model3d_assets[] /
+# output.processing_assets[] ({label, url, filename?, contentType?}).
+
+_ASSET_MODEL_EXT = re.compile(r"\.(glb|gltf|fbx|obj|stl|ply|usdz|3mf)$")
+_ASSET_IMAGE_EXT = re.compile(r"\.(png|jpe?g|webp|gif|avif)$")
+_ASSET_VIDEO_EXT = re.compile(r"\.(mp4|mov|webm|mkv)$")
+_ASSET_AUDIO_EXT = re.compile(r"\.(mp3|wav|ogg|flac|m4a)$")
+
+
+def _asset_kind(a):
+    ct = str(a.get("contentType") or "").lower()
+    if ct.startswith("image/"):
+        return "image"
+    if ct.startswith("video/") or ct == "video/quicktime":
+        return "video"
+    if ct.startswith("audio/"):
+        return "audio"
+    if "gltf" in ct or "model/" in ct:
+        return "model3d"
+    path = re.split(r"[?#]", str(a.get("url") or ""))[0].lower()
+    if _ASSET_MODEL_EXT.search(path):
+        return "model3d"
+    if _ASSET_IMAGE_EXT.search(path):
+        return "image"
+    if _ASSET_VIDEO_EXT.search(path):
+        return "video"
+    if _ASSET_AUDIO_EXT.search(path):
+        return "audio"
+    return "file"
+
+
+def _parse_status_assets(s):
+    data = s.get("data") if isinstance(s.get("data"), dict) else {}
+    out = data.get("output") if isinstance(data.get("output"), dict) else None
+    if out is None:
+        out = s.get("output") if isinstance(s.get("output"), dict) else {}
+    raw = []
+    for key in ("model3d_assets", "processing_assets"):
+        if isinstance(out.get(key), list):
+            raw.extend(out[key])
+    assets = []
+    for a in raw:
+        if not isinstance(a, dict) or not isinstance(a.get("url"), str) or not a["url"]:
+            continue
+        assets.append({"label": str(a.get("label") or a.get("filename") or ""),
+                       "url": a["url"], "kind": _asset_kind(a)})
+    return assets
+
+
+def _asset_outputs(engine, assets, primary_url, media_kind):
+    """Role ports for companion assets (twin of JS assetOutputs). The `assets`
+    port always carries the full normalized list as JSON (JS-stringify shape:
+    no spaces), so nothing is dropped; canonical roles surface as media refs."""
+    if not assets:
+        return {}
+    out = {"assets": json.dumps(assets, separators=(",", ":"))}
+    taken = set()
+
+    def claim(role, test):
+        for a in assets:
+            if id(a) not in taken and test(a):
+                taken.add(id(a))
+                mime = "model/gltf-binary" if a["kind"] == "model3d" else None
+                out[role] = engine._media_ref(a["url"], mime=mime)
+                return
+
+    def has(a, word):
+        return word in a["label"].lower()
+
+    if media_kind == "model3d":
+        claim("depth", lambda a: a["kind"] == "image" and has(a, "depth"))
+        claim("normals", lambda a: a["kind"] == "image" and has(a, "normal"))
+        claim("mask", lambda a: a["kind"] == "image" and has(a, "mask"))
+        claim("points", lambda a: has(a, "point") or re.search(r"\.ply([?#]|$)", a["url"], re.I))
+        n = 2
+        for a in assets:
+            if a["kind"] != "model3d" or id(a) in taken or a["url"] == primary_url:
+                continue
+            taken.add(id(a))
+            out["model%d" % n] = engine._media_ref(a["url"], mime="model/gltf-binary")
+            n += 1
+    elif media_kind == "video":
+        claim("matte", lambda a: a["kind"] == "video" and has(a, "matte"))
+        claim("cutout", lambda a: a["kind"] == "video" and (has(a, "cutout") or has(a, "alpha")))
+    return out
+
+
+def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None, want_assets=False):
     body = {"model": _mdl(node)}
     # 3D omits an empty prompt so an image-only model isn't sent a blank string.
     if not (media_kind == "model3d" and not str(prompt or "").strip()):
@@ -1283,7 +1373,10 @@ def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
                 url = _model3d_status_url(s)
                 if not url:
                     raise NanoodleError("completed but no model url")
-                return engine._media_ref(url, mime="model/gltf-binary")
+                ref = engine._media_ref(url, mime="model/gltf-binary")
+                if want_assets:
+                    return ref, _asset_outputs(engine, _parse_status_assets(s), url, "model3d")
+                return ref
             out = (data or {}).get("output") or s.get("output") or {}
             url = None
             video = out.get("video")
@@ -1295,7 +1388,10 @@ def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
                 url = (video[0] or {}).get("url")
             if not url:
                 raise NanoodleError("completed but no video url")
-            return engine._media_ref(engine.resolve_content_url(url))
+            ref = engine._media_ref(engine.resolve_content_url(url))
+            if want_assets:
+                return ref, _asset_outputs(engine, _parse_status_assets(s), url, "video")
+            return ref
         if st in ("FAILED", "ERROR", "CANCELED", "CANCELLED"):
             prefix = "3D failed: " if media_kind == "model3d" else "video failed: "
             raise NanoodleError(prefix + str((data or {}).get("error") or st))
@@ -1313,7 +1409,8 @@ def _run_tvideo(engine, node, inp, on_cost):
     refs = _collect_ports(inp, REF_PORT_RE)
     if refs:
         extra["reference_images"] = refs
-    return {"video": _gen_video(engine, node, on_cost, prompt, extra)}
+    ref, assets = _gen_video(engine, node, on_cost, prompt, extra, want_assets=True)
+    return {"video": ref, **assets}
 
 
 def _run_ivideo(engine, node, inp, on_cost):
@@ -1323,7 +1420,8 @@ def _run_ivideo(engine, node, inp, on_cost):
     extra = {"_sources": {"imageDataUrl": _as_url(inp["image"])}}
     if inp.get("endframe"):
         extra["_sources"]["last_image"] = _as_url(inp["endframe"])
-    return {"video": _gen_video(engine, node, on_cost, prompt, extra)}
+    ref, assets = _gen_video(engine, node, on_cost, prompt, extra, want_assets=True)
+    return {"video": ref, **assets}
 
 
 def _run_vedit(engine, node, inp, on_cost):
@@ -1332,7 +1430,8 @@ def _run_vedit(engine, node, inp, on_cost):
     prompt = _fstr(node, "prompt").strip()
     src = engine.resolve_content_url(_as_url(inp["video"]))
     sources = {"videoUrl": src} if re.match(r"^https?:", src) else {"videoDataUrl": src}
-    return {"video": _gen_video(engine, node, on_cost, prompt, {"_sources": sources})}
+    ref, assets = _gen_video(engine, node, on_cost, prompt, {"_sources": sources}, want_assets=True)
+    return {"video": ref, **assets}
 
 
 def _run_lipsync(engine, node, inp, on_cost):
@@ -1725,7 +1824,8 @@ def _run_model3d(engine, node, inp, on_cost):
         extra["_sources"] = {"imageDataUrl": image}
     if mesh:
         extra["model_url"] = mesh
-    return {"model": _gen_video(engine, node, on_cost, prompt, extra, media_kind="model3d")}
+    ref, assets = _gen_video(engine, node, on_cost, prompt, extra, media_kind="model3d", want_assets=True)
+    return {"model": ref, **assets}
 
 
 def _run_cleanvoice(engine, node, inp, on_cost):

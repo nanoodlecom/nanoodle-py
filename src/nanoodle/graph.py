@@ -63,14 +63,14 @@ NODE_TYPES = {
     # (pick: the winner; otherwise the first wired image, passed through)
     "decide":     {"title": "Decide",           "outputs": [("text", "text"), ("image", "image")],
                    "static": ["text"], "dynamic": [IMG_PORT_RE], "network": True},
-    "tvideo":     {"title": "Text→Video",       "outputs": [("video", "video")],
+    "tvideo":     {"title": "Text→Video",       "outputs": [("video", "video"), ("matte", "video"), ("cutout", "video"), ("assets", "text")],
                    "dynamic": [REF_PORT_RE], "network": True},
-    "ivideo":     {"title": "Image→Video",      "outputs": [("video", "video")],
+    "ivideo":     {"title": "Image→Video",      "outputs": [("video", "video"), ("matte", "video"), ("cutout", "video"), ("assets", "text")],
                    "static": ["image", "endframe"], "network": True},
     # 🧊 3D: image + model ports are static; prompt is a field override. Output is a GLB.
-    "model3d":    {"title": "3D model",         "outputs": [("model", "model3d")],
+    "model3d":    {"title": "3D model",         "outputs": [("model", "model3d"), ("depth", "image"), ("normals", "image"), ("mask", "image"), ("points", "model3d"), ("assets", "text")],
                    "static": ["image", "model"], "network": True},
-    "vedit":      {"title": "Video edit",       "outputs": [("video", "video")],
+    "vedit":      {"title": "Video edit",       "outputs": [("video", "video"), ("matte", "video"), ("cutout", "video"), ("assets", "text")],
                    "static": ["video"], "network": True},
     "vframes":    {"title": "Video → frames",   "outputs": [("frame1", "image")],
                    "static": ["video"]},
