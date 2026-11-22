@@ -10,11 +10,11 @@ import re
 from .errors import NanoodleError
 
 # Dynamic input-port families (SPEC-engine execution step 4).
-IMG_PORT_RE = re.compile(r"^img\d+$")        # llm vision slots, decide candidates
+IMG_PORT_RE = re.compile(r"^img\d*$")        # llm vision slots, decide candidates
 EDIT_IMG_RE = re.compile(r"^image\d*$")      # edit multi-reference: image, image2, ...
-VID_PORT_RE = re.compile(r"^vid\d+$")        # combine clips
-CLIP_PORT_RE = re.compile(r"^clip\d+$")      # combine clips (spec alias)
-REF_PORT_RE = re.compile(r"^ref\d+$")        # tvideo reference images
+VID_PORT_RE = re.compile(r"^vid\d*$")        # combine clips
+CLIP_PORT_RE = re.compile(r"^clip\d*$")      # combine clips (spec alias)
+REF_PORT_RE = re.compile(r"^ref\d*$")        # tvideo reference images
 FRAME_PORT_RE = re.compile(r"^frame\d+$")    # vframes outputs
 MAX_FRAMES = 12
 
