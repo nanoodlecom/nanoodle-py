@@ -21,7 +21,7 @@ from .graph import (EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name,
                     optional_node)
 from .media import (MEDIA_INLINE_MAX, MODEL_FILE_MIMES, TRANSCRIBE_MAX_BYTES, MediaRef,
                     b64_image_mime, make_data_url, parse_data_url)
-from .transport import HttpResponse, default_http, encode_multipart
+from .transport import HttpBodyReadError, HttpResponse, default_http, encode_multipart
 from .x402 import assert_payment_option, looks_like_result, parse_json, parse_nano_invoice
 
 IMG_ENDPOINT = "/v1/images/generations"          # note: NOT /api/v1
@@ -202,7 +202,7 @@ class Engine(object):
         """
         if self._cancel.is_set():
             return True
-        if self._deadline is not None and time.monotonic() > self._deadline:
+        if self._deadline is not None and time.monotonic() >= self._deadline:
             self._cancel.set()
             return True
         return False
@@ -465,7 +465,9 @@ class Engine(object):
                            headers={"Content-Type": "application/json", "x-x402": "true"},
                            body="{}", timeout=self._http_timeout_now())
             if 200 <= cr.status < 300:
-                cj = parse_json(cr.text()) if "json" in (cr.header("content-type") or "") else None
+                # An unreadable completion body cannot authorize a fallback generation.
+                has_json = cr.body and "json" in (cr.header("content-type") or "")
+                cj = parse_json(cr.text()) if has_json else None
                 if looks_like_result(cj):
                     # re-wrap so call sites keep their HttpResponse contract
                     replay = HttpResponse(200, cr.headers, json.dumps(cj).encode("utf-8"))
@@ -481,10 +483,13 @@ class Engine(object):
             self.sleep(self.poll_x402)   # wakes early on cancel/deadline
 
     def _raise_http(self, resp):
-        body = resp.text()
         if resp.status in (401, 403):
             raise NanoodleError("API key rejected (HTTP %d) — sign in at nano-gpt.com and use a valid key"
                                 % resp.status)
+        try:
+            body = resp.text()
+        except HttpBodyReadError:
+            body = ""
         if resp.status == 402 or _FUNDS_RE.search(body or ""):
             raise NanoodleError("out of balance — this run needs more credit. "
                                 "Top up at nano-gpt.com, then run again.")
@@ -503,32 +508,43 @@ class Engine(object):
             self._raise_http(resp)
         return resp
 
-    def _get(self, path):
-        return self.http("GET", self.base_url + path, headers=self._auth_headers(),
-                         timeout=self._http_timeout_now())
+    def _poll_time_left(self, deadline):
+        remaining = deadline - time.monotonic()
+        self.check_cancel()
+        return remaining
 
-    def _poll_json(self, path):
-        """Retry transport/transient failures; terminate permanent HTTP failures.
-
-        Returning None means retry this status GET, never resubmit the job.
-        HTTP errors must be checked before parsing (even non-JSON 401s), and
-        outside the NanoodleError handler that tolerates connection failures.
-        """
-        try:
-            resp = self._get(path)
-        except NodeCancelled:
-            raise
-        except NanoodleError:
-            return None
-        if not (200 <= resp.status < 300):
-            if 400 <= resp.status < 500 and resp.status not in (408, 409, 425, 429):
-                self._raise_http(resp)
-            return None
-        try:
-            value = json.loads(resp.text())
-        except ValueError:
-            return None
-        return value if isinstance(value, dict) else None
+    def _poll_statuses(self, path, interval, deadline):
+        """Yield status objects until the poll budget is spent or the run is cancelled."""
+        if self._deadline is not None:
+            deadline = min(deadline, self._deadline)
+        url = self.base_url + path
+        while (remaining := self._poll_time_left(deadline)) > 0:
+            self.sleep(min(interval or 0, remaining))
+            remaining = self._poll_time_left(deadline)
+            if remaining <= 0:
+                return
+            timeout = self.http_timeout
+            if deadline != float("inf"):
+                timeout = remaining if timeout is None else min(timeout, remaining)
+            try:
+                resp = self.http("GET", url, headers=self._auth_headers(), timeout=timeout)
+            except NodeCancelled:
+                raise
+            except NanoodleError:
+                continue
+            # A socket timeout can be per read, and custom transports can return late.
+            if self._poll_time_left(deadline) <= 0:
+                return
+            if not (200 <= resp.status < 300):
+                if 400 <= resp.status < 500 and resp.status not in (408, 409, 425, 429):
+                    self._raise_http(resp)
+                continue
+            try:
+                value = json.loads(resp.text())
+            except (ValueError, HttpBodyReadError):
+                continue
+            if isinstance(value, dict) and self._poll_time_left(deadline) > 0:
+                yield value
 
     def fetch_media(self, url, run_bound=False):
         """Download bytes of an https media URL (no auth headers — provider CDNs).
@@ -660,6 +676,20 @@ class Engine(object):
         if usd is None and h_usd is not None:
             usd = h_usd
         return usd, balance
+
+    def _billed_json(self, resp, on_cost, *, usage_cost=False):
+        """Record a billed response once, even if its JSON cannot be decoded."""
+        pricing = None
+        try:
+            body = json.loads(resp.text())
+            pricing = body
+            if usage_cost and isinstance(body, dict) and isinstance(body.get("usage"), dict):
+                cost = body["usage"].get("cost")
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                    pricing = dict(body, cost=cost)
+            return body
+        finally:
+            on_cost(*self._cost_with_headers(pricing, resp))
 
     # ---- progress ----------------------------------------------------------
 
@@ -974,9 +1004,7 @@ def _run_llm(engine, node, inp, on_cost):
         body["response_format"] = {"type": "json_object"}
     if f.get("reasoningEffort") and f["reasoningEffort"] != "default":
         body["reasoning_effort"] = f["reasoningEffort"]
-    resp = engine._post_json(CHAT_ENDPOINT, body)
-    j = json.loads(resp.text())
-    on_cost(*engine._cost_with_headers(j, resp))
+    j = engine._billed_json(engine._post_json(CHAT_ENDPOINT, body), on_cost)
     show = f.get("showThinking") in (True, "true")
     return {"text": _parse_chat_text(j, show_thinking=show)}
 
@@ -989,9 +1017,7 @@ def _run_vision(engine, node, inp, on_cost):
         {"type": "text", "text": q},
         {"type": "image_url", "image_url": {"url": _as_url(inp["image"])}},
     ]}]
-    resp = engine._post_json(CHAT_ENDPOINT, _chat_body(node, messages))
-    j = json.loads(resp.text())
-    on_cost(*engine._cost_with_headers(j, resp))
+    j = engine._billed_json(engine._post_json(CHAT_ENDPOINT, _chat_body(node, messages)), on_cost)
     return {"text": _parse_chat_text(j)}
 
 
@@ -1019,15 +1045,7 @@ def _run_decide(engine, node, inp, on_cost):
     lim = decide_image_limits(di, bool(di))
 
     def send(body):
-        resp = engine._post_json(DECIDE_ENDPOINT, body)
-        j = json.loads(resp.text())
-        usage = j.get("usage") if isinstance(j, dict) else None
-        c = usage.get("cost") if isinstance(usage, dict) else None
-        if isinstance(c, (int, float)) and not isinstance(c, bool):
-            on_cost(*engine._cost_with_headers(dict(j, cost=c), resp))
-        else:
-            on_cost(*engine._cost_with_headers(j, resp))
-        return j
+        return engine._billed_json(engine._post_json(DECIDE_ENDPOINT, body), on_cost, usage_cost=True)
 
     def fit(url, max_dim, budget):
         from .local_media import fit_image_jpeg
@@ -1134,9 +1152,7 @@ def _gen_image(engine, node, on_cost, prompt, n=1, image_data_url=None, mask_dat
             raise NanoodleError("AIR must look like civitai:MODEL@VERSION, runware:id@rev, "
                                 "or persona:MODEL@VERSION")
         body["customCivitaiAir"] = air
-    resp = engine._post_json(IMG_ENDPOINT, body)
-    j = json.loads(resp.text())
-    on_cost(*engine._cost_with_headers(j, resp))
+    j = engine._billed_json(engine._post_json(IMG_ENDPOINT, body), on_cost)
     pairs = []
     for d in (j.get("data") or []):
         if d.get("b64_json"):
@@ -1254,9 +1270,7 @@ def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
         raise NanoodleError(
             "This 3D photo is a bit large (~4 MB max). nanoodle sends it inline rather "
             "than uploading it, so NanoGPT's edge won't accept it. Use a smaller photo.")
-    resp = engine._post_json(VIDEO_SUBMIT, body)
-    j = json.loads(resp.text())
-    on_cost(*engine._cost_with_headers(j, resp))
+    j = engine._billed_json(engine._post_json(VIDEO_SUBMIT, body), on_cost)
     run_id = j.get("runId") or j.get("id")
     if not run_id:
         raise NanoodleError("no runId returned")
@@ -1266,19 +1280,15 @@ def _gen_video(engine, node, on_cost, prompt, extra_body, media_kind=None):
     cap = engine.timeout_video
     if media_kind == "model3d":
         cap = MODEL3D_DEADLINE_S if cap is None else min(cap, MODEL3D_DEADLINE_S)
-    while cap is None or time.monotonic() - t0 < cap:
-        # The run deadline outranks timeout_video. Both checks sit OUTSIDE the
-        # transport helper: cancellation is terminal even during a status GET.
-        engine.check_cancel()
-        engine.sleep(engine.poll_video)   # wakes early on cancel/deadline
-        engine.check_cancel()
-        s = engine._poll_json(VIDEO_STATUS + "?requestId=" + urllib.parse.quote(str(run_id)))
-        if s is None:
-            continue
+    deadline = float("inf") if cap is None else t0 + cap
+    path = VIDEO_STATUS + "?requestId=" + urllib.parse.quote(str(run_id))
+    for s in engine._poll_statuses(path, engine.poll_video, deadline):
         data = s.get("data") if isinstance(s.get("data"), dict) else None
         st = str((data or {}).get("status") or s.get("status") or "").upper()
         engine._progress({"type": "poll", "node_id": node.id, "name": display_name(node),
                           "status": st, "elapsed": time.monotonic() - t0})
+        if engine._poll_time_left(deadline) <= 0:
+            break
         if st in ("COMPLETED", "SUCCEEDED"):
             if media_kind == "model3d":
                 url = _model3d_status_url(s)
@@ -1410,18 +1420,14 @@ def _poll_audio(engine, node, model, submit_json):
         qs["isApiRequest"] = "true" if v is True else ("false" if v is False else str(v))
     query = urllib.parse.urlencode(qs)
     t0 = time.monotonic()
-    while time.monotonic() - t0 < engine.timeout_audio:
-        # The run deadline outranks timeout_audio, including during a status GET.
-        engine.check_cancel()
-        engine.sleep(engine.poll_audio)   # wakes early on cancel/deadline
-        engine.check_cancel()
-        s = engine._poll_json(AUDIO_STATUS + "?" + query)
-        if s is None:
-            continue
+    deadline = t0 + engine.timeout_audio
+    for s in engine._poll_statuses(AUDIO_STATUS + "?" + query, engine.poll_audio, deadline):
         st = str(s.get("status") or "").lower()
         engine._progress({"type": "poll", "node_id": node.id, "name": display_name(node),
                           "status": st, "queue": s.get("queuePosition"),
                           "elapsed": time.monotonic() - t0})
+        if engine._poll_time_left(deadline) <= 0:
+            break
         if st in ("completed", "succeeded"):
             data = s.get("data") if isinstance(s.get("data"), dict) else {}
             url = s.get("audioUrl") or s.get("url") or data.get("audioUrl") or data.get("url")
@@ -1443,8 +1449,7 @@ def _gen_audio(engine, node, on_cost, text, extra):
     resp = engine._post_json(AUDIO_ENDPOINT, body)
     ctype = (resp.header("content-type") or "").lower()
     if "application/json" in ctype:
-        j = json.loads(resp.text())
-        on_cost(*engine._cost_with_headers(j, resp))
+        j = engine._billed_json(resp, on_cost)
         data = j.get("data") if isinstance(j.get("data"), dict) else {}
         url = j.get("url") or j.get("audioUrl") or data.get("url") or data.get("audioUrl")
         if not url and (j.get("runId") or j.get("id")):
@@ -1514,8 +1519,7 @@ def _run_transcribe(engine, node, inp, on_cost):
     resp = engine._paid_send("POST", engine.base_url + TRANSCRIBE_ENDPOINT, headers, body)
     if not (200 <= resp.status < 300):
         engine._raise_http(resp)
-    j = json.loads(resp.text())
-    on_cost(*engine._cost_with_headers(j, resp))
+    j = engine._billed_json(resp, on_cost)
     data_obj = j.get("data") if isinstance(j.get("data"), dict) else {}
     txt = j.get("transcription")
     if txt is None:
