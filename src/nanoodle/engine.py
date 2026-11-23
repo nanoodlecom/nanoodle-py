@@ -1660,8 +1660,11 @@ def _run_vframes(engine, node, inp, on_cost):
     frames = extract_video_frames(
         _media_url(vid),
         count=count,
-        gap=node.fields.get("gap") if node.fields.get("gap") is not None else 0.5,
+        gap=node.fields.get("gap", 0.5),
         dir=node.fields.get("dir") or "end",
+        stride=node.fields.get("stride"),
+        start_sec=node.fields.get("startSec"),
+        end_sec=node.fields.get("endSec"),
         **engine._local_opts())
     return {k: engine._media_ref(v) for k, v in frames.items()}
 

@@ -225,7 +225,7 @@ The record is written BEFORE the callback fires, because the worker thread can b
 Implemented in `src/local-media.mjs` (JS) / `nanoodle/local_media.py` (Py). Behaviour mirrors the browser:
 
 - **resize** — `mode` fit|fill|exact, width/height; fit never upscales; PNG stays PNG else JPEG.
-- **vframes** — `frames` 1–48, `gap` seconds, `dir` end|start; emits `frame1..frameN` JPEG data URLs.
+- **vframes** — `frames` 1–48, `gap` seconds, `dir` end|start. An optional positive integer `stride` selects every Nth displayed frame. Optional `startSec` and `endSec` bound the selection inclusively, measured from the first displayed frame. With any of those fields set, results contain up to the requested number of JPEG data URLs in sampling order as `frame1..frameN`. A range without a stride samples by `gap`. Existing gap-only graphs continue using timestamp seeks.
   - **wiredFramesFloor**: before run (and in `derive_settings` min), raise `fields.frames` up to the highest outbound `frameK` wire (clamped 1..48). Graphs saved with `frames=1` but a wire from `frame3` would otherwise starve the consumer after paid upstream steps.
 - **combine** — clip1../vid1.. inputs (≥2), sorted by port number then name, de-duped; `dedup` drops ~1 frame from subsequent clips; concat → mp4.
 - **soundtrack** — video+audio; `loop` loops audio to fill video length; mux → mp4.
