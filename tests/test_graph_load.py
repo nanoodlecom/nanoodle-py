@@ -67,16 +67,26 @@ class LoaderSemanticsTest(unittest.TestCase):
         }, api_key="k")
         self.assertEqual(wf.graph.links[0].to_port, "text")
 
-    def test_orphaned_links_dropped_and_minimal_form(self):
-        wf = Workflow.from_dict({"nodes": [{"id": "n1", "type": "text", "fields": {}}],
-                                 "links": [{"id": "l1", "from": {"node": "nX", "port": "text"},
-                                            "to": {"node": "n1", "port": "text"}}]}, api_key="k")
-        self.assertEqual(wf.graph.links, [])
+    def test_dangling_links_are_retained_but_do_not_shape_io(self):
+        for role, source, target in (("source", "nX", "n1"), ("target", "n1", "nX")):
+            with self.subTest(role=role):
+                wf = Workflow.from_dict({"nodes": [{"id": "n1", "type": "text", "fields": {}}],
+                                         "links": [{"id": "l1", "from": {"node": source, "port": "text"},
+                                                    "to": {"node": target, "port": "text"}}]}, api_key="k")
+                self.assertEqual([l.id for l in wf.graph.links], ["l1"])
+                self.assertEqual([s.field for s in wf.inputs], ["text"])
+                self.assertEqual([s.node_id for s in wf.outputs], ["n1"])
+                self.assertIn('missing %s node "nX"' % role, wf.warnings[0])
+                with self.assertRaises(NanoodleError) as ctx:
+                    wf.run()
+                self.assertEqual(str(ctx.exception), wf.warnings[0])
+
+    def test_minimal_form(self):
         # {nodes} only (no links/v/nid/lid/view) is a valid save
-        wf2 = Workflow.from_dict({"nodes": [{"id": "n1", "type": "text",
-                                             "fields": {"text": "x"}}]}, api_key="k")
-        self.assertEqual(wf2.graph.node("n1").fields["text"], "x")
-        self.assertEqual(wf2.graph.links, [])
+        wf = Workflow.from_dict({"nodes": [{"id": "n1", "type": "text",
+                                            "fields": {"text": "x"}}]}, api_key="k")
+        self.assertEqual(wf.graph.node("n1").fields["text"], "x")
+        self.assertEqual(wf.graph.links, [])
 
     def test_layout_and_editor_keys_ignored(self):
         wf = Workflow.load(fixture("starter-graph.json"), api_key="k")
@@ -177,6 +187,64 @@ class SourceWireTest(unittest.TestCase):
                 graph = materialize(self._graph("vframes", port))
                 self.assertEqual(len(graph.warnings), 1)
                 self.assertIn("undeclared source port", graph.warnings[0])
+
+
+class TargetWireTest(unittest.TestCase):
+    @staticmethod
+    def _graph(node_type, port):
+        return {"nodes": [
+            {"id": "source", "type": "text", "fields": {"text": "upstream"}},
+            {"id": "sink", "type": node_type, "fields": {"promtp": "typo in stored fields"}},
+        ], "links": [
+            {"id": "wire", "from": {"node": "source", "port": "text"},
+             "to": {"node": "sink", "port": port}},
+        ]}
+
+    def test_unrecognized_targets_fail_even_with_a_matching_stored_field(self):
+        for node_type, port in (("llm", "promtp"), ("llm", "text"), ("llm", "ref1"),
+                                ("decide", "branch"), ("join", None), ("join", [])):
+            with self.subTest(node_type=node_type, port=port):
+                wf = Workflow.from_dict(self._graph(node_type, port), api_key="", http=tripwire_http)
+                self.assertEqual([l.id for l in wf.graph.links], ["wire"])
+                self.assertIn("undeclared target port", wf.warnings[0])
+                events = []
+                with self.assertRaises(NanoodleError) as ctx:
+                    wf.run(on_progress=events.append)
+                self.assertEqual(str(ctx.exception), wf.warnings[0])
+                self.assertEqual(events, [])
+
+    def test_runtime_inputs_and_known_field_overrides_are_structurally_valid(self):
+        targets = {
+            "llm": ("prompt", "system", "model", "img", "img2", "audio"),
+            "edit": ("prompt", "image", "image2"),
+            "decide": ("text", "img2", "question", "options", "levels"),
+            "combine": ("vid1", "clip2"),
+            "tvideo": ("prompt", "ref2"),
+            "ivideo": ("image", "endframe"),
+            "model3d": ("model", "image", "prompt"),
+            "endpoint": ("url", "mode", "model", "system"),
+            "text": ("text",),
+            "choice": ("options", "selected"),
+            "music": ("text", "lyrics", "negative_prompt"),
+            "tts": ("text", "instructions"),
+        }
+        for node_type, ports in targets.items():
+            for port in ports:
+                with self.subTest(node_type=node_type, port=port):
+                    self.assertEqual(materialize(self._graph(node_type, port)).warnings, [])
+
+    def test_browser_only_inputs_report_the_python_runtime_limit(self):
+        for node_type, port in (("llm", "video"), ("vedit", "image"), ("vedit", "ref2")):
+            with self.subTest(node_type=node_type, port=port):
+                media = "video" if port == "video" else "image"
+                graph = self._graph(node_type, port)
+                graph["nodes"][0]["type"] = "vupload" if media == "video" else "upload"
+                graph["links"][0]["from"]["port"] = media
+                wf = Workflow.from_dict(graph, api_key="k", http=tripwire_http)
+                self.assertIn(f'input "{port}", which the Python SDK cannot send', wf.warnings[0])
+                with self.assertRaises(NanoodleError) as ctx:
+                    wf.run()
+                self.assertEqual(str(ctx.exception), wf.warnings[0])
 
 
 class TopoOrderTest(unittest.TestCase):

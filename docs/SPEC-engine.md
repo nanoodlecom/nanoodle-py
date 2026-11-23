@@ -205,10 +205,10 @@ The record is written BEFORE the callback fires, because the worker thread can b
 `Workflow` copies the ledger to `result.payments` and names every unredeemed deposit in the error message of the node that sent it, with one sentence per state: "a Nano deposit was already sent …", "a Nano deposit may have been sent …" (callback still in flight), or "no Nano deposit was sent (payment …): the wallet callback failed — …". So a user who sent XNO gets the payment id and explorer URL even when the run timed out and the worker's `NodeCancelled` went nowhere, and a user whose wallet failed is never told money moved.
 
 ## Execution (runGraph 3000-3133)
-1. Materialize the graph. Normalize aliases, drop orphaned links, and migrate music/tts inbound `text` to `prompt`. Python keeps unknown node types and links from undeclared source ports with inspection warnings, then rejects them before execution. A declared dynamic or optional source port may emit no value in a particular run.
+1. Materialize the graph. Normalize aliases and migrate music/tts inbound `text` to `prompt`. Python keeps unknown node types and wires with missing endpoint nodes, undeclared ports, or browser-only inputs for inspection, then rejects them before execution. A declared dynamic or optional source port may emit no value in a particular run.
 2. Kahn topological order; cyclic → error naming the cyclic nodes.
 3. Concurrency: node starts when ITS deps finish (siblings run concurrently). Library: same semantics (asyncio / Promise per node).
-4. Input resolution per node: for declared ports, value = srcNode.out[from.port]. Dynamic families: img\d+ / image\d*, vid\d+, clip\d+, audio, endframe, ref\d+, frame\d+ (vframes outputs). ANY other inbound link = FIELD OVERRIDE: run with fields = {...fields, [port]: value} (that's how wired prompt/system/lyrics/q override typed values).
+4. Read each wire's value from `srcNode.out[from.port]`. Declared inputs, including node-specific dynamic slots, receive the value in the node's input map. Declared field wires replace typed values for fields such as `prompt`, `system`, `model`, `lyrics`, and `q`.
 5. Node failure: record error for that node, continue independent lanes (library default: collect; raise at end if a sink failed — see DESIGN).
 6. comment nodes never run. Fixed-seed skip-cache: optional for a library (stateless one-shot runs don't need it) — SKIP in v1.
 
