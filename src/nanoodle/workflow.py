@@ -15,8 +15,9 @@ from .branches import plan_branches
 from .decide import DecideGateClosed
 from .endpoint import endpoint_out_port
 from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
-from .graph import (NODE_TYPES, Node, classify_inbound, display_name,
-                    materialize, topo_order, wire_issue, wired_frames_floor)
+from .graph import (NODE_TYPES, Node, classify_inbound, competing_input_issues,
+                    display_name, materialize, topo_order, unconditional_competing_input_issues,
+                    wire_issue, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
 from .media import MEDIA_INLINE_MAX, MediaRef, make_data_url
@@ -358,6 +359,10 @@ class Workflow(object):
             sspec = resolve_setting_key(self.settings, key, graph)
             graph.node(sspec.node_id).fields[sspec.field] = value
 
+        issues = unconditional_competing_input_issues(graph)
+        if issues:
+            raise NanoodleError(issues[0])
+
         # 2. backfill spec defaults into empty fields (play.html run() applies
         #    it.def — e.g. the llm default system prompt), then error on missing
         #    required inputs
@@ -541,6 +546,12 @@ class Workflow(object):
         def exec_node(nid, inbound):
             # Honour deadline before starting (local media especially can be long).
             engine.check_cancel()
+            # A selected branch or source mode may leave a declared output absent.
+            inbound = [link for link in inbound
+                       if (runs[link.from_node].out or {}).get(link.from_port) is not None]
+            issues = competing_input_issues(inbound)
+            if issues:
+                raise NanoodleError(issues[0])
             node = graph.node(nid)
             name = display_name(node)
             worker_progress({"type": "node-start", "node_id": nid, "name": name})
@@ -555,9 +566,6 @@ class Workflow(object):
                 node = copy.deepcopy(node)
                 for port, (src, sport) in overrides.items():
                     v = (runs[src].out or {}).get(sport)
-                    if v is None:
-                        continue  # play.html: if(v!=null) — a null upstream value
-                                  # leaves the typed field value in effect
                     node.fields[port] = v.url if isinstance(v, MediaRef) else v
             # Prompt length caps (see prompt_caps.py). Many image/video models reject an
             # over-long prompt at the route, and in a graph the prompt is WRITTEN by an

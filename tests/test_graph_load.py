@@ -247,6 +247,28 @@ class TargetWireTest(unittest.TestCase):
                 self.assertEqual(str(ctx.exception), wf.warnings[0])
 
 
+class CompetingInputTest(unittest.TestCase):
+    def test_legacy_and_current_prompt_ports_compete_after_migration(self):
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "first", "type": "text", "fields": {"text": "first"}},
+            {"id": "second", "type": "text", "fields": {"text": "second"}},
+            {"id": "sink", "type": "audio", "fields": {"model": "m"}},
+        ], "links": [
+            {"id": "legacy", "from": {"node": "first", "port": "text"},
+             "to": {"node": "sink", "port": "text"}},
+            {"id": "current", "from": {"node": "second", "port": "text"},
+             "to": {"node": "sink", "port": "prompt"}},
+        ]}, api_key="k", http=tripwire_http)
+        self.assertEqual([(l.id, l.to_port) for l in wf.graph.links],
+                         [("legacy", "prompt"), ("current", "prompt")])
+        issue = ("input sink.prompt has competing wires from first.text, second.text. "
+                 "Leave one active wire for this input.")
+        self.assertEqual(wf.warnings, [issue])
+        with self.assertRaises(NanoodleError) as ctx:
+            wf.run()
+        self.assertEqual(str(ctx.exception), issue)
+
+
 class TopoOrderTest(unittest.TestCase):
     def test_topo_order_respects_deps(self):
         wf = Workflow.load(fixture("starter-graph.json"), api_key="k")

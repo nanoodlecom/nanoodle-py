@@ -246,6 +246,45 @@ class RunCliTest(MockedTest):
         img = self.mock.requests_to("/v1/images/generations")[0]
         self.assertEqual(img.json["size"], "2k")
 
+    def test_competing_prompt_wires_fail_before_paid_work_in_either_order(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
+        data = {"nodes": [
+            {"id": "first", "type": "text", "fields": {"text": "first"}},
+            {"id": "second", "type": "text", "fields": {"text": "second"}},
+            {"id": "sink", "type": "llm", "fields": {"model": "m", "prompt": "stored fallback"}},
+        ]}
+        left = {"id": "left", "from": {"node": "first", "port": "text"},
+                "to": {"node": "sink", "port": "prompt"}}
+        right = {"id": "right", "from": {"node": "second", "port": "text"},
+                 "to": {"node": "sink", "port": "prompt"}}
+        issue = ("input sink.prompt has competing wires from first.text, second.text. "
+                 "Leave one active wire for this input.")
+        with tempfile.TemporaryDirectory() as d:
+            saved = Path(d) / "graph.json"
+            argv = ["run", str(saved), "--api-key", "cli-key",
+                    "--base-url", self.mock.base_url, "--json"]
+            for links in ([left, right], [right, left]):
+                data["links"] = links
+                saved.write_text(json.dumps(data), encoding="utf-8")
+                code, _, err = run_cli(["inspect", str(saved)])
+                self.assertEqual(code, 0)
+                self.assertIn(issue, err)
+                code, out, err = run_cli(argv)
+                self.assertEqual(code, 1)
+                self.assertIn(issue, err)
+                result = json.loads(out)
+                self.assertEqual(result["errors"][0]["message"], issue)
+                self.assertEqual(result["nodes"], {})
+                self.assertEqual(result["costUsd"], 0.0)
+                self.assertEqual(self.mock.requests, [])
+
+            data["links"] = [left, dict(left, id="copy")]
+            saved.write_text(json.dumps(data), encoding="utf-8")
+            code, out, err = run_cli(argv)
+        self.assertEqual(code, 0, err or out)
+        req, = self.mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual(req.json["messages"][-1]["content"], "first")
+
     def test_run_out_dir_saves_media(self):
         self._script_ok()
         with tempfile.TemporaryDirectory() as d:

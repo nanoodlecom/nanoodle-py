@@ -11,6 +11,61 @@ FIXTURE = Path(__file__).parent / "fixtures" / "decider-branches.json"
 
 
 class BranchTest(MockedTest):
+    def test_mutually_exclusive_branches_share_a_prompt_input(self):
+        self.mock.script("POST", "/api/v1/decisions", [
+            decision({"type": "noul", "noul": 1}, 0.001),
+            decision({"type": "noul", "noul": 0}, 0.001),
+        ])
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
+        wf = self.wf_dict({"nodes": [
+            {"id": "route", "type": "decide-branch", "fields": {"model": "m", "question": "Use yes?"}},
+            {"id": "yes", "type": "choice", "fields": {"options": "yes prompt"}},
+            {"id": "no", "type": "choice", "fields": {"options": "no prompt"}},
+            {"id": "sink", "type": "llm", "fields": {"model": "m"}},
+        ], "links": [
+            {"from": {"node": "route", "port": branch}, "to": {"node": branch, "port": "selected"}}
+            for branch in ("yes", "no")
+        ] + [
+            {"from": {"node": branch, "port": "text"}, "to": {"node": "sink", "port": "prompt"}}
+            for branch in ("yes", "no")
+        ]})
+        self.assertEqual(wf.warnings, [])
+        for closed in ("no", "yes"):
+            result = wf.run()
+            self.assertEqual(result.nodes[closed].skip_reason, "branch")
+        requests = self.mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual([req.json["messages"][-1]["content"] for req in requests],
+                         ["yes prompt", "no prompt"])
+
+    def test_legacy_gate_defers_conflict_until_consumer_is_active(self):
+        self.mock.script("POST", "/api/v1/decisions", [
+            decision({"type": "noul", "noul": 0}, 0.001),
+            decision({"type": "noul", "noul": 1}, 0.001),
+        ])
+        wf = self.wf_dict({"nodes": [
+            {"id": "gate", "type": "decide", "fields": {
+                "model": "m", "question": "Proceed?", "mode": "yesno", "gate": True,
+            }},
+            {"id": "first", "type": "text", "fields": {"text": "first"}},
+            {"id": "second", "type": "text", "fields": {"text": "second"}},
+            {"id": "sink", "type": "llm", "fields": {"model": "m"}},
+        ], "links": [
+            {"from": {"node": "gate", "port": "text"}, "to": {"node": "sink", "port": "system"}},
+            {"from": {"node": "first", "port": "text"}, "to": {"node": "sink", "port": "prompt"}},
+            {"from": {"node": "second", "port": "text"}, "to": {"node": "sink", "port": "prompt"}},
+        ]})
+        self.assertEqual(wf.warnings, [])
+        self.assertEqual(wf.run().nodes["sink"].gated_by, "gate")
+        with self.assertRaises(RunError) as ctx:
+            wf.run()
+        result = ctx.exception.result
+        self.assertEqual(result.nodes["sink"].error,
+                         "input sink.prompt has competing wires from first.text, second.text. "
+                         "Leave one active wire for this input.")
+        self.assertAlmostEqual(result.cost_usd, 0.001)
+        self.assertEqual(len(self.mock.requests_to("/api/v1/decisions")), 2)
+        self.assertEqual(self.mock.requests_to("/api/v1/chat/completions"), [])
+
     def test_conditional_graph_and_retry(self):
         graph = json.loads(FIXTURE.read_text())
         cases = graph.pop("cases")
