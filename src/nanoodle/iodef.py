@@ -250,7 +250,13 @@ def _assign_input_keys(inputs):
     per_node = {}
     for spec in inputs:
         per_node.setdefault(spec.node_id, []).append(spec)
-    used = {}
+    reserved = {}
+    for spec in inputs:
+        owner = (spec.node_id, spec.field)
+        _reserve_key(reserved, f"{spec.node_id}.{spec.field}", owner)
+        if len(per_node[spec.node_id]) == 1:
+            _reserve_key(reserved, spec.node_id, owner)
+    used = set()
     for spec in inputs:
         node_inputs = per_node[spec.node_id]
         required = [s for s in node_inputs if not s.optional]
@@ -260,10 +266,26 @@ def _assign_input_keys(inputs):
             cand = spec.node_name
         else:
             cand = spec.label
-        low = cand.strip().lower()
-        count = used.get(low, 0) + 1
-        used[low] = count
-        spec.key = cand if count == 1 else "%s %d" % (cand, count)
+        spec.key = _unique_key(cand, used, reserved, (spec.node_id, spec.field))
+
+
+def _reserve_key(reserved, key, owner):
+    key = _norm(key)
+    # If multiple canonical addresses fold to the same key, no friendly
+    # alias should claim it. The exact canonical spellings remain useful.
+    reserved[key] = owner if reserved.get(key, owner) == owner else None
+
+
+def _unique_key(base, used, reserved, owner):
+    key = base
+    normalized = _norm(key)
+    suffix = 2
+    while normalized in used or reserved.get(normalized, owner) != owner:
+        key = f"{base} {suffix}"
+        normalized = _norm(key)
+        suffix += 1
+    used.add(normalized)
+    return key
 
 
 def derive_outputs(graph):
@@ -279,12 +301,13 @@ def derive_outputs(graph):
         if graph.outbound(nid):
             continue
         sinks.append(node)
-    used = {}
+    reserved = {}
+    for node in sinks:
+        _reserve_key(reserved, node.id, node.id)
+    used = set()
     out = []
     for node in sinks:
-        base = display_name(node)
-        used[base] = used.get(base, 0) + 1
-        key = base if used[base] == 1 else "%s %d" % (base, used[base])
+        key = _unique_key(display_name(node), used, reserved, node.id)
         ports = [p for (p, _kind) in NODE_TYPES.get(node.type, {}).get("outputs", [])]
         if node.type == "endpoint":
             from .endpoint import endpoint_out_port
@@ -339,8 +362,8 @@ def _norm(s):
 def resolve_input_key(inputs, key, graph):
     """Resolution order (case-insensitive, trimmed):
     1. the input's assigned key (the very name wf.inputs advertises)
-    2. exact node custom name (node has exactly one derived input -> it; else ambiguous)
-    3. "nodeId.field", and bare nodeId when the node has a single input
+    2. "nodeId.field", and bare nodeId when the node has a single input
+    3. exact node custom name (node has exactly one derived input -> it; else ambiguous)
     4. the input's label / field name when unique across inputs
     """
     k = _norm(key)
@@ -350,40 +373,35 @@ def resolve_input_key(inputs, key, graph):
     by_key = [s for s in inputs if _norm(s.key) == k]
     if len(by_key) == 1:
         return by_key[0]
-    # 2. custom node name
+    # 2. A friendly label cannot shadow a canonical address. Match the whole
+    # qualified address so node IDs containing a dot work as well.
+    spelling = str(key).strip()
+    for address in (lambda s: f"{s.node_id}.{s.field}", lambda s: s.node_id):
+        hits = [s for s in inputs if _norm(address(s)) == k]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            exact = [s for s in hits if address(s) == spelling]
+            if len(exact) == 1:
+                return exact[0]
+            raise NanoodleError(
+                "input name %r is ambiguous — use one of: %s"
+                % (key, ", ".join("%s.%s" % (s.node_id, s.field) for s in hits)))
+    # 3. custom node name
     named = [s for s in inputs if s.node_name and _norm(s.node_name) == k]
     if named:
         if len(named) == 1:
             return named[0]
-        # Several inputs share the node name (e.g. llm prompt + optional system).
-        # Prefer the input whose ASSIGNED key is exactly this name (the PR #138
-        # flat-label input), then the node's single required input, before
-        # declaring ambiguity — otherwise the very key wf.inputs advertises
-        # would be unresolvable.
-        exact = [s for s in named if _norm(s.key) == k]
-        if len(exact) == 1:
-            return exact[0]
+        # Several inputs can share a node name (e.g. a prompt and an optional
+        # system message). Its sole required input is still a useful fallback.
         required = [s for s in named if not s.optional]
         if len(required) == 1:
             return required[0]
         raise NanoodleError(
             "input name %r is ambiguous — use one of: %s"
             % (key, ", ".join("%s.%s" % (s.node_id, s.field) for s in named)))
-    # 3. nodeId.field / bare nodeId
-    if "." in k:
-        nid, _, fld = k.partition(".")
-        hit = [s for s in inputs if _norm(s.node_id) == nid and _norm(s.field) == fld]
-        if len(hit) == 1:
-            return hit[0]
-    by_node = [s for s in inputs if _norm(s.node_id) == k]
-    if len(by_node) == 1:
-        return by_node[0]
-    if len(by_node) > 1:
-        raise NanoodleError(
-            "input name %r is ambiguous — use one of: %s"
-            % (key, ", ".join("%s.%s" % (s.node_id, s.field) for s in by_node)))
-    # 4. key / label / field name when unique
-    for attr in ("key", "label", "field"):
+    # 4. label / field name when unique
+    for attr in ("label", "field"):
         hit = [s for s in inputs if _norm(getattr(s, attr)) == k]
         if len(hit) == 1:
             return hit[0]

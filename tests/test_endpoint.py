@@ -127,6 +127,32 @@ class EndpointRunTest(MockedTest):
         self.assertIn("no such route", str(ctx.exception))
         self.assertIn("check the custom endpoint URL", str(ctx.exception))
 
+    def test_choice_mode_publishes_the_resolved_terminal_port(self):
+        self.mock.script("POST", "/convert", [
+            {"status": 200, "json": {"url": "https://cdn.test/out.mp4"}},
+            {"status": 200, "json": {"data": [{"url": "https://cdn.test/out.png"}]}},
+            chat_response("converted"),
+        ])
+        wf = self.wf_dict({"nodes": [
+            {"id": "ch", "type": "choice", "name": "Format", "fields": {"options": "chat\nvideo\nimage"}},
+            {"id": "e", "type": "endpoint", "name": "Output", "fields": {
+                "url": self.mock.base_url + "/convert", "mode": "chat", "prompt": "hi",
+            }},
+        ], "links": [
+            {"id": "l", "from": {"node": "ch", "port": "text"}, "to": {"node": "e", "port": "mode"}},
+        ]}, api_key="", **FAST)
+
+        for mode, url in (("video", "https://cdn.test/out.mp4"), ("image", "https://cdn.test/out.png")):
+            with self.subTest(mode=mode):
+                result = wf.run({"Format": mode})
+                self.assertEqual(result.nodes["e"].status, "done")
+                self.assertIs(result["Output"], result.nodes["e"].out[mode])
+                self.assertIs(result["e"], result["Output"])
+                self.assertIsInstance(result["Output"], MediaRef)
+                self.assertEqual(result["Output"].url, url)
+        self.assertEqual(wf.run({"Format": "chat"})["Output"], "converted")
+        self.assertEqual(wf.outputs[0].ports, ["text"])
+
     def test_audio_binary_and_json_mode(self):
         self.mock.script("POST", "/wav", binary_response(b"ID3fake", mime="audio/mpeg"))
         wf = self.wf_dict({"nodes": [

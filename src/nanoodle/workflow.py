@@ -13,6 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, wait
 from .engine import Engine, disclose as _disclose
 from .branches import plan_branches
 from .decide import DecideGateClosed
+from .endpoint import endpoint_out_port
 from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, display_name,
                     materialize, topo_order, wired_frames_floor)
@@ -740,11 +741,14 @@ class Workflow(object):
                 gated_outputs[str(ospec.node_id).strip().lower()] = gname
                 continue   # a gate said no: not a failure, just no value
             if run is not None and (run.status == "done" or (run.status == "gated" and run.out)):
-                # ports[0] is the primary. Endpoint's port follows its mode
-                # (text / image / video / audio); vframes' first port is frame1.
+                # ports[0] is normally the primary. A Custom Endpoint can
+                # resolve another mode from its inputs after the run starts.
                 primary = (ospec.ports[0] if ospec.ports
                            else NODE_TYPES[ospec.type]["outputs"][0][0])
-                value = (run.out or {}).get(primary)
+                out = run.out or {}
+                if ospec.type == "endpoint":
+                    primary = endpoint_out_port(graph.node(ospec.node_id), emitted=out)[0]
+                value = out.get(primary)
                 outputs[ospec.key] = value
                 outputs[ospec.node_id] = value
             else:
