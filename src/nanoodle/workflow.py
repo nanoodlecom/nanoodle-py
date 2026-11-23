@@ -180,15 +180,16 @@ class RunResult(object):
     def __getitem__(self, key):
         if key in self.outputs:
             return self.outputs[key]
+        normalized = str(key).strip().lower()
         for k in self.outputs:
-            if k.strip().lower() == str(key).strip().lower():
+            if str(k).strip().lower() == normalized:
                 return self.outputs[k]
-        gate = self._gated_outputs.get(str(key).strip().lower())
+        gate = self._gated_outputs.get(normalized)
         if gate is not None:
             raise GatedOutputError(
                 "output %r was skipped — the gate %r answered no, so it never ran "
                 "(see result.gated)" % (key, gate))
-        raise KeyError("no output %r — available: %s" % (key, ", ".join(sorted(self.outputs))))
+        raise KeyError("no output %r — available: %s" % (key, ", ".join(sorted(map(str, self.outputs)))))
 
     def get(self, key, default=None):
         try:
@@ -201,7 +202,7 @@ class RunResult(object):
 
     def __repr__(self):
         return "RunResult(outputs=%r, cost_usd=%r, errors=%d)" % (
-            sorted(self.outputs), self.cost_usd, len(self.errors))
+            sorted(self.outputs, key=str), self.cost_usd, len(self.errors))
 
 
 _MISSING = object()

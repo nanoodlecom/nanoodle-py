@@ -4,7 +4,7 @@ key-resolution order incl. ambiguity errors (SPEC-io)."""
 import unittest
 
 from tests import fixture
-from tests._util import MockedTest
+from tests._util import MockedTest, tripwire_http
 from tests.harness import MockNanoGPT, chat_response
 
 from nanoodle import NanoodleError, Workflow
@@ -233,6 +233,22 @@ class OutputDerivationTest(unittest.TestCase):
         wf = Workflow.load(fixture("duplicate-names.json"), api_key="k")
         self.assertEqual([o.key for o in wf.outputs], ["Writer", "Writer 2"])
         self.assertEqual([o.node_id for o in wf.outputs], ["n3", "n4"])
+
+    def test_numeric_node_ids_allow_normalized_output_lookup_and_missing_keys(self):
+        wf = Workflow.from_dict({"nodes": [
+            {"id": 7, "type": "text", "name": "Numeric", "fields": {"text": "first"}},
+            {"id": "second", "type": "text", "name": "Other", "fields": {"text": "second"}},
+        ]}, api_key="", http=tripwire_http)
+        result = wf.run()
+        self.assertIn(7, result.outputs)
+        self.assertEqual(result[7], "first")
+        self.assertEqual(result["7"], "first")
+        self.assertEqual(result[" OTHER "], "second")
+        self.assertEqual(result.get("missing", "fallback"), "fallback")
+        self.assertNotIn("missing", result)
+        with self.assertRaisesRegex(KeyError, "available: 7, Numeric, Other, second"):
+            result["missing"]
+        self.assertIn("outputs=[7, 'Numeric', 'Other', 'second']", repr(result))
 
     def test_authored_suffixes_and_case_variants_stay_addressable(self):
         wf = Workflow.from_dict({"nodes": [
