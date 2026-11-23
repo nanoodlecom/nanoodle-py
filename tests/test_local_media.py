@@ -13,6 +13,7 @@ import unittest
 from PIL import Image
 
 from tests import fixture
+from tests._util import tripwire_http
 
 from nanoodle import MediaRef, NanoodleError, RunError, Workflow, media_from_file
 from nanoodle.local_media import extract_video_frames, resize_plan
@@ -188,6 +189,27 @@ class VframesNodeTest(unittest.TestCase):
         self.assertTrue(thumb.url.startswith("data:image/"))
         self.assertGreater(len(thumb.bytes()), 20)
 
+    @skip_no_ffmpeg
+    def test_wired_count_respects_frame_floor_and_higher_values(self):
+        video = media_from_file(MEDIA("clipA.mp4"))
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "video", "type": "vupload"},
+            {"id": "count", "type": "text", "fields": {"text": "1"}},
+            {"id": "frames", "type": "vframes", "fields": {"frames": "1", "dir": "start", "gap": "0.04"}},
+            {"id": "thumb", "type": "resize", "fields": {"width": "16", "height": "16"}},
+        ], "links": [
+            {"from": {"node": "video", "port": "video"}, "to": {"node": "frames", "port": "video"}},
+            {"from": {"node": "count", "port": "text"}, "to": {"node": "frames", "port": "frames"}},
+            {"from": {"node": "frames", "port": "frame3"}, "to": {"node": "thumb", "port": "image"}},
+        ]}, api_key="", http=tripwire_http)
+
+        for value, count in (("1", 3), ("5", 5), ("invalid", 3)):
+            with self.subTest(value=value):
+                result = wf.run({"Video": video, "count.text": value})
+                self.assertEqual(list(result.nodes["frames"].out), [f"frame{i}" for i in range(1, count + 1)])
+                self.assertIsInstance(result["thumb"], MediaRef)
+        self.assertEqual(wf.graph.node("frames").fields["frames"], "1")
+
 
 @unittest.skipUnless(HAS_FFMPEG and shutil.which("ffprobe"), "ffmpeg and ffprobe not on PATH")
 class IndexedVframesTest(unittest.TestCase):
@@ -267,12 +289,16 @@ class IndexedVframesTest(unittest.TestCase):
         self.assertEqual(settings["startSec"].default, "0.071")
         self.assertEqual(settings["endSec"].default, "0.21")
 
-        graph["nodes"].append({"id": "r", "type": "resize", "fields": {"width": "16"}})
-        graph["links"].append({
-            "from": {"node": "f", "port": "frame3"}, "to": {"node": "r", "port": "image"},
-        })
+        graph["nodes"].extend([
+            {"id": "r", "type": "resize", "fields": {"width": "16"}},
+            {"id": "count", "type": "text", "fields": {"text": "1"}},
+        ])
+        graph["links"].extend([
+            {"from": {"node": "f", "port": "frame3"}, "to": {"node": "r", "port": "image"}},
+            {"from": {"node": "count", "port": "text"}, "to": {"node": "f", "port": "frames"}},
+        ])
         with self.assertRaisesRegex(RunError, "no image input") as error:
-            Workflow.from_dict(graph).run({"Video": self.cfr})
+            Workflow.from_dict(graph, api_key="", http=tripwire_http).run({"Video": self.cfr})
         self.assert_indices(error.exception.result.nodes["f"].out, [2, 4])
 
     def test_invalid_and_empty_ranges_fail(self):

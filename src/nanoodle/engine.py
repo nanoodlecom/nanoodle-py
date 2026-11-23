@@ -1651,8 +1651,8 @@ def _run_vframes(engine, node, inp, on_cost):
     vid = inp.get("video")
     if not vid:
         raise NanoodleError("no video input")
-    # fields.frames is already raised to wired_frames_floor by Workflow.run;
-    # re-clamp here so a direct engine.run_node call stays safe too.
+    # The workflow raises the effective count after resolving wires.
+    # Keep direct engine calls within the supported range too.
     try:
         count = max(1, min(MAX_FRAMES, int(node.fields.get("frames") or 1)))
     except (TypeError, ValueError):
