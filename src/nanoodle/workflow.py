@@ -318,10 +318,13 @@ class Workflow(object):
     # ---- run ----------------------------------------------------------------
 
     def run(self, inputs=None, settings=None, timeout=None, on_progress=None):
-        if timeout is not None and (isinstance(timeout, bool)
-                or not isinstance(timeout, (int, float))
-                or not math.isfinite(timeout) or timeout < 0):
-            raise NanoodleError("timeout must be a finite non-negative number of seconds or None")
+        if timeout is not None:
+            if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                    or not 0 <= timeout < math.inf):
+                raise NanoodleError("timeout must be a finite non-negative number of seconds or None")
+            if timeout > threading.TIMEOUT_MAX:
+                raise NanoodleError("timeout cannot exceed %s seconds on this platform"
+                                    % threading.TIMEOUT_MAX)
         graph = self._copy_graph()
 
         # Network nodes force the ~4 MB MEDIA_INLINE_MAX guard on user media
@@ -660,7 +663,8 @@ class Workflow(object):
                     continue
                 remaining = None
                 if deadline is not None:
-                    remaining = max(0.0, deadline - time.monotonic())
+                    # Absolute deadline arithmetic can round the initial wait up.
+                    remaining = min(timeout, max(0.0, deadline - time.monotonic()))
                 done, _ = wait(list(pending.keys()), timeout=remaining,
                                return_when=FIRST_COMPLETED)
                 if not done:

@@ -26,9 +26,9 @@ import time
 import unittest
 
 from tests._util import MockedTest
-from tests.harness import video_status
+from tests.harness import chat_response, video_status
 
-from nanoodle import RunError
+from nanoodle import NanoodleError, RunError
 from nanoodle.__main__ import main
 
 # Generous enough for a loaded CI box, tight enough that a 30 s (let alone
@@ -61,6 +61,58 @@ def _reap(pid):
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
+
+
+class OverallTimeoutRangeTest(MockedTest):
+    graph = {"nodes": [{"id": "chat", "type": "llm",
+                       "fields": {"model": "fixture", "prompt": "hello"}}]}
+
+    def setUp(self):
+        super().setUp()
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("fixture reply"))
+
+    def test_sdk_rejects_timeouts_that_exceed_the_platform_limit(self):
+        wf = self.wf_dict(self.graph)
+        for name, timeout in (("above limit", threading.TIMEOUT_MAX + 1),
+                              ("huge float", 1e300), ("huge int", 10 ** 1000)):
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(NanoodleError, "timeout cannot exceed .* seconds"):
+                    wf.run(timeout=timeout)
+                self.assertEqual(self.mock.requests, [])
+
+    def test_supported_timeouts_keep_zero_and_no_deadline_semantics(self):
+        wf = self.wf_dict(self.graph)
+        with self.assertRaisesRegex(RunError, "run timed out after 0s"):
+            wf.run(timeout=0)
+        self.assertEqual(self.mock.requests, [])
+
+        for timeout in (None, 10, threading.TIMEOUT_MAX):
+            with self.subTest(timeout=timeout):
+                self.assertEqual(wf.run(timeout=timeout)["LLM"], "fixture reply")
+        self.assertEqual(len(self.mock.requests), 3)
+
+    def test_cli_extreme_timeout_returns_preflight_json_without_provider_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            graph_path = os.path.join(directory, "graph.json")
+            with open(graph_path, "w", encoding="utf-8") as graph_file:
+                json.dump(self.graph, graph_file)
+            proc = subprocess.run([
+                sys.executable, "-m", "nanoodle", "run", graph_path,
+                "--base-url", self.mock.base_url, "--api-key", "fixture-key",
+                "--timeout", "1e300", "--json",
+            ], cwd=_REPO_ROOT, env={**os.environ, "PYTHONPATH": os.path.join(_REPO_ROOT, "src")},
+                capture_output=True, text=True, timeout=EXIT_BOUND)
+
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("timeout cannot exceed", proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["nodes"], {})
+        self.assertEqual(payload["outputs"], {"LLM": None})
+        self.assertEqual(payload["costUsd"], 0.0)
+        self.assertEqual(payload["payments"], [])
+        self.assertIsNone(payload["errors"][0]["node_id"])
+        self.assertIn("timeout cannot exceed", payload["errors"][0]["message"])
+        self.assertEqual(self.mock.requests, [])
 
 
 class AbandonedWorkerTest(MockedTest):
