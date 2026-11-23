@@ -226,7 +226,7 @@ Implemented in `src/local-media.mjs` (JS) / `nanoodle/local_media.py` (Py). Beha
 
 - **resize** — `mode` fit|fill|exact, width/height; fit never upscales; PNG stays PNG else JPEG.
 - **vframes** — `frames` 1–48, `gap` seconds, `dir` end|start; emits `frame1..frameN` JPEG data URLs.
-  - **wiredFramesFloor**: before run (and in `derive_settings` min), raise `fields.frames` up to the highest outbound `frameK` wire (clamped 1..12). Graphs saved with `frames=1` but a wire from `frame3` would otherwise starve the consumer after paid upstream steps.
+  - **wiredFramesFloor**: before run (and in `derive_settings` min), raise `fields.frames` up to the highest outbound `frameK` wire (clamped 1..48). Graphs saved with `frames=1` but a wire from `frame3` would otherwise starve the consumer after paid upstream steps.
 - **combine** — clip1../vid1.. inputs (≥2), sorted by port number then name, de-duped; `dedup` drops ~1 frame from subsequent clips; concat → mp4.
 - **soundtrack** — video+audio; `loop` loops audio to fill video length; mux → mp4.
 - **trim** — audio → mono WAV @ 16 kHz; `start` + `length` (default 30s when blank).
