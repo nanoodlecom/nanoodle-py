@@ -482,7 +482,17 @@ class Workflow(object):
                 except Exception:
                     pass
 
-        engine = self._make_engine(progress)
+        def worker_progress(evt):
+            if not on_progress:
+                return
+            with lock:
+                if reports_closed or engine.cancelled():
+                    return
+            # An admitted callback can block. Never hold the reporting lock
+            # while it runs, so the scheduler can still time out and return.
+            progress(evt)
+
+        engine = self._make_engine(worker_progress)
         engine.catalog = self.catalog
         engine.set_run_deadline(deadline, timeout)
         gated = []   # closed ⚖️ Decide gates: [{node_id, name, message, yes, skipped}]
@@ -525,7 +535,8 @@ class Workflow(object):
             engine.check_cancel()
             node = graph.node(nid)
             name = display_name(node)
-            progress({"type": "node-start", "node_id": nid, "name": name})
+            worker_progress({"type": "node-start", "node_id": nid, "name": name})
+            engine.check_cancel()
             t0 = time.monotonic()
             inputs, overrides = classify_inbound(node, inbound)
             inp = {}
@@ -555,9 +566,11 @@ class Workflow(object):
                 record = {"node_id": nid, "name": name, "from": trimmed["from"],
                           "to": trimmed["to"], "cap": trimmed["cap"]}
                 with lock:
+                    engine.check_cancel()
                     if not reports_closed:
                         prompt_trims.append(record)
-                progress(dict(record, type="prompt-trimmed"))
+                worker_progress(dict(record, type="prompt-trimmed"))
+                engine.check_cancel()
                 _disclose(
                     "node %s: prompt trimmed %d -> %d characters — %s rejects prompts over %d"
                     % (nid, trimmed["from"], trimmed["to"],

@@ -224,6 +224,64 @@ class RunLifecycleTest(unittest.TestCase):
             finally:
                 release.set()
 
+    def test_timeout_closes_worker_progress_without_joining_a_blocked_worker(self):
+        for source in ("node-start", "engine"):
+            with self.subTest(source=source):
+                entered = threading.Event()
+                release = threading.Event()
+                workers, events = [], []
+                http = mock.Mock()
+                original = Engine.run_node
+
+                def pause_worker():
+                    workers.append(threading.current_thread())
+                    entered.set()
+                    release.wait(5)
+
+                def watch(event):
+                    events.append(event["type"])
+                    if source == "node-start" and event["type"] == "node-start":
+                        pause_worker()
+
+                def run_node(engine, node, inputs, on_cost):
+                    if source == "engine":
+                        pause_worker()
+                        engine._progress({"type": "poll", "node_id": node.id, "status": "pending"})
+                        return {"text": "late"}
+                    return original(engine, node, inputs, on_cost)
+
+                def expire(futures, **_):
+                    self.assertTrue(entered.wait(4), "worker did not reach the controlled pause")
+                    return set(), set(futures)
+
+                if source == "node-start":
+                    wf = Workflow.from_dict({"nodes": [
+                        {"id": "n", "type": "image", "fields": {
+                            "model": "step-image-edit-2",
+                            "prompt": "A night city reflected in rain. " * 60,
+                        }},
+                    ]}, api_key="k", http=http)
+                else:
+                    wf = workflow(http=http)
+
+                with mock.patch("nanoodle.workflow.wait", side_effect=expire), \
+                     mock.patch.object(Engine, "run_node", run_node), \
+                     mock.patch("nanoodle.workflow._disclose") as disclose:
+                    try:
+                        with self.assertRaisesRegex(RunError, "run timed out") as ctx:
+                            wf.run(timeout=30, on_progress=watch)
+                        self.assertTrue(workers[0].is_alive(), "timeout joined the blocked worker")
+                        self.assertEqual(ctx.exception.result.prompt_trims, [])
+                    finally:
+                        release.set()
+                        for worker in workers:
+                            worker.join(4)
+                    self.assertFalse(workers[0].is_alive())
+                    self.assertEqual(events, ["node-start", "node-error"])
+                    self.assertEqual(ctx.exception.result.prompt_trims, [])
+                    disclose.assert_not_called()
+                    http.assert_not_called()
+
     def test_interrupt_cancels_inflight_workers_without_joining_them(self):
         entered = threading.Event()
         finished = threading.Event()

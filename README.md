@@ -339,9 +339,10 @@ is named in the node's error message too — including when a `timeout=` abandon
 the node that sent it, and when the paid call itself answered an error. `status`
 records the callback outcome: `sent` means your callback returned, `failed` means it raised,
 and `sending` means it had not returned when the result was captured. A raised callback
-may already have broadcast a deposit; verify the payment ID before paying again. A settled deposit
-always gets its request: the run deadline never cancels the one call the user
-has already paid for. The CLI reports the same list as `payments` in its `--json`
+may already have broadcast a deposit. Verify the payment ID before paying again.
+A settlement-only confirmation authorizes one request with the original payment ID,
+even if the run deadline has passed. If completion is unreadable, the node's error
+keeps the original payment ID and status link for recovery. The CLI reports the same list as `payments` in its `--json`
 output, so an agent caller never has to re-derive a payment id from stderr.
 
 Copy-paste scripts (CLI, print callback, wallet stub):

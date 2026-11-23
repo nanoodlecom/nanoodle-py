@@ -12,13 +12,14 @@ from tests import fixture
 
 from nanoodle import NanoodleError, RunError, Workflow
 from nanoodle.engine import Engine
-from nanoodle.transport import HttpResponse
+from nanoodle.transport import HttpBodyReadError, HttpResponse
 from nanoodle.x402 import assert_payment_option, looks_like_result, parse_nano_invoice
 
 with open(fixture("x402/402.json"), "r", encoding="utf-8") as f:
     FIXTURE_402 = json.load(f)
 
 BASE = "https://nano-gpt.com"
+PAYMENT_ID = parse_nano_invoice(FIXTURE_402, BASE)["paymentId"]
 CHAT_OK = {"choices": [{"message": {"content": "paid hello"}}], "cost": 0.0001}
 
 
@@ -79,8 +80,123 @@ class ParseInvoiceTest(unittest.TestCase):
     def test_looks_like_result(self):
         self.assertTrue(looks_like_result(CHAT_OK))
         self.assertTrue(looks_like_result({"data": [{"b64_json": "x"}]}))
-        self.assertFalse(looks_like_result({"status": "completed", "paymentId": "pay_x"}))
+        self.assertTrue(looks_like_result({"answers": {"answer": {"noul": 0.9}}, "usage": {"cost": 0.002}}))
+        self.assertFalse(looks_like_result({"status": "completed", "paymentId": PAYMENT_ID}))
         self.assertFalse(looks_like_result(None))
+
+
+class CompletionResponseTest(unittest.TestCase):
+    def workflow(self, completion, kind="tts"):
+        self.invoices = []
+        self.requests = []
+
+        def http(method, url, headers=None, body=None, timeout=None):
+            self.requests.append((method, url, headers))
+            if url == BASE + "/api/x402/complete/" + PAYMENT_ID:
+                return completion
+            return json_resp(402, fresh_402())
+
+        fields = {"model": "fixture", "prompt": "hello"}
+        if kind == "decide":
+            fields.update(mode="yesno", question="Was the response replayed?")
+        return Workflow.from_dict({"nodes": [{"id": "n1", "type": kind, "fields": fields}]},
+                                  api_key="", base_url=BASE, http=http, payment=self.invoices.append)
+
+    def assert_completed_once(self, path):
+        self.assertEqual([inv["paymentId"] for inv in self.invoices], [PAYMENT_ID])
+        self.assertEqual([(method, url) for method, url, _ in self.requests], [
+            ("POST", BASE + path), ("POST", BASE + "/api/x402/complete/" + PAYMENT_ID),
+        ])
+        self.assertNotIn("x-x402-payment-id", self.requests[0][2])
+
+    def test_paid_tts_keeps_binary_replay_and_billing_without_repost(self):
+        audio = b"ID3\x04\x00\x00\xff\xfb\x90\x64"
+        for mime in ("Audio/MPEG; charset=binary", "application/octet-stream", "binary/octet-stream"):
+            with self.subTest(mime=mime):
+                wf = self.workflow(HttpResponse(200, {"content-type": mime, "x-cost": "0.0012",
+                                                       "x-remaining-balance": "3.5"}, audio))
+                result = wf.run()
+                self.assertEqual(result["n1"].bytes(), audio)
+                self.assertEqual(result["n1"].mime, "audio/mpeg")
+                self.assertEqual(result.cost_usd, 0.0012)
+                self.assertEqual(result.nodes["n1"].cost_usd, 0.0012)
+                self.assertEqual(result.remaining_balance, 3.5)
+                self.assertTrue(result.cost_exact)
+                self.assertEqual([p["status"] for p in result.payments], ["sent"])
+                self.assertEqual([p["redeemed"] for p in result.payments], [True])
+                self.assert_completed_once("/api/v1/audio/speech")
+
+    def test_typed_json_speech_replay_uses_the_audio_url(self):
+        wf = self.workflow(HttpResponse(200, {"content-type": "application/vnd.result+json"},
+                                        b'{"audioUrl":"https://cdn.test/audio.mp3","cost":0.002}'))
+        result = wf.run()
+        self.assertEqual(result["n1"].url, "https://cdn.test/audio.mp3")
+        self.assertEqual(result.cost_usd, 0.002)
+        self.assertEqual([p["redeemed"] for p in result.payments], [True])
+        self.assert_completed_once("/api/v1/audio/speech")
+
+    def test_paid_decision_answer_is_a_replay(self):
+        wf = self.workflow(json_resp(200, {"answers": {"answer": {"type": "noul", "noul": 0.9}},
+                                         "usage": {"input_tokens": 12, "output_tokens": 0, "cost": 0.002}}),
+                           kind="decide")
+        result = wf.run()
+        self.assertEqual(result["n1"], "yes")
+        self.assertEqual(result.cost_usd, 0.002)
+        self.assertEqual([p["redeemed"] for p in result.payments], [True])
+        self.assert_completed_once("/api/v1/decisions")
+
+    def test_video_job_id_is_a_replayed_submission(self):
+        calls = []
+        invoices = []
+
+        def http(method, url, **options):
+            calls.append(url)
+            if "/api/x402/complete/" in url:
+                return json_resp(200, {"id": "job-1", "status": "completed"})
+            return json_resp(402, fresh_402())
+
+        engine = make_engine(http, invoices.append)
+        response = engine._post_json("/api/generate-video", {"prompt": "a boat"})
+        self.assertEqual(json.loads(response.text())["id"], "job-1")
+        self.assertEqual(calls, [BASE + "/api/generate-video", BASE + "/api/x402/complete/" + PAYMENT_ID])
+        self.assertEqual([inv["paymentId"] for inv in invoices], [PAYMENT_ID])
+        self.assertTrue(engine.payments()[0]["redeemed"])
+
+    def test_invalid_success_never_authorizes_a_repost(self):
+        for desc, completion, known_cost in (
+            ("malformed JSON", HttpResponse(200, {"content-type": "application/json", "x-cost": "0.2"}, b"{"), 0.2),
+            ("unreadable audio", HttpResponse(200, {"content-type": "audio/mpeg", "x-cost": "0.3"},
+                                             None, body_error=HttpBodyReadError("truncated")), 0.3),
+            ("empty audio", HttpResponse(200, {"content-type": "audio/mpeg"}, b""), None),
+            ("missing MIME", HttpResponse(200, {}, b'{"status":"completed"}'), None),
+            ("HTML", HttpResponse(200, {"content-type": "text/html"}, b"<html>error</html>"), None),
+            ("text acknowledgement", HttpResponse(200, {"content-type": "text/plain"}, b"OK"), None),
+            ("untyped JSON", json_resp(200, ["completed"]), None),
+            ("empty JSON object", json_resp(200, {}), None),
+            ("pending receipt", json_resp(200, {"status": "pending", "paymentId": PAYMENT_ID}), None),
+            ("mismatched receipt", json_resp(200, {"status": "completed", "paymentId": "pay_other"}), None),
+            ("receipt with error", json_resp(200, {"status": "completed", "error": "not verified"}), None),
+        ):
+            with self.subTest(desc=desc):
+                with self.assertRaisesRegex(RunError, "x402 completion") as raised:
+                    self.workflow(completion).run()
+                result = raised.exception.result
+                self.assertEqual(result.nodes["n1"].status, "error")
+                self.assertIn(PAYMENT_ID, result.nodes["n1"].error)
+                self.assertIn(BASE + "/api/x402/status/" + PAYMENT_ID, result.nodes["n1"].error)
+                self.assertIn("before paying again", result.nodes["n1"].error)
+                self.assertEqual([p["status"] for p in result.payments], ["sent"])
+                self.assertEqual([p["redeemed"] for p in result.payments], [False])
+                self.assertEqual(result.cost_usd, known_cost or 0.0)
+                self.assertEqual(result.cost_exact, known_cost is not None)
+                self.assert_completed_once("/api/v1/audio/speech")
+
+    def test_binary_body_cannot_redeem_a_json_only_request(self):
+        completion = HttpResponse(200, {"content-type": "application/octet-stream"}, b"ID3")
+        with self.assertRaisesRegex(RunError, "unsupported content type") as raised:
+            self.workflow(completion, kind="llm").run()
+        self.assertFalse(raised.exception.result.payments[0]["redeemed"])
+        self.assert_completed_once("/api/v1/chat/completions")
 
 
 class SettleFlowTest(unittest.TestCase):
@@ -124,14 +240,14 @@ class SettleFlowTest(unittest.TestCase):
                     return json_resp(200, CHAT_OK)
                 return json_resp(402, fresh_402())
             if "/api/x402/complete/" in url:
-                return json_resp(200, {"status": "completed", "paymentId": "pay_x"})
+                return json_resp(200, {"status": "completed", "paymentId": PAYMENT_ID})
             raise AssertionError("unexpected url " + url)
 
         eng = make_engine(http, lambda inv: None)
         self.assertEqual(self.chat(eng), CHAT_OK)
         reposts = [c for c in calls if "/chat/completions" in c[1] and c[2].get("x-x402-payment-id")]
         self.assertEqual(len(reposts), 1)
-        self.assertRegex(reposts[0][2]["x-x402-payment-id"], r"^pay_")
+        self.assertEqual(reposts[0][2]["x-x402-payment-id"], PAYMENT_ID)
 
     def test_second_402_after_settle_is_hard_error(self):
         paid = []
@@ -210,7 +326,7 @@ class SettleFlowTest(unittest.TestCase):
                 return json_resp(402, fresh_402())
             if "/api/x402/complete/" in url:
                 time.sleep(0.3)   # the deposit is confirmed AFTER the deadline
-                return json_resp(200, {"status": "completed", "paymentId": "pay_x"})
+                return json_resp(200, {"status": "completed", "paymentId": PAYMENT_ID})
             raise AssertionError("unexpected url " + url)
 
         eng = make_engine(http, lambda inv: None)
@@ -240,7 +356,7 @@ class SettleFlowTest(unittest.TestCase):
                     return json_resp(200, CHAT_OK)
                 return json_resp(402, fresh_402())
             if "/api/x402/complete/" in url:
-                return json_resp(200, {"status": "completed", "paymentId": "pay_x"})
+                return json_resp(200, {"status": "completed", "paymentId": PAYMENT_ID})
             raise AssertionError("unexpected url " + url)
 
         eng = make_engine(http, lambda inv: None)
@@ -472,7 +588,7 @@ class PaidRetryFailsTest(unittest.TestCase):
                 return json_resp(500, {"error": "model overloaded"})
             return json_resp(402, fresh_402())
         if "/api/x402/complete/" in url:
-            return json_resp(200, {"status": "completed", "paymentId": "pay_x"})
+            return json_resp(200, {"status": "completed", "paymentId": PAYMENT_ID})
         raise AssertionError("unexpected url " + url)
 
     def test_a_paid_retry_that_errors_leaves_the_deposit_unredeemed(self):
@@ -510,7 +626,7 @@ class PaidRetryFailsTest(unittest.TestCase):
                     return json_resp(200, CHAT_OK)
                 return json_resp(402, fresh_402())
             if "/api/x402/complete/" in url:
-                return json_resp(200, {"status": "completed", "paymentId": "pay_x"})
+                return json_resp(200, {"status": "completed", "paymentId": PAYMENT_ID})
             raise AssertionError("unexpected url " + url)
 
         eng = make_engine(http, lambda inv: None)
