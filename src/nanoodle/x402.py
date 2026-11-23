@@ -112,7 +112,9 @@ def parse_nano_invoice(body, base_url):
 
 def looks_like_result(j):
     """Does a complete-endpoint body already carry the replayed API result?"""
-    return isinstance(j, dict) and any(j.get(k) is not None for k in _RESULT_KEYS)
+    return isinstance(j, dict) and (
+        any(j.get(k) is not None for k in _RESULT_KEYS)
+        or (isinstance(j.get("answers"), dict) and isinstance(j.get("usage"), dict)))
 
 
 def parse_json(text):

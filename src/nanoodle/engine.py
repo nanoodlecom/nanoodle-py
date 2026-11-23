@@ -21,7 +21,7 @@ from .graph import (EDIT_IMG_RE, IMG_PORT_RE, REF_PORT_RE, display_name,
                     optional_node)
 from .media import (MEDIA_INLINE_MAX, MODEL_FILE_MIMES, TRANSCRIBE_MAX_BYTES, MediaRef,
                     b64_image_mime, make_data_url, parse_data_url)
-from .transport import HttpBodyReadError, HttpResponse, default_http, encode_multipart
+from .transport import HttpBodyReadError, default_http, encode_multipart
 from .x402 import assert_payment_option, looks_like_result, parse_json, parse_nano_invoice
 
 IMG_ENDPOINT = "/v1/images/generations"          # note: NOT /api/v1
@@ -38,6 +38,7 @@ MODEL3D_DEADLINE_S = 25 * 60
 _FUNDS_RE = re.compile(r"insufficient|balance|funds|not enough|payment required", re.I)
 _AUDIO_MIME = {"mp3": "audio/mpeg", "opus": "audio/ogg", "aac": "audio/aac",
                "flac": "audio/flac", "wav": "audio/wav", "pcm": "audio/wav"}
+_GENERIC_BINARY_MIMES = ("application/octet-stream", "binary/octet-stream")
 # Native music endpoints use prompt for musical direction; lyrics remain separate.
 _AUDIO_PROMPT_MODEL_RE = re.compile(
     r"(?:^|/)(?:prompt-to-song|generate-bgm)$|(?:^|/)mureka-ai/[^/]+/generate-song$|^minimax/music-3$",
@@ -80,6 +81,58 @@ def _as_url(value):
 
 class NodeCancelled(NanoodleError):
     pass
+
+
+class _X402CompletionError(NanoodleError):
+    def __init__(self, invoice, response, detail):
+        self.response = response
+        self.payment_id = invoice["paymentId"]
+        self.status_url = invoice.get("statusUrl")
+        recovery = self.status_url or invoice.get("completeUrl") or "the original payment status"
+        super().__init__(f"NanoGPT x402 completion {detail} (HTTP {response.status}). "
+                         f"Payment {self.payment_id} was sent. Check {recovery} before paying again.")
+
+
+def _response_mime(resp):
+    return (resp.header("content-type") or "").split(";", 1)[0].strip().lower()
+
+
+def _is_json_mime(mime):
+    return mime in ("application/json", "text/json") or mime.endswith("+json")
+
+
+def _x402_completion_response(resp, invoice, request_path):
+    """Return the replayed result or allow a retry on a positive receipt only."""
+    mime = _response_mime(resp)
+    try:
+        body = resp.body
+    except HttpBodyReadError as exc:
+        raise _X402CompletionError(invoice, resp, "returned an unreadable response") from exc
+
+    speech = request_path.endswith(AUDIO_ENDPOINT)
+    if speech and (mime.startswith("audio/") or mime in _GENERIC_BINARY_MIMES):
+        if body:
+            return resp
+        raise _X402CompletionError(invoice, resp, "returned empty audio")
+    if not _is_json_mime(mime):
+        raise _X402CompletionError(invoice, resp, "returned an unsupported content type")
+
+    receipt = parse_json(body)
+    if not isinstance(receipt, dict):
+        raise _X402CompletionError(invoice, resp, "returned no readable JSON receipt")
+    if "paymentId" in receipt and receipt["paymentId"] != invoice["paymentId"]:
+        raise _X402CompletionError(invoice, resp, "returned a receipt for a different payment")
+    if receipt.get("error") is None:
+        if looks_like_result(receipt):
+            return resp
+        # Audio and video submissions also accept `id` as their provider job ID.
+        job_id = receipt.get("id")
+        if ((speech or request_path.endswith(VIDEO_SUBMIT)) and "paymentId" not in receipt
+                and isinstance(job_id, str) and job_id and job_id != invoice["paymentId"]):
+            return resp
+        if receipt.get("status") == "completed":
+            return None
+    raise _X402CompletionError(invoice, resp, "returned neither a result nor a confirmed settlement receipt")
 
 
 # ---- money-critical sections -----------------------------------------------
@@ -392,7 +445,7 @@ class Engine(object):
                          timeout=self._http_timeout_now())
         if resp.status != 402 or self._payment is None or self._api_key:
             return resp
-        settled = self._settle_402(resp)
+        settled = self._settle_402(resp, urllib.parse.urlsplit(url).path)
         record = settled.get("record")
         if settled.get("response") is not None:
             self._mark_redeemed(record)
@@ -420,7 +473,7 @@ class Engine(object):
             self._mark_redeemed(record)
         return resp2
 
-    def _settle_402(self, resp):
+    def _settle_402(self, resp, request_path):
         body = parse_json(resp.text())
         invoice = parse_nano_invoice(body, self.base_url) if body else None
         if not invoice or not invoice.get("paymentId") or not invoice.get("completeUrl"):
@@ -465,16 +518,9 @@ class Engine(object):
                            headers={"Content-Type": "application/json", "x-x402": "true"},
                            body="{}", timeout=self._http_timeout_now())
             if 200 <= cr.status < 300:
-                # An unreadable completion body cannot authorize a fallback generation.
-                has_json = cr.body and "json" in (cr.header("content-type") or "")
-                cj = parse_json(cr.text()) if has_json else None
-                if looks_like_result(cj):
-                    # re-wrap so call sites keep their HttpResponse contract
-                    replay = HttpResponse(200, cr.headers, json.dumps(cj).encode("utf-8"))
-                    return {"paymentId": invoice["paymentId"], "statusUrl": invoice.get("statusUrl"),
-                            "record": record, "response": replay}
+                replay = _x402_completion_response(cr, invoice, request_path)
                 return {"paymentId": invoice["paymentId"], "statusUrl": invoice.get("statusUrl"),
-                        "record": record}
+                        "record": record, "response": replay}
             if cr.status != 402:
                 self._raise_http(cr)
             if time.time() >= deadline:
@@ -714,6 +760,11 @@ class Engine(object):
         self._tls.node_id = node.id
         try:
             return fn(self, node, inp, on_cost)
+        except _X402CompletionError as exc:
+            # A bad 2xx completion can still carry a charge. Keep the amount
+            # when known and leave the deposit traceable as unredeemed.
+            on_cost(*self._cost_from_headers(exc.response))
+            raise
         finally:
             self._tls.node_id = None
 
@@ -1447,8 +1498,8 @@ def _gen_audio(engine, node, on_cost, text, extra):
             body["prompt"] = text
         body.pop("input", None)
     resp = engine._post_json(AUDIO_ENDPOINT, body)
-    ctype = (resp.header("content-type") or "").lower()
-    if "application/json" in ctype:
+    mime = _response_mime(resp)
+    if _is_json_mime(mime):
         j = engine._billed_json(resp, on_cost)
         data = j.get("data") if isinstance(j.get("data"), dict) else {}
         url = j.get("url") or j.get("audioUrl") or data.get("url") or data.get("audioUrl")
@@ -1460,8 +1511,7 @@ def _gen_audio(engine, node, on_cost, text, extra):
     # binary body: the audio bytes; pin the mime from the requested format when
     # the response type is missing or generic
     on_cost(*engine._cost_from_headers(resp))
-    mime = ctype.split(";")[0].strip()
-    if not mime or mime in ("application/octet-stream", "binary/octet-stream"):
+    if not mime or mime in _GENERIC_BINARY_MIMES:
         fmt = str(extra.get("response_format") or "mp3")
         mime = _AUDIO_MIME.get(fmt, "audio/mpeg")
     return MediaRef(make_data_url(resp.body, mime), mime=mime, fetcher=engine.fetch_media)
