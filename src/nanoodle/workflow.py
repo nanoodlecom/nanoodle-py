@@ -391,20 +391,6 @@ class Workflow(object):
                                 "environment variable, or pass payment= for accountless "
                                 "x402 runs (this workflow calls NanoGPT)")
 
-        # 4. vframes: clamp fields.frames up to the highest wired frameK port
-        #    (wired_frames_floor). Persisted apps may still carry frames=1 with
-        #    frame3 wired — without this the frame3 consumer starves mid-run.
-        for node in graph.nodes.values():
-            if node.type != "vframes":
-                continue
-            floor = wired_frames_floor(graph, node.id)
-            try:
-                cur = int(node.fields.get("frames") or 1)
-            except (TypeError, ValueError):
-                cur = 1
-            if floor > cur:
-                node.fields["frames"] = floor
-
         order = topo_order(graph)  # raises on cycles, naming the cyclic nodes
         return self._execute(graph, order, timeout, on_progress)
 
@@ -567,6 +553,16 @@ class Workflow(object):
                 for port, (src, sport) in overrides.items():
                     v = (runs[src].out or {}).get(sport)
                     node.fields[port] = v.url if isinstance(v, MediaRef) else v
+            if node.type == "vframes":
+                # The effective count can come from a wire. Apply the floor
+                # after overrides so a wired frame stays reachable.
+                floor = wired_frames_floor(graph, nid)
+                try:
+                    count = int(node.fields.get("frames") or 1)
+                except (TypeError, ValueError):
+                    count = 1
+                if count < floor:
+                    node = Node(node.id, node.type, {**node.fields, "frames": floor}, node.name)
             # Prompt length caps (see prompt_caps.py). Many image/video models reject an
             # over-long prompt at the route, and in a graph the prompt is WRITTEN by an
             # upstream LLM — so the caller has nothing to shorten. Trim it to fit rather
