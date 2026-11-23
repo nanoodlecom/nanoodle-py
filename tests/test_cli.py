@@ -239,6 +239,43 @@ class RunCliTest(MockedTest):
         req, = self.mock.requests_to("/api/v1/chat/completions")
         self.assertEqual(req.json["messages"][-1]["content"], "upstream")
 
+    def test_malformed_node_records_have_json_errors_before_paid_work(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
+        request = {"id": 12, "type": "llm", "fields": {"model": "m", "prompt": "stored prompt"}}
+        cases = [
+            (None, "node at position 2 must be an object"),
+            ({"type": "text"}, "node at position 2 has a missing or invalid id"),
+            ({"id": "damaged"}, "node at position 2 has a missing or invalid type"),
+            ({"id": "future", "type": "future-node-fixture"}, "unknown node type 'future-node-fixture'"),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            saved = Path(d) / "graph.json"
+            argv = ["run", str(saved), "--api-key", "cli-key",
+                    "--base-url", self.mock.base_url, "--json"]
+            for bad, diagnostic in cases:
+                with self.subTest(bad=bad):
+                    saved.write_text(json.dumps({"nodes": [request, bad]}), encoding="utf-8")
+                    code, out, err = run_cli(argv)
+                    self.assertEqual(code, 1)
+                    self.assertIn(diagnostic, err)
+                    self.assertNotIn("Traceback", err)
+                    report = json.loads(out)
+                    self.assertIn(diagnostic, report["errors"][0]["message"])
+                    self.assertEqual(report["nodes"], {})
+                    self.assertEqual(report["costUsd"], 0.0)
+                    self.assertEqual(self.mock.requests, [])
+
+            saved.write_text(json.dumps({"nodes": [request, {
+                "id": 0, "type": "text", "fields": {"text": "wired prompt"},
+            }], "links": [
+                {"from": {"node": 0, "port": "text"}, "to": {"node": 12, "port": "prompt"}},
+            ]}), encoding="utf-8")
+            code, out, err = run_cli(argv)
+        self.assertEqual(code, 0, err or out)
+        self.assertEqual(json.loads(out)["errors"], [])
+        req, = self.mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual(req.json["messages"][-1]["content"], "wired prompt")
+
     def test_run_set_overrides_setting(self):
         self._script_ok()
         code, _, _ = run_cli(self._argv("--input", "Text=x", "--set", "n3.size=2k", "--json"))

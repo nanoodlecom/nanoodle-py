@@ -1,4 +1,4 @@
-"""Graph loading: aliases, link migration, orphan drop, unknown types, topo
+"""Graph loading: aliases, link migration, malformed records, unknown types, topo
 order, cycle errors, comment nodes (SPEC-format loader semantics)."""
 
 import unittest
@@ -114,14 +114,6 @@ class LoaderSemanticsTest(unittest.TestCase):
             wf.run()
         self.assertEqual(ctx.exception.node_id, "n1")
 
-    def test_node_without_id_skipped_with_warning(self):
-        wf = Workflow.from_dict({"nodes": [
-            {"type": "text", "fields": {"text": "lost"}},
-            {"id": "n1", "type": "text", "fields": {"text": "kept"}},
-        ]}, api_key="k")
-        self.assertEqual(list(wf.graph.nodes), ["n1"])
-        self.assertTrue(any("no id" in w for w in wf.warnings))
-
     def test_non_object_json_rejected(self):
         with self.assertRaises(NanoodleError):
             materialize([1, 2, 3])
@@ -140,6 +132,43 @@ class LoaderSemanticsTest(unittest.TestCase):
         self.assertEqual(display_name(wf.graph.node("n1")), "Poet")   # custom, trimmed
         self.assertEqual(display_name(wf.graph.node("n2")), "LLM")    # type title
         self.assertEqual(display_name(wf.graph.node("n3")), "LLM")    # blank name -> title
+
+
+class MalformedNodeRecordTest(unittest.TestCase):
+    def test_invalid_records_report_their_position(self):
+        invalid_ids = (None, "", " ", [], {}, True, False, float("inf"), float("nan"))
+        invalid_types = (None, "", "\t", [], {}, 1, True)
+        cases = [(entry, "must be an object") for entry in (None, [], "text", 1, False)]
+        cases += [({"type": "text"}, "invalid id"), ({"id": "bad"}, "invalid type")]
+        cases += [({"id": nid, "type": "text"}, "invalid id") for nid in invalid_ids]
+        cases += [({"id": "bad", "type": ntype}, "invalid type") for ntype in invalid_types]
+        cases += [({"id": "bad", "type": "text", "fields": 1}, "invalid fields")]
+        for entry, expected in cases:
+            with self.subTest(entry=entry):
+                with self.assertRaises(NanoodleError) as ctx:
+                    materialize({"nodes": [{"id": "first", "type": "text"}, entry]})
+                self.assertIn("node at position 2", str(ctx.exception))
+                self.assertIn(expected, str(ctx.exception))
+
+    def test_invalid_node_list_shape_reports_graph_error(self):
+        for nodes in (None, "text", {}, False):
+            with self.subTest(nodes=nodes), self.assertRaisesRegex(NanoodleError, "'nodes' list"):
+                materialize({"nodes": nodes})
+
+    def test_numeric_ids_and_node_type_aliases_remain_addressable(self):
+        graph = materialize({"nodes": [
+            {"id": 0, "type": "text", "fields": {"text": "speak"}},
+            {"id": 12, "type": "audio", "fields": None},
+            {"id": 5.5, "type": "decide-branch"},
+        ], "links": [
+            {"from": {"node": 0, "port": "text"}, "to": {"node": 12, "port": "text"}},
+        ]})
+        self.assertEqual(list(graph.nodes), [0, 12, 5.5])
+        self.assertEqual(graph.node(12).type, "tts")
+        self.assertEqual(graph.links[0].to_port, "prompt")
+        self.assertEqual(graph.node(5.5).type, "decide")
+        self.assertTrue(graph.node(5.5).fields["branch"])
+        self.assertEqual(graph.warnings, [])
 
 
 class SourceWireTest(unittest.TestCase):

@@ -5,6 +5,7 @@ exported-app runtime (play.html RUNTIME_JS runGraph step 1).
 """
 
 import json
+import math
 import re
 
 from .branches import PORTS as BRANCH_PORTS, potentially_skipped_nodes
@@ -361,32 +362,46 @@ def materialize(data, warnings=None):
       - type alias: audio -> tts (legacy)
       - links into a music/tts node's "text" port are migrated to "prompt"
       - invalid and competing wires are kept with warnings where diagnosable on load
-    Unknown node types are KEPT (with a load warning) — run() fails fast on them.
+    Malformed node records fail on load. Unknown node types are kept with a
+    warning so they can be inspected, and run() fails fast on them.
     """
     if isinstance(data, str):
         data = json.loads(data)
     if not isinstance(data, dict):
         raise NanoodleError("workflow JSON must be an object with a 'nodes' list")
+    raw_nodes = data.get("nodes", [])
+    if not isinstance(raw_nodes, (list, tuple)):
+        raise NanoodleError("workflow JSON must be an object with a 'nodes' list")
     warnings = warnings if warnings is not None else []
 
     nodes = {}
-    for raw in (data.get("nodes") or []):
+    for position, raw in enumerate(raw_nodes, 1):
+        label = f"node at position {position}"
+        if not isinstance(raw, dict):
+            raise NanoodleError(f"{label} must be an object")
+        nid = raw.get("id")
+        valid_id = ((isinstance(nid, str) and bool(nid.strip()))
+                    or (isinstance(nid, int) and not isinstance(nid, bool))
+                    or (isinstance(nid, float) and math.isfinite(nid)))
+        if not valid_id:
+            raise NanoodleError(f"{label} has a missing or invalid id (expected a non-empty string or finite number)")
         ntype = raw.get("type")
+        if not isinstance(ntype, str) or not ntype.strip():
+            raise NanoodleError(f"{label} has a missing or invalid type (expected a non-empty string)")
         if ntype == "audio":  # legacy alias
             ntype = "tts"
         if ntype == "decide-branch":
             ntype = "decide"
-        nid = raw.get("id")
-        if not nid:
-            warnings.append("skipped a node with no id")
-            continue
         if nid in nodes:
             # twin of JS graph.mjs: a duplicate id is a load error, never a
             # silent overwrite of the first node (D4, fixed 2026-11-18)
             raise NanoodleError('duplicate node id "%s" — every node must have a unique id' % nid)
         if ntype not in NODE_TYPES:
             warnings.append("unknown node type %r (node %s) — it cannot be executed" % (ntype, nid))
-        fields = dict(raw.get("fields") or {})
+        try:
+            fields = dict(raw.get("fields") or {})
+        except (TypeError, ValueError) as exc:
+            raise NanoodleError(f"{label} has invalid fields (expected an object)") from exc
         if raw.get("type") == "decide-branch":
             fields["branch"] = True
         if ntype in NODE_TYPES:
