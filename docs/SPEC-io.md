@@ -23,8 +23,8 @@ surfaces optional: run() skips it and the node yields an empty value instead of 
 - upload nodes feeding role ports get role labels ("End frame", "Reference N", "Image N") — UI nicety; library can skip.
 - Unique key = (nodeId, field). LIBRARY RESOLUTION ORDER for a user-supplied key (case-insensitive, trimmed):
   1. the input's ASSIGNED key — the very name wf.inputs advertises (suffixed forms like "Text 2" live here)
-  2. exact node custom name (if that node has exactly one derived input → that input; ambiguous → error listing candidates)
-  3. "nodeId.field" (e.g. "n2.prompt") and bare nodeId (if single input on the node)
+  2. "nodeId.field" (e.g. "n2.prompt") and bare nodeId (if single input on the node)
+  3. exact node custom name (if that node has exactly one derived input → that input; ambiguous → error listing candidates)
   4. the input's label / field name if unique across inputs
   Unknown key → error listing available input names.
 - If the workflow has exactly one required input, allow a bare scalar: run("hello").
@@ -36,8 +36,8 @@ node.fields[field] = value before execution. Same wired-hides rule (cannot overr
 
 ## Outputs — deriveOutputs (play.html 3208-3214)
 Output nodes = nodes with a non-empty outputs list AND no outgoing link (sinks). No explicit marker.
-Result value = node.out[NODE_TYPES[type].outputs[0].name] (primary port). Some nodes expose several output ports (e.g. vframes frame1..frameK); expose all ports.
-Result keying: displayName(node) (custom name → type title); on duplicate display names, suffix " 2", " 3" in topo order; always ALSO keyed by node id.
+Result value = node.out[NODE_TYPES[type].outputs[0].name] (primary port). Custom Endpoint uses the primary port it emitted for the resolved mode. Some nodes expose several output ports (e.g. vframes frame1..frameK); expose all ports.
+Result keying: displayName(node) (custom name → type title); use the first unused case-insensitive key, trying suffixes " 2", " 3" in topo order. Reserve other sinks' node IDs so each output is also keyed by node ID.
 Intermediate nodes still run; expose them under result.nodes / result.steps for debugging.
 
 ## Key & auth

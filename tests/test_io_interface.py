@@ -234,6 +234,35 @@ class OutputDerivationTest(unittest.TestCase):
         self.assertEqual([o.key for o in wf.outputs], ["Writer", "Writer 2"])
         self.assertEqual([o.node_id for o in wf.outputs], ["n3", "n4"])
 
+    def test_authored_suffixes_and_case_variants_stay_addressable(self):
+        wf = Workflow.from_dict({"nodes": [
+            {"id": f"n{i}", "type": "text", "name": name, "fields": {}}
+            for i, name in enumerate(("A", "A", "A 2", "a 2"), start=1)
+        ]}, api_key="")
+        keys = ["A", "A 2", "A 2 2", "a 2 3"]
+        self.assertEqual([spec.key for spec in wf.inputs], keys)
+        self.assertEqual([spec.key for spec in wf.outputs], keys)
+        result = wf.run({key.upper(): f"value {i}" for i, key in enumerate(keys, start=1)})
+        for i, key in enumerate(keys, start=1):
+            self.assertEqual(result[key], f"value {i}")
+            self.assertEqual(result[f"n{i}"], f"value {i}")
+
+    def test_friendly_aliases_cannot_shadow_another_nodes_canonical_addresses(self):
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "route.alpha", "type": "text", "name": "A", "fields": {}},
+            {"id": "n2", "type": "text", "name": "ROUTE.ALPHA", "fields": {}},
+            {"id": "n3", "type": "text", "name": "route.alpha.text", "fields": {}},
+        ]}, api_key="")
+        self.assertEqual([spec.key for spec in wf.inputs], ["A", "ROUTE.ALPHA 2", "route.alpha.text 2"])
+        self.assertEqual([spec.key for spec in wf.outputs], ["A", "ROUTE.ALPHA 2", "route.alpha.text"])
+        self.assertEqual(resolve_input_key(wf.inputs, "route.alpha", wf.graph).node_id, "route.alpha")
+        result = wf.run({"route.alpha.text": "first", "ROUTE.ALPHA 2": "second", "n3.text": "third"})
+        self.assertEqual(result["route.alpha"], "first")
+        self.assertEqual(result["route.alpha 2"], "second")
+        self.assertEqual(result["n2"], "second")
+        self.assertEqual(result["route.alpha.text"], "third")
+
+
 class SettingsTest(unittest.TestCase):
     def test_settings_derived_with_current_values(self):
         wf = Workflow.load(fixture("starter-graph.json"), api_key="k")

@@ -18,6 +18,7 @@ from .media import MediaRef, b64_image_mime, make_data_url
 
 ENDPOINT_DEF_URL = "http://127.0.0.1:8787/v1/chat/completions"
 ENDPOINT_MODES = ("chat", "image", "video", "audio", "json")
+_ENDPOINT_MEDIA_PORTS = ("image", "video", "audio")
 
 
 def endpoint_mode(node):
@@ -26,15 +27,14 @@ def endpoint_mode(node):
     return m if m in ENDPOINT_MODES else "chat"
 
 
-def endpoint_out_port(node):
-    m = endpoint_mode(node)
-    if m == "image":
-        return ("image", "image")
-    if m == "video":
-        return ("video", "video")
-    if m == "audio":
-        return ("audio", "audio")
-    return ("text", "text")
+def endpoint_out_port(node, *, emitted=None):
+    mode = endpoint_mode(node)
+    port = mode if mode in _ENDPOINT_MEDIA_PORTS else "text"
+    if emitted is not None and port not in emitted:
+        # The response parser emits the primary port for the resolved route.
+        # A wired mode or URL prefix can select a different port at run time.
+        port = next((p for p in ("text", *_ENDPOINT_MEDIA_PORTS) if p in emitted), port)
+    return port, port
 
 
 def _loopback(host):
