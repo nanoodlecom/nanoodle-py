@@ -3,14 +3,20 @@
 Soft dependency: ffmpeg on PATH. Mirrors nanoodle-js/tests/local-media.test.mjs.
 """
 
+import io
 import os
 import shutil
+import subprocess
+import tempfile
 import unittest
+
+from PIL import Image
 
 from tests import fixture
 
-from nanoodle import MediaRef, NanoodleError, Workflow, media_from_file
-from nanoodle.local_media import resize_plan
+from nanoodle import MediaRef, NanoodleError, RunError, Workflow, media_from_file
+from nanoodle.local_media import extract_video_frames, resize_plan
+from nanoodle.media import parse_data_url
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 MEDIA = lambda name: fixture(os.path.join("media", name))
@@ -181,6 +187,106 @@ class VframesNodeTest(unittest.TestCase):
         self.assertIsInstance(thumb, MediaRef)
         self.assertTrue(thumb.url.startswith("data:image/"))
         self.assertGreater(len(thumb.bytes()), 20)
+
+
+@unittest.skipUnless(HAS_FFMPEG and shutil.which("ffprobe"), "ffmpeg and ffprobe not on PATH")
+class IndexedVframesTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as directory:
+            for index in range(24):
+                image = Image.new("RGB", (16, 16), (index * 10, 0, 0))
+                image.save(os.path.join(directory, f"f{index:02d}.png"))
+            pattern = os.path.join(directory, "f%02d.png")
+            for name, fps, timestamps in [
+                ("cfr", "24", []),
+                ("vfr", "100", [
+                    "-vf", "setpts='if(lt(N,4),N*4,16+(N-4)*13)'",
+                    "-fps_mode", "vfr", "-output_ts_offset", "2",
+                ]),
+            ]:
+                path = os.path.join(directory, f"{name}.mp4")
+                subprocess.run([
+                    "ffmpeg", "-loglevel", "error", "-framerate", fps, "-i", pattern,
+                    *timestamps, "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-q:v", "1", path,
+                ], check=True, timeout=30)
+                setattr(cls, name, media_from_file(path))
+
+    def assert_indices(self, output, expected):
+        self.assertEqual(list(output), [f"frame{i}" for i in range(1, len(expected) + 1)])
+        indices = []
+        for frame in output.values():
+            data = frame.bytes() if isinstance(frame, MediaRef) else parse_data_url(frame)[1]
+            with Image.open(io.BytesIO(data)) as image:
+                red, _, _ = image.convert("RGB").getpixel((8, 8))
+            indices.append(round(red / 10))
+        self.assertEqual(indices, expected)
+
+    def test_cfr_stride_selects_exact_display_indices(self):
+        self.assert_indices(
+            extract_video_frames(self.cfr, count=4, stride=3, dir="start"), [0, 3, 6, 9])
+        self.assert_indices(
+            extract_video_frames(self.cfr, count=3, stride="2", dir="start", start_sec="0.5"),
+            [12, 14, 16])
+
+    def test_vfr_uses_relative_timestamps_in_both_directions(self):
+        # Relative PTS are 0, .04, .08, .12, .16, .29, .42, .55, ...
+        bounds = {"count": 8, "start_sec": 0.071, "end_sec": 0.42}
+        for direction, sampling, expected in [
+            ("start", {"stride": 2}, [2, 4, 6]),
+            ("end", {"stride": 2}, [6, 4, 2]),
+            ("start", {"gap": 0.1}, [2, 5, 6]),
+            ("end", {"gap": 0.1}, [6, 5, 4]),
+        ]:
+            with self.subTest(direction=direction, sampling=sampling):
+                self.assert_indices(
+                    extract_video_frames(self.vfr, dir=direction, **bounds, **sampling), expected)
+
+    def test_workflow_keeps_ports_and_does_not_pad_a_short_range(self):
+        graph = {
+            "nodes": [
+                {"id": "v", "type": "vupload", "fields": {}},
+                {"id": "f", "type": "vframes", "name": "Frames", "fields": {
+                    "frames": "8", "stride": "2", "startSec": "0.071", "endSec": "0.21",
+                    "dir": "start",
+                }},
+            ],
+            "links": [
+                {"from": {"node": "v", "port": "video"}, "to": {"node": "f", "port": "video"}},
+            ],
+        }
+        wf = Workflow.from_dict(graph)
+        self.assertEqual(wf.outputs[0].ports, [f"frame{i}" for i in range(1, 9)])
+        self.assert_indices(wf.run({"Video": self.cfr}).nodes["f"].out, [2, 4])
+        result = wf.run({"Video": self.cfr}, settings={"f.dir": "end"})
+        self.assert_indices(result.nodes["f"].out, [5, 3])
+        narrowed = wf.run({"Video": self.cfr}, settings={"f.endSec": 0.13})
+        self.assert_indices(narrowed.nodes["f"].out, [2])
+        settings = {spec.field: spec for spec in wf.settings if spec.node_id == "f"}
+        self.assertEqual(settings["stride"].min, 1)
+        self.assertEqual(settings["startSec"].default, "0.071")
+        self.assertEqual(settings["endSec"].default, "0.21")
+
+        graph["nodes"].append({"id": "r", "type": "resize", "fields": {"width": "16"}})
+        graph["links"].append({
+            "from": {"node": "f", "port": "frame3"}, "to": {"node": "r", "port": "image"},
+        })
+        with self.assertRaisesRegex(RunError, "no image input") as error:
+            Workflow.from_dict(graph).run({"Video": self.cfr})
+        self.assert_indices(error.exception.result.nodes["f"].out, [2, 4])
+
+    def test_invalid_and_empty_ranges_fail(self):
+        for fields, message in [
+            ({"start_sec": -1}, "startSec must be a non-negative"),
+            ({"end_sec": "Infinity"}, "endSec must be a non-negative"),
+            ({"start_sec": 0.8, "end_sec": 0.2}, "endSec must be at or after startSec"),
+            ({"start_sec": 0.02, "end_sec": 0.03}, "no video frames"),
+            ({"stride": 0}, "stride must be a positive integer"),
+            ({"stride": 1.5}, "stride must be a positive integer"),
+            ({"stride": 2**53}, "stride must be a positive integer"),
+        ]:
+            with self.subTest(fields=fields), self.assertRaisesRegex(NanoodleError, message):
+                extract_video_frames(self.cfr, **fields)
 
 
 class MediaInlineGuardTest(unittest.TestCase):

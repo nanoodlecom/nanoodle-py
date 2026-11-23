@@ -9,6 +9,8 @@ URLs for the MediaRef pipeline.
 from __future__ import annotations
 
 import atexit
+import json
+import math
 import os
 import re
 import shutil
@@ -92,7 +94,8 @@ def _effective_timeout(default, deadline=None):
     return min(default, rem)
 
 
-def _run(bin_name, args, timeout=120, cancel_check=None, deadline=None):
+def _run(bin_name, args, timeout=120, cancel_check=None, deadline=None,
+         stdout_to=subprocess.PIPE):
     if cancel_check:
         cancel_check()
     if not shutil.which(bin_name):
@@ -109,7 +112,7 @@ def _run(bin_name, args, timeout=120, cancel_check=None, deadline=None):
         # instead of waiting for the full process timeout.
         p = subprocess.Popen(
             [bin_name] + list(args),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout=stdout_to, stderr=subprocess.PIPE)
     except FileNotFoundError:
         raise NanoodleError(
             "local media nodes need ffmpeg on PATH (not found: %s). "
@@ -385,23 +388,169 @@ def extract_audio_to_wav(url, start, length, rate=16000, fetcher=None,
                              deadline=deadline)
 
 
+_MAX_SAFE_FRAME_NUMBER = 2**53 - 1
+_FRAME_TIMESTAMP_TOLERANCE = 1e-9
+_FRAME_PROBE_LIMIT = 32 * 1024 * 1024
+
+
+def _frame_number(value):
+    if value is None:
+        return 0.0
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return 0.0
+            if not value.isascii() or "_" in value:
+                return math.nan
+            if value.lower().startswith(("0x", "0o", "0b")):
+                return float(int(value, 0))
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return math.nan
+
+
+def _frame_range_value(value, name):
+    if value is None or value == "":
+        return None
+    seconds = _frame_number(value)
+    if not 0 <= seconds < math.inf:
+        raise NanoodleError(f"{name} must be a non-negative time in seconds")
+    return seconds
+
+
+def _read_frame_timestamps(in_path, cancel_check, deadline):
+    # The frame-by-frame probe can be much larger than a normal metadata probe.
+    # Spool stdout to a temporary file and check its size while the child runs.
+    with tempfile.TemporaryFile() as probe_file:
+        def check_probe():
+            if cancel_check:
+                cancel_check()
+            if os.fstat(probe_file.fileno()).st_size > _FRAME_PROBE_LIMIT:
+                raise NanoodleError("ffprobe frame timestamp output is too large")
+
+        _run("ffprobe", [
+            "-v", "error", "-select_streams", "v:0", "-show_frames",
+            "-show_entries", "stream=time_base:frame=best_effort_timestamp",
+            "-of", "json", in_path,
+        ], cancel_check=check_probe, deadline=deadline, stdout_to=probe_file)
+        check_probe()
+        probe_file.seek(0)
+        try:
+            return json.load(probe_file)
+        except (ValueError, RecursionError):
+            raise NanoodleError("could not read the video frame timestamps") from None
+
+
+def _frame_timestamp(frame):
+    pts = frame.get("best_effort_timestamp") if isinstance(frame, dict) else None
+    if type(pts) is int and abs(pts) <= _MAX_SAFE_FRAME_NUMBER:
+        return pts
+    return None
+
+
+def _extract_indexed_frames(in_path, directory, count, stride, gap, start, end,
+                            from_end, cancel_check, deadline):
+    probe = _read_frame_timestamps(in_path, cancel_check, deadline)
+    try:
+        frames = probe["frames"]
+        units, scale = map(int, probe["streams"][0]["time_base"].split("/"))
+        origin = _frame_timestamp(frames[0])
+    except (KeyError, IndexError, AttributeError, TypeError, ValueError):
+        raise NanoodleError("video has no readable frame timestamps") from None
+    if units <= 0 or scale <= 0 or origin is None:
+        raise NanoodleError("video has no readable frame timestamps")
+
+    first = last = None
+    previous_pts = origin
+    for index, frame in enumerate(frames):
+        if cancel_check and index % 1024 == 0:
+            cancel_check()
+        pts = _frame_timestamp(frame)
+        if pts is None or pts < previous_pts:
+            raise NanoodleError("video frame timestamps are missing or out of order")
+        previous_pts = pts
+        timestamp = (pts - origin) * units / scale
+        if timestamp > end + _FRAME_TIMESTAMP_TOLERANCE:
+            break
+        if timestamp + _FRAME_TIMESTAMP_TOLERANCE >= start:
+            if first is None:
+                first = index
+            last = index
+    if first is None:
+        raise NanoodleError("no video frames in the requested time range")
+
+    indices = range(first, last + 1)
+    if from_end:
+        indices = indices[::-1]
+    if stride is not None:
+        indices = indices[::stride]
+    selected = []
+    previous_time = None
+    for offset, index in enumerate(indices):
+        if cancel_check and offset % 1024 == 0:
+            cancel_check()
+        if stride is None:
+            timestamp = (_frame_timestamp(frames[index]) - origin) * units / scale
+            if previous_time is not None and abs(timestamp - previous_time) + _FRAME_TIMESTAMP_TOLERANCE < gap:
+                continue
+            previous_time = timestamp
+        selected.append(index)
+        if len(selected) == count:
+            break
+
+    # Both subprocesses use the first video stream in display order. FFmpeg
+    # writes selected indices in that order, so number the outputs in reverse
+    # when sampling from the end.
+    expression = "+".join(f"eq(n,{index})" for index in selected)
+    _run("ffmpeg", [
+        "-y", "-i", in_path, "-map", "0:v:0", "-vf", f"select='{expression}'",
+        "-fps_mode", "passthrough", "-frames:v", str(len(selected)), "-q:v", "2",
+        "-start_number", "1", os.path.join(directory, "frame-%d.jpg"),
+    ], **_run_args(cancel_check, deadline))
+    result = {}
+    for index in range(1, len(selected) + 1):
+        if cancel_check:
+            cancel_check()
+        file_number = len(selected) - index + 1 if from_end else index
+        frame_path = os.path.join(directory, f"frame-{file_number}.jpg")
+        result[f"frame{index}"] = _data_url_from_file(frame_path, "image/jpeg")
+    return result
+
+
 def extract_video_frames(url, count=1, gap=0.5, dir="end", fetcher=None,
-                         cancel_check=None, deadline=None):
+                         cancel_check=None, deadline=None, *, stride=None,
+                         start_sec=None, end_sec=None):
+    if cancel_check:
+        cancel_check()
     try:
         n = max(1, min(MAX_FRAMES, int(count or 1)))
     except (TypeError, ValueError):
         n = 1
-    try:
-        step = max(0.0, float(gap))
-    except (TypeError, ValueError):
-        step = 0.5
     from_end = (dir or "end") == "end"
-    eps = 0.04
-    if cancel_check:
-        cancel_check()
+    start = _frame_range_value(start_sec, "startSec")
+    end = _frame_range_value(end_sec, "endSec")
+    stride_n = None
+    if stride is not None and stride != "":
+        stride_n = _frame_number(stride)
+        if not (1 <= stride_n <= _MAX_SAFE_FRAME_NUMBER and stride_n.is_integer()):
+            raise NanoodleError("stride must be a positive integer")
+        stride_n = int(stride_n)
+    if end is not None and end < (start or 0):
+        raise NanoodleError("endSec must be at or after startSec")
     ra = _run_args(cancel_check, deadline)
     with tempfile.TemporaryDirectory(prefix="nanoodle-media-") as d:
         in_path = _write_input(d, "in", url, fetcher)
+        if stride_n is not None or start is not None or end is not None:
+            indexed_gap = _frame_number(gap)
+            return _extract_indexed_frames(
+                in_path, d, n, stride_n, max(0.0, indexed_gap) if math.isfinite(indexed_gap) else 0.5,
+                start or 0, end if end is not None else math.inf, from_end, cancel_check, deadline)
+        try:
+            step = max(0.0, float(gap))
+        except (TypeError, ValueError):
+            step = 0.5
+        eps = 0.04
         out, _ = _run("ffprobe", [
             "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", in_path], **ra)

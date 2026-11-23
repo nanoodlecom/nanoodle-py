@@ -147,7 +147,10 @@ SETTING_SPECS = {
                ("height", "Height", "number", None, None)],
     "vframes": [("dir", "Start from", "select", "end", ["end", "start"]),
                 ("frames", "Frames", "number", "1", None),
-                ("gap", "Gap (s)", "number", "0.5", None)],
+                ("gap", "Gap (s)", "number", "0.5", None),
+                ("stride", "Stride (every Nth frame)", "number", "1", None),
+                ("startSec", "Range start (s)", "number", None, None),
+                ("endSec", "Range end (s)", "number", None, None)],
     "combine": [("dedup", "Trim duplicate seam frame", "boolean", True, None)],
     "soundtrack": [("loop", "Loop audio to fill video", "boolean", False, None)],
     "trim": [("start", "Start (s)", "number", "0", None),
@@ -337,6 +340,8 @@ def derive_settings(graph):
             if node.type == "vframes" and field == "frames":
                 smin = max(1, wired_frames_floor(graph, node.id))
                 smax = MAX_FRAMES
+            if node.type == "vframes" and field == "stride":
+                smin = 1
             if node.type == "slice-3d":
                 if field == "frames":
                     smin, smax = 1, 64
