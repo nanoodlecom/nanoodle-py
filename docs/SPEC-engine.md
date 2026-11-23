@@ -205,7 +205,7 @@ The record is written BEFORE the callback fires, because the worker thread can b
 `Workflow` copies the ledger to `result.payments` and names every unredeemed deposit in the error message of the node that sent it, with one sentence per state: "a Nano deposit was already sent …", "a Nano deposit may have been sent …" (callback still in flight), or "no Nano deposit was sent (payment …): the wallet callback failed — …". So a user who sent XNO gets the payment id and explorer URL even when the run timed out and the worker's `NodeCancelled` went nowhere, and a user whose wallet failed is never told money moved.
 
 ## Execution (runGraph 3000-3133)
-1. Alias/filter nodes (materialize): audio→tts, drop unknown types + orphaned links, migrate music/tts inbound "text" port → "prompt".
+1. Materialize the graph. Normalize aliases, drop orphaned links, and migrate music/tts inbound `text` to `prompt`. Python keeps unknown node types and links from undeclared source ports with inspection warnings, then rejects them before execution. A declared dynamic or optional source port may emit no value in a particular run.
 2. Kahn topological order; cyclic → error naming the cyclic nodes.
 3. Concurrency: node starts when ITS deps finish (siblings run concurrently). Library: same semantics (asyncio / Promise per node).
 4. Input resolution per node: for declared ports, value = srcNode.out[from.port]. Dynamic families: img\d+ / image\d*, vid\d+, clip\d+, audio, endframe, ref\d+, frame\d+ (vframes outputs). ANY other inbound link = FIELD OVERRIDE: run with fields = {...fields, [port]: value} (that's how wired prompt/system/lyrics/q override typed values).

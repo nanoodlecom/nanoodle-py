@@ -15,12 +15,12 @@ EDIT_IMG_RE = re.compile(r"^image\d*$")      # edit multi-reference: image, imag
 VID_PORT_RE = re.compile(r"^vid\d*$")        # combine clips
 CLIP_PORT_RE = re.compile(r"^clip\d*$")      # combine clips (spec alias)
 REF_PORT_RE = re.compile(r"^ref\d*$")        # tvideo reference images
-FRAME_PORT_RE = re.compile(r"^frame\d+$")    # vframes outputs
 MAX_FRAMES = 48
+_FRAME_PORT_INDEX = {"frame%d" % i: i for i in range(1, MAX_FRAMES + 1)}
 
 
 def wired_frames_floor(graph, node_id):
-    """Highest frameN port wired OUT of a vframes node (clamped 1..MAX_FRAMES).
+    """Highest supported frameN port wired OUT of a vframes node, at least 1.
 
     fields.frames is shape-affecting: run() emits frame1..frameN and downstream
     links read fixed frameK ports. A count below the highest wired port starves
@@ -31,13 +31,13 @@ def wired_frames_floor(graph, node_id):
     for link in (graph.links if graph is not None else []) or []:
         if link.from_node != node_id:
             continue
-        m = re.match(r"^frame(\d+)$", str(link.from_port))
-        if m:
-            floor = max(floor, int(m.group(1)) or 1)
-    return min(floor, MAX_FRAMES)
+        if isinstance(link.from_port, str):
+            floor = max(floor, _FRAME_PORT_INDEX.get(link.from_port, 1))
+    return floor
 
 
 # Node type registry. outputs = [(port, kind)] with the PRIMARY port first.
+# extra_source_ports can be wired but don't change how terminal outputs are derived.
 # static = declared input port names; dynamic = port-name regexes.
 # network nodes need an API key; local media ops need ffmpeg on PATH (soft dependency).
 NODE_TYPES = {
@@ -50,10 +50,13 @@ NODE_TYPES = {
     "join":       {"title": "Join",             "outputs": [("text", "text")], "static": ["a", "b"]},
     "llm":        {"title": "LLM",              "outputs": [("text", "text")], "static": ["audio"],
                    "dynamic": [IMG_PORT_RE], "network": True},
-    "image":      {"title": "Image",            "outputs": [("image", "image")], "network": True},
+    "image":      {"title": "Image",            "outputs": [("image", "image")],
+                   "extra_source_ports": ("images",), "network": True},
     "edit":       {"title": "Edit",             "outputs": [("image", "image")],
+                   "extra_source_ports": ("images", "layers"),
                    "dynamic": [EDIT_IMG_RE], "network": True},
     "inpaint":    {"title": "Inpaint",          "outputs": [("image", "image")],
+                   "extra_source_ports": ("images", "layers"),
                    "static": ["image", "mask"], "network": True},
     "slice-3d": {"title": "Slice 3D", "static": ["model", "paletteImage"],
                 "outputs": [("sheet", "image"), ("layout", "text"), ("image", "image")]},
@@ -66,6 +69,7 @@ NODE_TYPES = {
     # ⚖️ Decide: text in + img1… candidates (IMG_PORT_RE); text out (the answer) + image out
     # (pick: the winner; otherwise the first wired image, passed through)
     "decide":     {"title": "Decide",           "outputs": [("text", "text"), ("image", "image")],
+                   "extra_source_ports": ("decision", "yes", "no"),
                    "static": ["text"], "dynamic": [IMG_PORT_RE], "network": True},
     "tvideo":     {"title": "Text→Video",       "outputs": [("video", "video")],
                    "dynamic": [REF_PORT_RE], "network": True},
@@ -100,6 +104,7 @@ NODE_TYPES = {
     # 🔌 Custom endpoint: url/mode stay in the input dict (a Choice path joins the host).
     # Not a NanoGPT call — network is false so an endpoint-only graph needs no API key.
     "endpoint":   {"title": "Custom endpoint",  "outputs": [("text", "text")],
+                   "extra_source_ports": ("image", "images", "video", "audio"),
                    "static": ["text", "image", "audio", "video", "url", "mode"]},
     "comment":    {"title": "Comment",          "outputs": [], "note": True},
 }
@@ -178,6 +183,20 @@ def display_name(node):
     return node.type or "?"
 
 
+def source_wire_issue(source, link):
+    """Describe an undeclared source port, independent of what a run emits."""
+    if source is None or source.type not in NODE_TYPES:
+        return None
+    spec = source.spec()
+    port = link.from_port
+    if (any(name == port for name, _ in spec["outputs"])
+            or port in spec.get("extra_source_ports", ())
+            or (source.type == "vframes" and isinstance(port, str) and port in _FRAME_PORT_INDEX)):
+        return None
+    return ('wire %s.%s → %s.%s uses undeclared source port "%s" on %s'
+            % (link.from_node, port, link.to_node, link.to_port, port, display_name(source)))
+
+
 # Media fields hold a data: or http(s) URL (the editor writes data: URLs; hand-authored
 # graphs may inline either). Agents sometimes leave prose placeholders ("[image will be
 # provided at run time]") or bare file paths — those LOOK filled (inspect shows a default,
@@ -218,6 +237,7 @@ def materialize(data, warnings=None):
       - type alias: audio -> tts (legacy)
       - links kept only when both endpoints exist
       - links into a music/tts node's "text" port are migrated to "prompt"
+      - links with undeclared source ports are kept with a warning
     Unknown node types are KEPT (with a load warning) — run() fails fast on them.
     """
     if isinstance(data, str):
@@ -259,7 +279,11 @@ def materialize(data, warnings=None):
         # migration: legacy music/tts inbound "text" port is now "prompt"
         if tp == "text" and nodes[tn].type in ("music", "tts"):
             tp = "prompt"
-        links.append(Link(raw.get("id"), fn, fp, tn, tp))
+        link = Link(raw.get("id"), fn, fp, tn, tp)
+        links.append(link)
+        issue = source_wire_issue(nodes[fn], link)
+        if issue:
+            warnings.append(issue)
 
     return Graph(nodes, links, warnings)
 
