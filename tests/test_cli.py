@@ -193,6 +193,30 @@ class RunCliTest(MockedTest):
         self.assertEqual(chat.json["messages"][1]["content"], "hello")
         self.assertEqual(chat.headers.get("authorization"), "Bearer cli-key")
 
+    def test_invalid_source_wire_fails_before_paid_dependent(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("paid fallback"))
+        data = {
+            "nodes": [
+                {"id": "source", "type": "text", "fields": {"text": "upstream"}},
+                {"id": "sink", "type": "llm", "fields": {"model": "m", "prompt": "stored fallback"}},
+            ],
+            "links": [{"from": {"node": "source", "port": "obsoletePort"},
+                       "to": {"node": "sink", "port": "prompt"}}],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            saved = Path(d) / "graph.json"
+            saved.write_text(json.dumps(data), encoding="utf-8")
+            code, out, err = run_cli(["run", str(saved), "--api-key", "cli-key",
+                                      "--base-url", self.mock.base_url, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("undeclared source port", err)
+        payload = json.loads(out)
+        self.assertIn("wire source.obsoletePort → sink.prompt", payload["errors"][0]["message"])
+        self.assertEqual(payload["nodes"], {})
+        self.assertEqual(payload["outputs"], {"LLM": None})
+        self.assertEqual(payload["costUsd"], 0.0)
+        self.assertEqual(self.mock.requests, [])
+
     def test_run_set_overrides_setting(self):
         self._script_ok()
         code, _, _ = run_cli(self._argv("--input", "Text=x", "--set", "n3.size=2k", "--json"))

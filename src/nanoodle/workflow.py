@@ -16,7 +16,7 @@ from .decide import DecideGateClosed
 from .endpoint import endpoint_out_port
 from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, display_name,
-                    materialize, topo_order, wired_frames_floor)
+                    materialize, source_wire_issue, topo_order, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
 from .media import MEDIA_INLINE_MAX, MediaRef, make_data_url
@@ -365,7 +365,7 @@ class Workflow(object):
             raise NanoodleError("missing required input%s: %s"
                                 % ("s" if len(missing) > 1 else "", ", ".join(missing)))
 
-        # 3. fail fast BEFORE spending: unknown node types, API key
+        # 3. fail fast BEFORE spending: unknown node types, invalid wires, API key
         for node in graph.nodes.values():
             tspec = NODE_TYPES.get(node.type)
             if tspec is None:
@@ -373,6 +373,10 @@ class Workflow(object):
                     node.id, node.type,
                     "unknown node type '%s' (node %s '%s') — this workflow needs a newer "
                     "library or the nanoodle browser app" % (node.type, node.id, display_name(node)))
+        for link in graph.links:
+            issue = source_wire_issue(graph.node(link.from_node), link)
+            if issue:
+                raise NanoodleError(issue)
         if has_network and not self._api_key and self._payment is None:
             raise NanoodleError("no API key — pass api_key=, set the NANOGPT_API_KEY "
                                 "environment variable, or pass payment= for accountless "

@@ -4,6 +4,7 @@ order, cycle errors, comment nodes (SPEC-format loader semantics)."""
 import unittest
 
 from tests import fixture
+from tests._util import tripwire_http
 
 from nanoodle import NanoodleError, UnsupportedNodeError, Workflow
 from nanoodle.graph import display_name, materialize, topo_order
@@ -129,6 +130,53 @@ class LoaderSemanticsTest(unittest.TestCase):
         self.assertEqual(display_name(wf.graph.node("n1")), "Poet")   # custom, trimmed
         self.assertEqual(display_name(wf.graph.node("n2")), "LLM")    # type title
         self.assertEqual(display_name(wf.graph.node("n3")), "LLM")    # blank name -> title
+
+
+class SourceWireTest(unittest.TestCase):
+    @staticmethod
+    def _graph(node_type, port):
+        return {"nodes": [
+            {"id": "source", "type": node_type, "fields": {"text": "upstream"}},
+            {"id": "sink", "type": "text", "fields": {"text": "stored fallback"}},
+        ], "links": [
+            {"id": "wire", "from": {"node": "source", "port": port},
+             "to": {"node": "sink", "port": "text"}},
+        ]}
+
+    def test_undeclared_source_is_retained_for_inspect_and_rejected_before_running(self):
+        wf = Workflow.from_dict(self._graph("text", "obsoletePort"), api_key="", http=tripwire_http)
+        issue = 'wire source.obsoletePort → sink.text uses undeclared source port "obsoletePort" on Text'
+        self.assertEqual(wf.warnings, [issue])
+        self.assertEqual(wf.graph.links[0].id, "wire")
+        events = []
+        with self.assertRaises(NanoodleError) as ctx:
+            wf.run(on_progress=events.append)
+        self.assertEqual(str(ctx.exception), issue)
+        self.assertEqual(events, [])
+
+    def test_structural_checks_accept_dynamic_alias_and_optional_outputs(self):
+        possible_ports = {
+            "audio": ("audio",),
+            "decide-branch": ("yes", "no", "decision"),
+            "edit": ("images", "layers"),
+            "endpoint": ("text", "image", "images", "audio", "video"),
+            "image": ("images",),
+            "inpaint": ("images", "layers"),
+            "slice-3d": ("sheet", "layout", "image"),
+            "sprite-stack-render": ("video",),
+            "vframes": ("frame1", "frame48"),
+        }
+        for node_type, ports in possible_ports.items():
+            for port in ports:
+                with self.subTest(node_type=node_type, port=port):
+                    self.assertEqual(materialize(self._graph(node_type, port)).warnings, [])
+
+    def test_impossible_frame_spellings_are_rejected(self):
+        for port in ("frame0", "frame01", "frame49", "frame1\n", "frame١", None, []):
+            with self.subTest(port=port):
+                graph = materialize(self._graph("vframes", port))
+                self.assertEqual(len(graph.warnings), 1)
+                self.assertIn("undeclared source port", graph.warnings[0])
 
 
 class TopoOrderTest(unittest.TestCase):

@@ -372,19 +372,29 @@ class FieldOverrideTest(MockedTest):
         req = self.mock.requests_to("/api/v1/audio/speech")[0]
         self.assertEqual(req.json["input"], "read me")
 
-    def test_none_upstream_value_leaves_typed_field(self):
-        # regression: play.html only overrides when v != null — a link from a
-        # nonexistent out port must not clobber the typed prompt with None
+    def test_declared_source_without_a_value_leaves_typed_field(self):
+        # A declared source port can be absent on a particular run. Keep the
+        # typed prompt when chat mode emits no video; use it when video mode does.
+        video = "https://cdn.example/clip.mp4"
+        self.mock.script("POST", "/convert", [
+            chat_response("converted"), {"status": 200, "json": {"url": video}},
+        ])
         self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
         wf = self.wf_dict({"nodes": [
-            {"id": "n1", "type": "text", "fields": {"text": "x"}},
+            {"id": "choice", "type": "choice", "name": "Format",
+             "fields": {"options": "chat\nvideo"}},
+            {"id": "n1", "type": "endpoint",
+             "fields": {"url": self.mock.base_url + "/convert", "mode": "chat", "prompt": "hi"}},
             {"id": "n2", "type": "llm", "fields": {"model": "m", "prompt": "typed prompt"}},
-        ], "links": [{"id": "l1", "from": {"node": "n1", "port": "nosuchport"},
-                      "to": {"node": "n2", "port": "prompt"}}]})
-        result = wf.run()
-        req = self.mock.requests_to("/api/v1/chat/completions")[0]
-        self.assertEqual(req.json["messages"][-1]["content"], "typed prompt")
-        self.assertEqual(result["LLM"], "ok")
+        ], "links": [
+            {"from": {"node": "choice", "port": "text"}, "to": {"node": "n1", "port": "mode"}},
+            {"from": {"node": "n1", "port": "video"}, "to": {"node": "n2", "port": "prompt"}},
+        ]})
+        self.assertEqual(wf.run({"Format": "chat"})["LLM"], "ok")
+        self.assertEqual(wf.run({"Format": "video"})["LLM"], "ok")
+        requests = self.mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual([req.json["messages"][-1]["content"] for req in requests],
+                         ["typed prompt", video])
 
 
 class MaxTokensDegradeTest(MockedTest):
