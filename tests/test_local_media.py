@@ -121,6 +121,14 @@ class ExtractAudioNodeTest(unittest.TestCase):
 
 
 class VframesNodeTest(unittest.TestCase):
+    def test_authored_count_exposes_up_to_frame48(self):
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "n1", "type": "vframes", "fields": {"frames": "49"}},
+        ]})
+        self.assertEqual(wf.outputs[0].ports, ["frame%d" % i for i in range(1, 49)])
+        frames_knob = next(s for s in wf.settings if s.field == "frames")
+        self.assertEqual((frames_knob.min, frames_knob.max), (1, 48))
+
     @skip_no_ffmpeg
     def test_extract_two_frames(self):
         vid = media_from_file(MEDIA("clipA.mp4"))
@@ -138,10 +146,9 @@ class VframesNodeTest(unittest.TestCase):
         self.assertIn("frame2", result.nodes["n2"].out)
 
     @skip_no_ffmpeg
-    def test_wired_frames_floor_raises_frames_so_frame3_consumer_runs(self):
-        # Persisted graphs may have frames=1 while frame3 is wired to a
-        # downstream node. The engine must clamp up to the wired floor so the
-        # resize consumer receives frame3 (play.html wiredFramesFloor parity).
+    def test_wired_frame13_runs_with_a_lower_authored_count(self):
+        # A saved graph may wire frame13 with an authored count of 1. The
+        # executor must raise the count and extract the wired frame.
         from nanoodle.graph import wired_frames_floor
         from nanoodle.iodef import derive_settings
 
@@ -157,21 +164,19 @@ class VframesNodeTest(unittest.TestCase):
             "links": [
                 {"id": "l1", "from": {"node": "n1", "port": "video"},
                  "to": {"node": "n2", "port": "video"}},
-                {"id": "l2", "from": {"node": "n2", "port": "frame3"},
+                {"id": "l2", "from": {"node": "n2", "port": "frame13"},
                  "to": {"node": "n3", "port": "image"}},
             ],
         }
         wf = Workflow.from_dict(data)
-        self.assertEqual(wired_frames_floor(wf.graph, "n2"), 3)
+        self.assertEqual(wired_frames_floor(wf.graph, "n2"), 13)
         frames_knob = next(s for s in derive_settings(wf.graph)
                            if s.node_id == "n2" and s.field == "frames")
-        self.assertEqual(frames_knob.min, 3)
+        self.assertEqual((frames_knob.min, frames_knob.max), (13, 48))
 
         result = wf.run({"Video": vid})
-        # vframes must have produced frame3
-        self.assertIn("frame3", result.nodes["n2"].out)
-        self.assertTrue(result.nodes["n2"].out["frame3"].url.startswith("data:image/"))
-        # resize sink succeeds on frame3
+        self.assertEqual(len(result.nodes["n2"].out), 13)
+        self.assertTrue(result.nodes["n2"].out["frame13"].url.startswith("data:image/"))
         thumb = result["Thumb"]
         self.assertIsInstance(thumb, MediaRef)
         self.assertTrue(thumb.url.startswith("data:image/"))

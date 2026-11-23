@@ -52,7 +52,7 @@ field-port overrides the typed field value at run time.
 | ivideo | Image→Video | image:image | endframe:image | video:video | model, prompt, duration, aspect, resolution, modelOpts |
 | model3d | 3D model | image:image | — | model:model3d | model, prompt (image and/or text, from the model's modalities) |
 | vedit | Video edit | video:video | — | video:video | model, prompt, resolution, modelOpts |
-| vframes | Video→frames | video:video | — | frame1..frameN:image (dynamic, fields.frames) | frames(1-12), gap, dir(end\|start) (LOCAL) |
+| vframes | Video→frames | video:video | — | frame1..frameN:image (dynamic, fields.frames) | frames(1-48), gap, dir(end\|start) (LOCAL) |
 | combine | Combine videos | — | clip1..:video | video:video | dedup (LOCAL) |
 | soundtrack | Soundtrack | video:video, audio:audio | — | video:video | loop (LOCAL) |
 | lipsync | Avatar/lipsync | image:image, audio:audio | — | video:video | model, prompt, resolution, modelOpts |
