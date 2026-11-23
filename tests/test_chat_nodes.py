@@ -130,6 +130,22 @@ class LlmPayloadTest(MockedTest):
         self.assertEqual([p["image_url"]["url"] for p in content if p["type"] == "image_url"],
                          ["data:image/png;base64,ONE", "data:image/png;base64,TWO"])
 
+    def test_llm_literal_img_and_img1_slots_each_deliver_an_image(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("both"))
+        wf = self.wf_dict({"nodes": [
+            {"id": "first", "type": "upload", "fields": {"image": "data:image/png;base64,ONE"}},
+            {"id": "second", "type": "upload", "fields": {"image": "data:image/png;base64,TWO"}},
+            {"id": "sink", "type": "llm", "fields": {"model": "m", "prompt": "compare"}},
+        ], "links": [
+            {"from": {"node": "first", "port": "image"}, "to": {"node": "sink", "port": "img"}},
+            {"from": {"node": "second", "port": "image"}, "to": {"node": "sink", "port": "img1"}},
+        ]})
+        wf.run()
+        req, = self.mock.requests_to("/api/v1/chat/completions")
+        images = [part["image_url"]["url"] for part in req.json["messages"][-1]["content"]
+                  if part["type"] == "image_url"]
+        self.assertCountEqual(images, ["data:image/png;base64,ONE", "data:image/png;base64,TWO"])
+
     def test_llm_wired_audio_becomes_input_audio_part(self):
         wav = "data:audio/wav;base64,UklGRgAAAABXQVZF"
         self.mock.script("POST", "/api/v1/chat/completions", chat_response("heard it"))

@@ -209,6 +209,7 @@ The record is written BEFORE the callback fires, because the worker thread can b
 2. Kahn topological order; cyclic → error naming the cyclic nodes.
 3. Concurrency: node starts when ITS deps finish (siblings run concurrently). Library: same semantics (asyncio / Promise per node).
 4. Read each wire's value from `srcNode.out[from.port]`. Declared inputs, including node-specific dynamic slots, receive the value in the node's input map. Declared field wires replace typed values for fields such as `prompt`, `system`, `model`, `lyrics`, and `q`.
+   Python detects competing sources for one input before execution when both wires and their outputs are unconditional. When a branch, gate, or optional output controls availability, the consuming node checks the active wires with emitted values before it runs. Repeated wires from the same source port count once.
 5. Node failure: record error for that node, continue independent lanes (library default: collect; raise at end if a sink failed — see DESIGN).
 6. comment nodes never run. Fixed-seed skip-cache: optional for a library (stateless one-shot runs don't need it) — SKIP in v1.
 

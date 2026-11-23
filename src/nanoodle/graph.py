@@ -7,6 +7,7 @@ exported-app runtime (play.html RUNTIME_JS runGraph step 1).
 import json
 import re
 
+from .branches import PORTS as BRANCH_PORTS, potentially_skipped_nodes
 from .errors import NanoodleError
 
 # Dynamic input-port families (SPEC-engine execution step 4).
@@ -282,6 +283,44 @@ def wire_issue(graph, link):
     return None
 
 
+def competing_input_issues(links):
+    """Name inputs with more than one source among the supplied eligible wires."""
+    sources = {}
+    for link in links:
+        target = (link.to_node, link.to_port)
+        sources.setdefault(target, set()).add((link.from_node, link.from_port))
+    issues = []
+    for (node, port), endpoints in sources.items():
+        if len(endpoints) > 1:
+            addresses = sorted("%s.%s" % endpoint for endpoint in endpoints)
+            issues.append("input %s.%s has competing wires from %s. Leave one active wire for this input."
+                          % (node, port, ", ".join(addresses)))
+    return sorted(issues)
+
+
+_OPTIONAL_OUTPUTS = {
+    "decide": BRANCH_PORTS,
+    "edit": ("layers",),
+    "inpaint": ("layers",),
+    "sprite-stack-render": ("video",),
+}
+
+
+def unconditional_competing_input_issues(graph):
+    """Validate guaranteed outputs. Branches and optional outputs resolve at run time."""
+    links = [link for link in graph.valid_links()
+             if graph.node(link.from_node).type in NODE_TYPES and graph.node(link.to_node).type in NODE_TYPES]
+    maybe_skipped = potentially_skipped_nodes(graph, links)
+
+    def guaranteed(link):
+        source_type = graph.node(link.from_node).type
+        # Endpoint output follows its route; indexed extraction can yield fewer frames.
+        return (link.to_node not in maybe_skipped and source_type not in ("endpoint", "vframes")
+                and link.from_port not in _OPTIONAL_OUTPUTS.get(source_type, ()))
+
+    return competing_input_issues(link for link in links if guaranteed(link))
+
+
 # Media fields hold a data: or http(s) URL (the editor writes data: URLs; hand-authored
 # graphs may inline either). Agents sometimes leave prose placeholders ("[image will be
 # provided at run time]") or bare file paths — those LOOK filled (inspect shows a default,
@@ -321,7 +360,7 @@ def materialize(data, warnings=None):
     Loader semantics replicated from the app:
       - type alias: audio -> tts (legacy)
       - links into a music/tts node's "text" port are migrated to "prompt"
-      - wires with missing nodes or undeclared ports are kept with a warning
+      - invalid and competing wires are kept with warnings where diagnosable on load
     Unknown node types are KEPT (with a load warning) — run() fails fast on them.
     """
     if isinstance(data, str):
@@ -371,6 +410,7 @@ def materialize(data, warnings=None):
         if issue:
             warnings.append(issue)
 
+    warnings.extend(unconditional_competing_input_issues(graph))
     return graph
 
 

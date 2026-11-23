@@ -153,6 +153,27 @@ class EndpointRunTest(MockedTest):
         self.assertEqual(wf.run({"Format": "chat"})["Output"], "converted")
         self.assertEqual(wf.outputs[0].ports, ["text"])
 
+    def test_only_emitted_endpoint_output_supplies_shared_prompt(self):
+        clip = "https://cdn.example/clip.mp4"
+        self.mock.script("POST", "/convert", [chat_response("converted text"),
+                                              {"status": 200, "json": {"url": clip}}])
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
+        wf = self.wf_dict({"nodes": [
+            {"id": "route", "type": "endpoint", "fields": {
+                "url": self.mock.base_url + "/convert", "mode": "chat", "prompt": "convert",
+            }},
+            {"id": "sink", "type": "llm", "fields": {"model": "m", "prompt": "stored fallback"}},
+        ], "links": [
+            {"from": {"node": "route", "port": port}, "to": {"node": "sink", "port": "prompt"}}
+            for port in ("text", "video")
+        ]})
+        self.assertEqual(wf.warnings, [])
+        self.assertEqual(wf.run()["sink"], "ok")
+        self.assertEqual(wf.run(settings={"route.mode": "video"})["sink"], "ok")
+        requests = self.mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual([req.json["messages"][-1]["content"] for req in requests],
+                         ["converted text", clip])
+
     def test_audio_binary_and_json_mode(self):
         self.mock.script("POST", "/wav", binary_response(b"ID3fake", mime="audio/mpeg"))
         wf = self.wf_dict({"nodes": [
