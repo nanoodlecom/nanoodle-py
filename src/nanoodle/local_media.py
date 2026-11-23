@@ -18,9 +18,8 @@ import threading
 import time
 
 from .errors import NanoodleError
+from .graph import MAX_FRAMES
 from .media import MEDIA_INLINE_MAX, make_data_url, parse_data_url, sniff_mime
-
-MAX_FRAMES = 12
 
 
 # ---- children must not outlive this interpreter -----------------------------

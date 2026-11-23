@@ -5,7 +5,7 @@ import unittest
 
 from tests import fixture
 from tests._util import MockedTest
-from tests.harness import chat_response
+from tests.harness import MockNanoGPT, chat_response
 
 from nanoodle import NanoodleError, Workflow
 from nanoodle.iodef import resolve_input_key, resolve_setting_key
@@ -308,6 +308,48 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual((spec.node_id, spec.field), ("n1", "model"))
         spec2 = resolve_setting_key(wf.settings, "speech.voice", wf.graph)   # type title
         self.assertEqual((spec2.node_id, spec2.field), ("n2", "voice"))
+
+    def test_advertised_setting_key_wins_over_another_nodes_name(self):
+        with MockNanoGPT() as mock:
+            mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
+            wf = Workflow.from_dict({"nodes": [
+                {"id": "draft", "type": "llm", "name": "writer",
+                 "fields": {"model": "draft-original", "prompt": "draft"}},
+                {"id": "writer", "type": "llm", "name": "Final.Writer",
+                 "fields": {"model": "writer-original", "prompt": "writer"}},
+            ]}, api_key="fixture", base_url=mock.base_url)
+            self.assertIn("writer.model", {s.key for s in wf.settings})
+            wf.run(settings={"  WRITER.MODEL  ": "updated"})
+            picked = resolve_setting_key(wf.settings, " Final.Writer.MODEL ", wf.graph)
+            self.assertEqual(picked.key, "writer.model")
+            requests = mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual({req.json["messages"][-1]["content"]: req.json["model"] for req in requests},
+                         {"draft": "draft-original", "writer": "updated"})
+
+    def test_wired_node_address_does_not_fall_back_to_another_nodes_name(self):
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "draft", "type": "llm", "name": "writer", "fields": {"model": "draft"}},
+            {"id": "writer", "type": "llm", "name": "Finisher", "fields": {"model": "writer"}},
+            {"id": "model_name", "type": "text", "fields": {"text": "wired-model"}},
+        ], "links": [
+            {"id": "l", "from": {"node": "model_name", "port": "text"},
+             "to": {"node": "writer", "port": "model"}},
+        ]}, api_key="fixture")
+        self.assertNotIn("writer.model", {s.key for s in wf.settings})
+        for key in (" WRITEr.MODEL ", "Finisher.model"):
+            with self.subTest(key=key), self.assertRaisesRegex(NanoodleError, "wired"):
+                resolve_setting_key(wf.settings, key, wf.graph)
+
+    def test_case_colliding_node_ids_keep_their_exact_addresses(self):
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "chapter.writer", "type": "llm", "fields": {"model": "model-a"}},
+            {"id": "chapter.Writer", "type": "llm", "fields": {"model": "model-b"}},
+        ]}, api_key="fixture")
+        for key in ("chapter.writer", "chapter.Writer"):
+            with self.subTest(key=key):
+                self.assertEqual(resolve_setting_key(wf.settings, key + ".MODEL", wf.graph).node_id, key)
+        with self.assertRaisesRegex(NanoodleError, r"ambiguous.*chapter\.writer\.model.*chapter\.Writer\.model"):
+            resolve_setting_key(wf.settings, "chapter.WRITER.model", wf.graph)
 
     def test_image_size_options_match_the_app(self):
         # ground truth play.html SIZES — no invented values, 'auto' included

@@ -415,16 +415,36 @@ def resolve_input_key(inputs, key, graph):
 
 
 def resolve_setting_key(settings, key, graph):
-    k = _norm(key)
-    if "." in k:
-        # the dot-form head matches node id, custom name AND display name
-        # ("Writer.model" / "Speech.voice"), mirroring JS resolveSettingKey
-        nid, _, fld = k.partition(".")
-        nodes = [n for n in graph.nodes.values()
-                 if _norm(n.id) == nid
-                 or (n.name and _norm(n.name) == nid)
-                 or _norm(display_name(n)) == nid]
-        node_ids = set(n.id for n in nodes)
+    """Resolve canonical node settings before friendly names and bare fields."""
+    spelling = str(key).strip()
+    k = spelling.lower()
+    head, dot, field = spelling.rpartition(".")
+    if dot and head:
+        nid, fld = head.lower(), field.lower()
+        wired = dict.fromkeys(l.to_node for l in graph.links if _norm(l.to_port) == fld)
+        canonical = {s.node_id: s for s in settings if _norm(s.key) == k}
+        for node_id in wired:
+            if _norm(f"{node_id}.{fld}") == k:
+                canonical[node_id] = None
+        # Exact ID spelling disambiguates case variants. A wired canonical
+        # address still owns its key, even though it isn't advertised.
+        exact = [(node_id, spec) for node_id, spec in canonical.items() if str(node_id) == head]
+        addressed = exact or list(canonical.items())
+        if len(addressed) == 1:
+            _, spec = addressed[0]
+            if spec is None:
+                raise NanoodleError(
+                    "setting %r is wired — a link decides it upstream, it cannot be overridden" % key)
+            return spec
+        if addressed:
+            candidates = [spec.key if spec is not None else f"{node_id}.{fld} (wired)"
+                          for node_id, spec in addressed]
+            raise NanoodleError(
+                "setting name %r is ambiguous — use one of: %s" % (key, ", ".join(candidates)))
+
+        # Friendly dotted names remain valid when no canonical address owns
+        # this field ("Writer.model" / "Speech.voice").
+        node_ids = {n.id for n in graph.nodes.values() if _norm(display_name(n)) == nid}
         hit = [s for s in settings if s.node_id in node_ids and _norm(s.field) == fld]
         if len(hit) == 1:
             return hit[0]
@@ -432,13 +452,11 @@ def resolve_setting_key(settings, key, graph):
             raise NanoodleError(
                 "setting name %r is ambiguous — use one of: %s"
                 % (key, ", ".join(s.key for s in hit)))
-        # a real node.field that is wired gets a dedicated refusal
-        for node in nodes:
-            if any(l.to_node == node.id and _norm(l.to_port) == fld for l in graph.links):
-                raise NanoodleError(
-                    "setting %r is wired — a link decides it upstream, it cannot be overridden" % key)
+        if node_ids.intersection(wired):
+            raise NanoodleError(
+                "setting %r is wired — a link decides it upstream, it cannot be overridden" % key)
     named = [s for s in settings
-             if (s.node_name and _norm(s.node_name) == k) or _norm(s.key) == k]
+             if s.node_name and _norm(s.node_name) == k]
     if len(named) == 1:
         return named[0]
     if len(named) > 1:

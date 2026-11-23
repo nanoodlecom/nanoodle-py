@@ -16,7 +16,7 @@ VID_PORT_RE = re.compile(r"^vid\d*$")        # combine clips
 CLIP_PORT_RE = re.compile(r"^clip\d*$")      # combine clips (spec alias)
 REF_PORT_RE = re.compile(r"^ref\d*$")        # tvideo reference images
 FRAME_PORT_RE = re.compile(r"^frame\d+$")    # vframes outputs
-MAX_FRAMES = 12
+MAX_FRAMES = 48
 
 
 def wired_frames_floor(graph, node_id):
