@@ -15,7 +15,7 @@ silent tier. A model with no audio-switch descriptor stays silent.
 import math
 import re
 
-from .graph import IMG_PORT_RE, REF_PORT_RE
+from .graph import IMG_PORT_RE, REF_PORT_RE, Graph
 
 # Billable node type → catalog kind. A type absent here is free and local.
 PRICE_KIND = {
@@ -138,7 +138,10 @@ def _nodes(graph):
 def _links(graph):
     if graph is None:
         return []
-    links = graph.get("links") if isinstance(graph, dict) else getattr(graph, "links", None)
+    if isinstance(graph, Graph):
+        links = graph.valid_links()
+    else:
+        links = graph.get("links") if isinstance(graph, dict) else getattr(graph, "links", None)
     out = []
     for link in links or []:
         if isinstance(link, dict):

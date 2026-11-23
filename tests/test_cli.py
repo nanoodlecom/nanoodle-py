@@ -193,29 +193,51 @@ class RunCliTest(MockedTest):
         self.assertEqual(chat.json["messages"][1]["content"], "hello")
         self.assertEqual(chat.headers.get("authorization"), "Bearer cli-key")
 
-    def test_invalid_source_wire_fails_before_paid_dependent(self):
-        self.mock.script("POST", "/api/v1/chat/completions", chat_response("paid fallback"))
+    def test_malformed_wires_are_inspectable_and_stop_run_before_paid_work(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
         data = {
             "nodes": [
                 {"id": "source", "type": "text", "fields": {"text": "upstream"}},
                 {"id": "sink", "type": "llm", "fields": {"model": "m", "prompt": "stored fallback"}},
             ],
-            "links": [{"from": {"node": "source", "port": "obsoletePort"},
-                       "to": {"node": "sink", "port": "prompt"}}],
         }
+        cases = [
+            ("source", "obsoletePort", "sink", "prompt", 'undeclared source port "obsoletePort"'),
+            ("source", "text", "sink", "promtp", 'undeclared target port "promtp"'),
+            ("absent", "text", "sink", "prompt", 'missing source node "absent"'),
+            ("source", "text", "absent", "prompt", 'missing target node "absent"'),
+        ]
         with tempfile.TemporaryDirectory() as d:
             saved = Path(d) / "graph.json"
+            argv = ["run", str(saved), "--api-key", "cli-key",
+                    "--base-url", self.mock.base_url, "--json"]
+            for source, from_port, target, to_port, issue in cases:
+                with self.subTest(issue=issue):
+                    data["links"] = [{"id": "wire", "from": {"node": source, "port": from_port},
+                                      "to": {"node": target, "port": to_port}}]
+                    saved.write_text(json.dumps(data), encoding="utf-8")
+                    code, _, err = run_cli(["inspect", str(saved)])
+                    self.assertEqual(code, 0)
+                    self.assertIn(issue, err)
+                    code, out, err = run_cli(argv)
+                    self.assertEqual(code, 1)
+                    self.assertIn(issue, err)
+                    payload = json.loads(out)
+                    self.assertIn(issue, payload["errors"][0]["message"])
+                    self.assertIn(f"{source}.{from_port} → {target}.{to_port}",
+                                  payload["errors"][0]["message"])
+                    self.assertEqual(payload["nodes"], {})
+                    self.assertIsNone(payload["outputs"]["LLM"])
+                    self.assertEqual(payload["costUsd"], 0.0)
+                    self.assertEqual(self.mock.requests, [])
+
+            data["links"] = [{"id": "wire", "from": {"node": "source", "port": "text"},
+                              "to": {"node": "sink", "port": "prompt"}}]
             saved.write_text(json.dumps(data), encoding="utf-8")
-            code, out, err = run_cli(["run", str(saved), "--api-key", "cli-key",
-                                      "--base-url", self.mock.base_url, "--json"])
-        self.assertEqual(code, 1)
-        self.assertIn("undeclared source port", err)
-        payload = json.loads(out)
-        self.assertIn("wire source.obsoletePort → sink.prompt", payload["errors"][0]["message"])
-        self.assertEqual(payload["nodes"], {})
-        self.assertEqual(payload["outputs"], {"LLM": None})
-        self.assertEqual(payload["costUsd"], 0.0)
-        self.assertEqual(self.mock.requests, [])
+            code, out, err = run_cli(argv)
+        self.assertEqual(code, 0, err or out)
+        req, = self.mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual(req.json["messages"][-1]["content"], "upstream")
 
     def test_run_set_overrides_setting(self):
         self._script_ok()

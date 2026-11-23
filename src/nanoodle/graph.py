@@ -28,9 +28,8 @@ def wired_frames_floor(graph, node_id):
     wiredFramesFloor — floor is raised at run and in derive_settings.
     """
     floor = 1
-    for link in (graph.links if graph is not None else []) or []:
-        if link.from_node != node_id:
-            continue
+    outbound = graph.outbound(node_id) if graph is not None else ()
+    for link in outbound:
         if isinstance(link.from_port, str):
             floor = max(floor, _FRAME_PORT_INDEX.get(link.from_port, 1))
     return floor
@@ -109,6 +108,49 @@ NODE_TYPES = {
     "comment":    {"title": "Comment",          "outputs": [], "note": True},
 }
 
+# Field overrides consumed by the SDK runners. Keep their wireability independent
+# of stored values and modes: for example a Choice can set a downstream model.
+_LORA_FIELDS = ("loras", "loraUrl", "loraStrength")
+_IMAGE_FIELDS = ("model", "prompt", "size", "seed", "modelOpts", "customCivitaiAir", *_LORA_FIELDS)
+_VIDEO_FIELDS = ("model", "prompt", "resolution", "aspect", "duration", "modelOpts")
+_AUDIO_FIELDS = ("model", "prompt", "response_format", "extraJson")
+_WIRE_FIELDS = {
+    "text": ("text",),
+    "upload": ("image", "optional"),
+    "aupload": ("audio", "optional"),
+    "vupload": ("video", "optional"),
+    "mupload": ("model", "optional"),
+    "choice": ("options", "selected"),
+    "join": ("sep",),
+    "llm": ("model", "prompt", "system", "temperature", "maxTokens", "format",
+            "reasoningEffort", "showThinking"),
+    "image": (*_IMAGE_FIELDS, "variations", "sel"),
+    "edit": _IMAGE_FIELDS,
+    "inpaint": _IMAGE_FIELDS,
+    "slice-3d": ("preset", "clip", "frames", "slices", "resolution", "palette", "outline", "upAxis"),
+    "sprite-stack-render": ("yaw", "pitch", "spacing", "scale", "turntable", "fps", "duration",
+                            "yawStart", "yawEnd"),
+    "resize": ("mode", "width", "height"),
+    "vision": ("model", "q"),
+    "decide": ("model", "mode", "question", "options", "levels", "gate"),  # branching is authored
+    "tvideo": (*_VIDEO_FIELDS, *_LORA_FIELDS),
+    "ivideo": (*_VIDEO_FIELDS, *_LORA_FIELDS),
+    "vedit": (*_VIDEO_FIELDS, *_LORA_FIELDS),
+    "lipsync": _VIDEO_FIELDS,
+    "model3d": _VIDEO_FIELDS,
+    "vframes": ("frames", "gap", "dir", "stride", "startSec", "endSec"),
+    "combine": ("dedup",),
+    "soundtrack": ("loop",),
+    "music": (*_AUDIO_FIELDS, "lyrics", "instrumental", "duration", "negative_prompt", "seed"),
+    "remix": (*_AUDIO_FIELDS, "lyrics", "duration"),
+    "tts": (*_AUDIO_FIELDS, "voice", "speed", "instructions"),
+    "trim": ("start", "length"),
+    "extractaudio": ("start", "length"),
+    "transcribe": ("model", "language"),
+    "cleanvoice": ("model", "url"),
+    "endpoint": ("model", "auth", "prompt", "system", "size"),
+}
+
 # Kept for import compatibility; empty — local media ops are implemented (need ffmpeg).
 UNSUPPORTED_TYPES = tuple(t for t, s in NODE_TYPES.items() if s.get("unsupported"))
 
@@ -144,16 +186,24 @@ class Graph(object):
         self.warnings = warnings    # list of str
 
     def node(self, node_id):
-        return self.nodes.get(node_id)
+        try:
+            return self.nodes.get(node_id)
+        except TypeError:
+            return None
+
+    def valid_links(self):
+        """Links that count for inspection and estimation. Run validates every link."""
+        return (link for link in self.links if not wire_issue(self, link))
 
     def inbound(self, node_id):
-        return [l for l in self.links if l.to_node == node_id]
+        return [l for l in self.links if l.to_node == node_id and not wire_issue(self, l)]
 
     def outbound(self, node_id):
-        return [l for l in self.links if l.from_node == node_id]
+        return [l for l in self.links if l.from_node == node_id and not wire_issue(self, l)]
 
     def port_is_fed(self, node_id, port):
-        return any(l.to_node == node_id and l.to_port == port for l in self.links)
+        return any(l.to_node == node_id and l.to_port == port and not wire_issue(self, l)
+                   for l in self.links)
 
 
 def optional_node(node):
@@ -183,6 +233,16 @@ def display_name(node):
     return node.type or "?"
 
 
+def _wire_path(link):
+    return "wire %s.%s → %s.%s" % (link.from_node, link.from_port, link.to_node, link.to_port)
+
+
+def is_input_port(node, port):
+    spec = node.spec()
+    return isinstance(port, str) and (port in spec.get("static", ())
+                                      or any(rx.fullmatch(port) for rx in spec.get("dynamic", ())))
+
+
 def source_wire_issue(source, link):
     """Describe an undeclared source port, independent of what a run emits."""
     if source is None or source.type not in NODE_TYPES:
@@ -193,8 +253,33 @@ def source_wire_issue(source, link):
             or port in spec.get("extra_source_ports", ())
             or (source.type == "vframes" and isinstance(port, str) and port in _FRAME_PORT_INDEX)):
         return None
-    return ('wire %s.%s → %s.%s uses undeclared source port "%s" on %s'
-            % (link.from_node, port, link.to_node, link.to_port, port, display_name(source)))
+    return ('%s uses undeclared source port "%s" on %s'
+            % (_wire_path(link), port, display_name(source)))
+
+
+def wire_issue(graph, link):
+    """Describe the first structural problem with a wire kept for inspection."""
+    source, target = graph.node(link.from_node), graph.node(link.to_node)
+    if source is None:
+        return '%s references missing source node "%s"' % (_wire_path(link), link.from_node)
+    if target is None:
+        return '%s references missing target node "%s"' % (_wire_path(link), link.to_node)
+    issue = source_wire_issue(source, link)
+    if issue:
+        return issue
+    port = link.to_port
+    # The editor can attach these media inputs, but Python would discard them.
+    video_edit_image = target.type == "vedit" and (
+        port == "image" or (isinstance(port, str) and REF_PORT_RE.fullmatch(port)))
+    if video_edit_image or (target.type == "llm" and port == "video"):
+        return ('%s uses %s input "%s", which the Python SDK cannot send. '
+                'Run the graph in the browser or remove the wire.'
+                % (_wire_path(link), display_name(target), port))
+    if (target.type in NODE_TYPES and not is_input_port(target, port)
+            and port not in _WIRE_FIELDS.get(target.type, ())):
+        return ('%s uses undeclared target port "%s" on %s'
+                % (_wire_path(link), port, display_name(target)))
+    return None
 
 
 # Media fields hold a data: or http(s) URL (the editor writes data: URLs; hand-authored
@@ -235,9 +320,8 @@ def materialize(data, warnings=None):
 
     Loader semantics replicated from the app:
       - type alias: audio -> tts (legacy)
-      - links kept only when both endpoints exist
       - links into a music/tts node's "text" port are migrated to "prompt"
-      - links with undeclared source ports are kept with a warning
+      - wires with missing nodes or undeclared ports are kept with a warning
     Unknown node types are KEPT (with a load warning) — run() fails fast on them.
     """
     if isinstance(data, str):
@@ -270,22 +354,24 @@ def materialize(data, warnings=None):
             _scrub_media_placeholders(nid, fields, warnings, ntype)
         nodes[nid] = Node(nid, ntype, fields, raw.get("name"))
 
-    links = []
+    graph = Graph(nodes, [], warnings)
     for raw in (data.get("links") or []):
-        f, t = raw.get("from") or {}, raw.get("to") or {}
+        raw = raw if isinstance(raw, dict) else {}
+        f, t = raw.get("from"), raw.get("to")
+        f = f if isinstance(f, dict) else {}
+        t = t if isinstance(t, dict) else {}
         fn, fp, tn, tp = f.get("node"), f.get("port"), t.get("node"), t.get("port")
-        if fn not in nodes or tn not in nodes:
-            continue  # orphaned link
         # migration: legacy music/tts inbound "text" port is now "prompt"
-        if tp == "text" and nodes[tn].type in ("music", "tts"):
+        target = graph.node(tn)
+        if tp == "text" and target is not None and target.type in ("music", "tts"):
             tp = "prompt"
         link = Link(raw.get("id"), fn, fp, tn, tp)
-        links.append(link)
-        issue = source_wire_issue(nodes[fn], link)
+        graph.links.append(link)
+        issue = wire_issue(graph, link)
         if issue:
             warnings.append(issue)
 
-    return Graph(nodes, links, warnings)
+    return graph
 
 
 def topo_order(graph):
@@ -295,7 +381,7 @@ def topo_order(graph):
     indeg = {nid: 0 for nid in ids}
     down = {nid: [] for nid in ids}
     seen_edges = set()
-    for l in graph.links:
+    for l in graph.valid_links():
         if l.from_node in idset and l.to_node in idset:
             edge = (l.from_node, l.to_node)
             if edge in seen_edges:
@@ -323,18 +409,15 @@ def classify_inbound(node, links):
     """Split a node's inbound links into media/text INPUT ports vs FIELD OVERRIDES.
 
     Declared static ports and dynamic families feed the node's input dict;
-    ANY other inbound link overrides the same-named field (that is how wired
+    A declared field wire overrides the same-named field (that is how wired
     prompt/system/lyrics/q replace typed values). Returns (inputs, overrides)
     as {port_or_field: (from_node, from_port)}.
     """
-    spec = NODE_TYPES.get(node.type, {})
-    static = set(spec.get("static") or [])
-    dynamic = spec.get("dynamic") or []
     inputs, overrides = {}, {}
     for l in links:
         port = l.to_port
-        if port in static or any(rx.match(port) for rx in dynamic):
+        if is_input_port(node, port):
             inputs[port] = (l.from_node, l.from_port)
-        else:
+        elif port in _WIRE_FIELDS.get(node.type, ()):
             overrides[port] = (l.from_node, l.from_port)
     return inputs, overrides

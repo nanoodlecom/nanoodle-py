@@ -16,7 +16,7 @@ from .decide import DecideGateClosed
 from .endpoint import endpoint_out_port
 from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, display_name,
-                    materialize, source_wire_issue, topo_order, wired_frames_floor)
+                    materialize, topo_order, wire_issue, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
 from .media import MEDIA_INLINE_MAX, MediaRef, make_data_url
@@ -327,6 +327,18 @@ class Workflow(object):
                                     % threading.TIMEOUT_MAX)
         graph = self._copy_graph()
 
+        # Reject invalid graphs before resolving inputs or starting any node.
+        for node in graph.nodes.values():
+            if node.type not in NODE_TYPES:
+                raise UnsupportedNodeError(
+                    node.id, node.type,
+                    "unknown node type '%s' (node %s '%s') — this workflow needs a newer "
+                    "library or the nanoodle browser app" % (node.type, node.id, display_name(node)))
+        for link in graph.links:
+            issue = wire_issue(graph, link)
+            if issue:
+                raise NanoodleError(issue)
+
         # Network nodes force the ~4 MB MEDIA_INLINE_MAX guard on user media
         # inputs (NanoGPT has no upload endpoint). Local-only graphs (resize /
         # vframes / combine / …) accept larger data: URLs for on-device ffmpeg.
@@ -368,18 +380,7 @@ class Workflow(object):
             raise NanoodleError("missing required input%s: %s"
                                 % ("s" if len(missing) > 1 else "", ", ".join(missing)))
 
-        # 3. fail fast BEFORE spending: unknown node types, invalid wires, API key
-        for node in graph.nodes.values():
-            tspec = NODE_TYPES.get(node.type)
-            if tspec is None:
-                raise UnsupportedNodeError(
-                    node.id, node.type,
-                    "unknown node type '%s' (node %s '%s') — this workflow needs a newer "
-                    "library or the nanoodle browser app" % (node.type, node.id, display_name(node)))
-        for link in graph.links:
-            issue = source_wire_issue(graph.node(link.from_node), link)
-            if issue:
-                raise NanoodleError(issue)
+        # 3. Require credentials before any paid request.
         if has_network and not self._api_key and self._payment is None:
             raise NanoodleError("no API key — pass api_key=, set the NANOGPT_API_KEY "
                                 "environment variable, or pass payment= for accountless "
@@ -553,8 +554,6 @@ class Workflow(object):
             if overrides:
                 node = copy.deepcopy(node)
                 for port, (src, sport) in overrides.items():
-                    if node.type == "decide" and port == "branch":
-                        continue  # routing is authored in the graph
                     v = (runs[src].out or {}).get(sport)
                     if v is None:
                         continue  # play.html: if(v!=null) — a null upstream value

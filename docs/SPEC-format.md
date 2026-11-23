@@ -22,7 +22,7 @@ Verified against /home/ntc/dev/nanoodlecom/nanoodle/index.html (editor). The �
 ## Loader semantics (applyGraphData, index.html:8815-8860) — REPLICATE THESE
 - Type alias: `audio` → `tts` (legacy).
 - Unknown node type → node silently skipped (library: keep node but error only if it must run — see DESIGN; simplest faithful behavior: drop unknown-type nodes AND their links, but surface a warning).
-- Links kept only if BOTH endpoints exist after node filtering.
+- Python retains malformed wires for inspection and rejects a run if a wire names a missing endpoint node or an undeclared port.
 - Migration: links into a `music`/`tts` node with `to.port === "text"` are rewritten to `"prompt"`.
 - Media fields are `data:` URLs inline in `fields` (image/audio/video/mask). Share links may have them blanked to "".
 
