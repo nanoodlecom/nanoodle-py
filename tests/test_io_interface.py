@@ -4,7 +4,7 @@ key-resolution order incl. ambiguity errors (SPEC-io)."""
 import unittest
 
 from tests import fixture
-from tests._util import MockedTest
+from tests._util import MockedTest, tripwire_http
 from tests.harness import MockNanoGPT, chat_response
 
 from nanoodle import NanoodleError, Workflow
@@ -60,6 +60,14 @@ class InputDerivationTest(unittest.TestCase):
         self.assertIn(("n2", "mask"), specs)
         self.assertEqual(specs[("n2", "mask")].label, "Mask (white = repaint)")
         self.assertNotIn(("n2", "image"), specs)
+
+    def test_inpaint_defaults_expose_baked_image_and_mask(self):
+        media = {"image": "data:image/png;base64,QUJD", "mask": "data:image/png;base64,REVG"}
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "paint", "type": "inpaint", "fields": {"prompt": "baked prompt", **media}},
+        ]}, api_key="", http=tripwire_http)
+        defaults = {spec.field: spec.default for spec in wf.inputs if spec.kind == "image"}
+        self.assertEqual(defaults, media)
 
     def test_choice_input_options_and_default(self):
         wf = Workflow.load(fixture("join-choice.json"), api_key="k")
@@ -222,6 +230,40 @@ class DuplicateCustomNamesAtRunTest(MockedTest):
         self.assertIn("ambiguous", str(ctx.exception))
 
 
+class LockedFieldsTest(MockedTest):
+    def test_author_lock_rejects_user_overrides_and_preserves_graph_wires(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
+        graph = {"nodes": [
+            {"id": "label", "type": "text", "name": "Banner", "fields": {
+                "text": "authored prompt", "locked": True,
+            }},
+            {"id": "writer", "type": "llm", "name": "Writer", "fields": {
+                "model": "authored-model", "system": "authored system", "locked": "true",
+            }},
+        ], "links": [
+            {"from": {"node": "label", "port": "text"}, "to": {"node": "writer", "port": "prompt"}},
+        ]}
+        wf = self.wf_dict(graph)
+        self.assertEqual(wf.inputs, [])
+        with self.assertRaisesRegex(NanoodleError, "unknown input"):
+            wf.run({"label.text": "replacement"})
+        with self.assertRaisesRegex(NanoodleError, "targets locked node writer"):
+            wf.run(settings={"writer.model": "replacement"})
+        self.assertEqual(self.mock.requests, [])
+
+        self.assertEqual(wf.run()["Writer"], "ok")
+        req, = self.mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual(req.json["model"], "authored-model")
+        self.assertEqual(req.json["messages"], [
+            {"role": "system", "content": "authored system"},
+            {"role": "user", "content": "authored prompt"},
+        ])
+
+        graph["nodes"][1]["fields"]["locked"] = False
+        self.wf_dict(graph).run(settings={"writer.model": "replacement"})
+        self.assertEqual(self.mock.requests[-1].json["model"], "replacement")
+
+
 class OutputDerivationTest(unittest.TestCase):
     def test_sinks_only(self):
         wf = Workflow.load(fixture("starter-graph.json"), api_key="k")
@@ -233,6 +275,22 @@ class OutputDerivationTest(unittest.TestCase):
         wf = Workflow.load(fixture("duplicate-names.json"), api_key="k")
         self.assertEqual([o.key for o in wf.outputs], ["Writer", "Writer 2"])
         self.assertEqual([o.node_id for o in wf.outputs], ["n3", "n4"])
+
+    def test_numeric_node_ids_allow_normalized_output_lookup_and_missing_keys(self):
+        wf = Workflow.from_dict({"nodes": [
+            {"id": 7, "type": "text", "name": "Numeric", "fields": {"text": "first"}},
+            {"id": "second", "type": "text", "name": "Other", "fields": {"text": "second"}},
+        ]}, api_key="", http=tripwire_http)
+        result = wf.run()
+        self.assertIn(7, result.outputs)
+        self.assertEqual(result[7], "first")
+        self.assertEqual(result["7"], "first")
+        self.assertEqual(result[" OTHER "], "second")
+        self.assertEqual(result.get("missing", "fallback"), "fallback")
+        self.assertNotIn("missing", result)
+        with self.assertRaisesRegex(KeyError, "available: 7, Numeric, Other, second"):
+            result["missing"]
+        self.assertIn("outputs=[7, 'Numeric', 'Other', 'second']", repr(result))
 
     def test_authored_suffixes_and_case_variants_stay_addressable(self):
         wf = Workflow.from_dict({"nodes": [

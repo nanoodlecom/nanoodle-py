@@ -223,6 +223,12 @@ def optional_node(node):
     return v is True or v == "true"
 
 
+def locked_node(node):
+    """Whether the author locked the node's fields against user overrides."""
+    flag = node.fields.get("locked")
+    return flag is True or flag == "true"
+
+
 def display_name(node):
     """node.name (trimmed) -> type title -> type -> '?' (play.html displayName)."""
     if node is None:

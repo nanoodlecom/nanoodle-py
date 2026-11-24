@@ -16,7 +16,7 @@ from .decide import DecideGateClosed
 from .endpoint import endpoint_out_port
 from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, competing_input_issues,
-                    display_name, materialize, topo_order, unconditional_competing_input_issues,
+                    display_name, locked_node, materialize, topo_order, unconditional_competing_input_issues,
                     wire_issue, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
@@ -180,15 +180,16 @@ class RunResult(object):
     def __getitem__(self, key):
         if key in self.outputs:
             return self.outputs[key]
+        normalized = str(key).strip().lower()
         for k in self.outputs:
-            if k.strip().lower() == str(key).strip().lower():
+            if str(k).strip().lower() == normalized:
                 return self.outputs[k]
-        gate = self._gated_outputs.get(str(key).strip().lower())
+        gate = self._gated_outputs.get(normalized)
         if gate is not None:
             raise GatedOutputError(
                 "output %r was skipped — the gate %r answered no, so it never ran "
                 "(see result.gated)" % (key, gate))
-        raise KeyError("no output %r — available: %s" % (key, ", ".join(sorted(self.outputs))))
+        raise KeyError("no output %r — available: %s" % (key, ", ".join(sorted(map(str, self.outputs)))))
 
     def get(self, key, default=None):
         try:
@@ -201,7 +202,7 @@ class RunResult(object):
 
     def __repr__(self):
         return "RunResult(outputs=%r, cost_usd=%r, errors=%d)" % (
-            sorted(self.outputs), self.cost_usd, len(self.errors))
+            sorted(self.outputs, key=str), self.cost_usd, len(self.errors))
 
 
 _MISSING = object()
@@ -357,7 +358,11 @@ class Workflow(object):
             explicit.add(id(spec))
         for key, value in (settings or {}).items():
             sspec = resolve_setting_key(self.settings, key, graph)
-            graph.node(sspec.node_id).fields[sspec.field] = value
+            target = graph.node(sspec.node_id)
+            if locked_node(target):
+                raise NanoodleError("setting %r targets locked node %s (%s)"
+                                    % (key, target.id, display_name(target)))
+            target.fields[sspec.field] = value
 
         issues = unconditional_competing_input_issues(graph)
         if issues:

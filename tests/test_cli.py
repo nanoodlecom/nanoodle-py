@@ -193,6 +193,43 @@ class RunCliTest(MockedTest):
         self.assertEqual(chat.json["messages"][1]["content"], "hello")
         self.assertEqual(chat.headers.get("authorization"), "Bearer cli-key")
 
+    def test_cycle_failure_preserves_json_diagnostic(self):
+        code, out, err = run_cli(["run", fixture("cycle.json"), "--json"])
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertEqual(report["nodes"], {})
+        self.assertEqual(report["outputs"], {})
+        self.assertEqual(report["costUsd"], 0.0)
+        message = report["errors"][0]["message"]
+        self.assertIn("cycle involving", message)
+        self.assertIn("n1", message)
+        self.assertIn("n2", message)
+        self.assertIn(message, err)
+        self.assertEqual(self.mock.requests, [])
+
+    def test_distinct_media_outputs_get_distinct_sanitized_filenames(self):
+        clip_a = Path(fixture("media/clipA.mp4")).read_bytes()
+        clip_b = Path(fixture("media/clipB.mp4")).read_bytes()
+        clips = {"Clip / A": clip_a, "Clip ? A": clip_b, "clip_A_2": clip_a}
+        graph = {"nodes": [
+            {"id": f"v{i}", "type": "vupload", "name": name, "fields": {
+                "video": "data:video/mp4;base64," + base64.b64encode(data).decode("ascii"),
+            }} for i, (name, data) in enumerate(clips.items())
+        ]}
+        with tempfile.TemporaryDirectory() as d:
+            saved = Path(d) / "graph.json"
+            saved.write_text(json.dumps(graph), encoding="utf-8")
+            folder = Path(d) / "out"
+            code, out, err = run_cli(["run", str(saved), "--out", str(folder), "--json"])
+            self.assertEqual(code, 0, err or out)
+            files = {name: Path(output["file"]) for name, output in json.loads(out)["outputs"].items()}
+            self.assertEqual({name: path.name for name, path in files.items()}, {
+                "Clip / A": "Clip_A.mp4", "Clip ? A": "Clip_A_3.mp4", "clip_A_2": "clip_A_2.mp4",
+            })
+            self.assertEqual({name: path.read_bytes() for name, path in files.items()}, clips)
+            self.assertEqual(set(folder.iterdir()), set(files.values()))
+        self.assertEqual(self.mock.requests, [])
+
     def test_malformed_wires_are_inspectable_and_stop_run_before_paid_work(self):
         self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
         data = {

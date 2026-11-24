@@ -123,15 +123,31 @@ def cmd_inspect(args):
 
 
 def _save_outputs(result, keys, out_dir):
-    saved = {}
     os.makedirs(out_dir, exist_ok=True)
+    media = []
     for key in keys:
         value = result.outputs.get(key)
         if isinstance(value, MediaRef):
             safe = re.sub(r"[^A-Za-z0-9._-]+", "_", key).strip("_") or "output"
-            path = os.path.join(out_dir, "%s.%s" % (safe, value.suggested_extension()))
-            value.save(path)
-            saved[key] = path
+            media.append((key, value, safe, value.suggested_extension()))
+
+    # Reserve preferred filenames first, including for outputs saved later.
+    reserved = {f"{stem}.{ext}".lower() for _, _, stem, ext in media}
+    used = set()
+    saved = {}
+    for key, value, stem, ext in media:
+        filename = f"{stem}.{ext}"
+        if filename.lower() in used:
+            suffix = 2
+            filename = f"{stem}_{suffix}.{ext}"
+            while filename.lower() in reserved:
+                suffix += 1
+                filename = f"{stem}_{suffix}.{ext}"
+            reserved.add(filename.lower())
+        used.add(filename.lower())
+        path = os.path.join(out_dir, filename)
+        value.save(path)
+        saved[key] = path
     return saved
 
 
@@ -158,7 +174,14 @@ def _print_prerun_failure_json(wf, exc):
     Print the same shape as the post-execution failure, with the fields that describe
     execution empty, because nothing executed: no nodes ran, nothing was spent.
     """
-    payload = {"outputs": {o.key: None for o in wf.outputs} if wf is not None else {},
+    outputs = {}
+    if wf is not None:
+        try:
+            outputs = dict.fromkeys(o.key for o in wf.outputs)
+        except NanoodleError:
+            # A cyclic graph cannot derive its outputs. Report the original error.
+            pass
+    payload = {"outputs": outputs,
                "costUsd": 0.0, "costExact": True, "remainingBalance": None,
                "nodes": {},
                "errors": [{"node_id": None, "name": None, "message": str(exc)}],
