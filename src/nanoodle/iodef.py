@@ -5,7 +5,7 @@ from dataclasses import dataclass, field as dc_field
 from typing import Any, List, Optional
 
 from .errors import NanoodleError
-from .graph import (MAX_FRAMES, NODE_TYPES, display_name, optional_node,
+from .graph import (MAX_FRAMES, NODE_TYPES, display_name, locked_node, optional_node,
                     topo_order, wired_frames_floor)
 
 
@@ -176,6 +176,8 @@ def derive_inputs(graph, catalog=None):
     """
     out = []
     for node in graph.nodes.values():
+        if locked_node(node):
+            continue
         fed = lambda port: graph.port_is_fed(node.id, port)  # noqa: E731
         name = (str(node.name).strip() or None) if node.name else None
         author_optional = optional_node(node)
@@ -188,14 +190,16 @@ def derive_inputs(graph, catalog=None):
             if not img_fed:
                 out.append(InputSpec("", node.id, "image", "image",
                                      "Image" if mask_fed else "Image — brush the area to repaint",
-                                     optional=author_optional, node_name=name))
+                                     optional=author_optional,
+                                     default=_field_default(node, "image", None), node_name=name))
             if not mask_fed:
                 # derived whenever the mask port is unwired — including the
                 # neither-wired case (play.html's combined upload+brush control
                 # writes BOTH fields.image and fields.mask); a baked fields.mask
                 # satisfies the required-input check.
                 out.append(InputSpec("", node.id, "mask", "image", "Mask (white = repaint)",
-                                     optional=author_optional, node_name=name))
+                                     optional=author_optional,
+                                     default=_field_default(node, "mask", None), node_name=name))
             continue
         if node.type == "choice":
             opts = [s.strip() for s in str(node.fields.get("options") or "").split("\n") if s.strip()]

@@ -16,7 +16,7 @@ from .decide import DecideGateClosed
 from .endpoint import endpoint_out_port
 from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, competing_input_issues,
-                    display_name, materialize, topo_order, unconditional_competing_input_issues,
+                    display_name, locked_node, materialize, topo_order, unconditional_competing_input_issues,
                     wire_issue, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
@@ -358,7 +358,11 @@ class Workflow(object):
             explicit.add(id(spec))
         for key, value in (settings or {}).items():
             sspec = resolve_setting_key(self.settings, key, graph)
-            graph.node(sspec.node_id).fields[sspec.field] = value
+            target = graph.node(sspec.node_id)
+            if locked_node(target):
+                raise NanoodleError("setting %r targets locked node %s (%s)"
+                                    % (key, target.id, display_name(target)))
+            target.fields[sspec.field] = value
 
         issues = unconditional_competing_input_issues(graph)
         if issues:

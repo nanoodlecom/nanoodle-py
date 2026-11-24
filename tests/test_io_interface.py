@@ -61,6 +61,14 @@ class InputDerivationTest(unittest.TestCase):
         self.assertEqual(specs[("n2", "mask")].label, "Mask (white = repaint)")
         self.assertNotIn(("n2", "image"), specs)
 
+    def test_inpaint_defaults_expose_baked_image_and_mask(self):
+        media = {"image": "data:image/png;base64,QUJD", "mask": "data:image/png;base64,REVG"}
+        wf = Workflow.from_dict({"nodes": [
+            {"id": "paint", "type": "inpaint", "fields": {"prompt": "baked prompt", **media}},
+        ]}, api_key="", http=tripwire_http)
+        defaults = {spec.field: spec.default for spec in wf.inputs if spec.kind == "image"}
+        self.assertEqual(defaults, media)
+
     def test_choice_input_options_and_default(self):
         wf = Workflow.load(fixture("join-choice.json"), api_key="k")
         choice = next(s for s in wf.inputs if s.kind == "choice")
@@ -220,6 +228,40 @@ class DuplicateCustomNamesAtRunTest(MockedTest):
         with self.assertRaises(NanoodleError) as ctx:
             wf.run({"System prompt": "x"})
         self.assertIn("ambiguous", str(ctx.exception))
+
+
+class LockedFieldsTest(MockedTest):
+    def test_author_lock_rejects_user_overrides_and_preserves_graph_wires(self):
+        self.mock.script("POST", "/api/v1/chat/completions", chat_response("ok"))
+        graph = {"nodes": [
+            {"id": "label", "type": "text", "name": "Banner", "fields": {
+                "text": "authored prompt", "locked": True,
+            }},
+            {"id": "writer", "type": "llm", "name": "Writer", "fields": {
+                "model": "authored-model", "system": "authored system", "locked": "true",
+            }},
+        ], "links": [
+            {"from": {"node": "label", "port": "text"}, "to": {"node": "writer", "port": "prompt"}},
+        ]}
+        wf = self.wf_dict(graph)
+        self.assertEqual(wf.inputs, [])
+        with self.assertRaisesRegex(NanoodleError, "unknown input"):
+            wf.run({"label.text": "replacement"})
+        with self.assertRaisesRegex(NanoodleError, "targets locked node writer"):
+            wf.run(settings={"writer.model": "replacement"})
+        self.assertEqual(self.mock.requests, [])
+
+        self.assertEqual(wf.run()["Writer"], "ok")
+        req, = self.mock.requests_to("/api/v1/chat/completions")
+        self.assertEqual(req.json["model"], "authored-model")
+        self.assertEqual(req.json["messages"], [
+            {"role": "system", "content": "authored system"},
+            {"role": "user", "content": "authored prompt"},
+        ])
+
+        graph["nodes"][1]["fields"]["locked"] = False
+        self.wf_dict(graph).run(settings={"writer.model": "replacement"})
+        self.assertEqual(self.mock.requests[-1].json["model"], "replacement")
 
 
 class OutputDerivationTest(unittest.TestCase):

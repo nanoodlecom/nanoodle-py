@@ -12,8 +12,10 @@ INPUT_SPECS table (only these node types contribute; kind in parens):
 - choice (special): field `selected`, kind choice, options from fields.options newline-split
 
 Required unless marked optional. `def` = prefilled default.
+Unwired inpaint image and mask inputs expose any media stored in the graph as their defaults.
 An input node whose `fields.optional` is true (the editor's optional checkbox) makes EVERY input that node
 surfaces optional: run() skips it and the node yields an empty value instead of failing.
+An author-locked node (`fields.locked` set to `true` or `"true"`) hides its user inputs and rejects settings overrides. Graph wires still feed the node.
 
 ## Input NAMING (for run({name: value}) resolution)
 - Node display name = node.name (trimmed) → NODE_TYPES[type].title → type.
