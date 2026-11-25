@@ -11,7 +11,7 @@ import re
 from .errors import NanoodleError
 
 DECIDE_ENDPOINT = "/api/v1/decisions"
-DECIDE_DEFAULT_MODEL = "perplexity/pplx-decider-v1.1-27b"
+DECIDE_DEFAULT_MODEL = "perplexity/pplx-decider-v1.2"
 DECIDE_SCALE_DEFAULT = "poor\nokay\ngood\ngreat"
 # The live limits of every image-capable decision model at launch (catalog decision_input.image_limits).
 DECIDE_IMG_FALLBACK = {"maxImages": 4, "maxDimension": 512, "maxEncodedBytes": 240000}
