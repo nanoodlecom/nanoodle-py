@@ -1,5 +1,6 @@
 """Offline regressions for lifecycle transitions found in the state-machine audit."""
 
+import json
 import threading
 import time
 import unittest
@@ -10,6 +11,7 @@ from tests.test_x402 import BASE, CHAT_OK, fresh_402, json_resp
 from nanoodle import NanoodleError, RunError, Workflow
 from nanoodle.engine import Engine, NodeCancelled
 from nanoodle.transport import HttpResponse
+from nanoodle.workflow import _DaemonPool
 
 
 def workflow(kind="llm", **opts):
@@ -197,6 +199,59 @@ class RunLifecycleTest(unittest.TestCase):
         with self.assertRaises(RunError):
             workflow(http=lambda *a, **kw: calls.append(a)).run(timeout=0)
         self.assertEqual(calls, [])
+
+    def test_deadline_rejects_late_node_results_even_when_the_scheduler_is_busy(self):
+        timeout = 0.25
+        quick = {"id": "quick", "type": "llm", "name": "Quick", "fields": {
+            "model": "quick", "prompt": "Reply quickly",
+        }}
+        cases = (
+            ("llm", {"model": "late", "prompt": "Reply later"}, dict(CHAT_OK, cost=0.2)),
+            ("decide", {"model": "late", "mode": "yesno", "gate": True, "question": "Proceed?"},
+             {"answers": {"answer": {"type": "noul", "noul": 0}}, "usage": {"cost": 0.2}}),
+        )
+        for kind, fields, late_body in cases:
+            with self.subTest(kind=kind):
+                started = threading.Event()
+                release = threading.Event()
+                finished = threading.Event()
+                late = {"id": "late", "type": kind, "name": "Late", "fields": fields}
+
+                def http(method, url, body=None, **kwargs):
+                    if json.loads(body)["model"] == "late":
+                        started.set()
+                        release.wait(2)
+                        return json_resp(200, late_body)
+                    started.wait(2)
+                    return json_resp(200, dict(CHAT_OK, cost=0.1))
+
+                def progress(event):
+                    if event["type"] == "node-done" and event["node_id"] == "quick":
+                        time.sleep(timeout + 0.05)
+                        release.set()
+                        finished.wait(2)
+
+                submit = _DaemonPool.submit
+
+                def monitor(pool, job, node_id, inbound):
+                    future = submit(pool, job, node_id, inbound)
+                    if node_id == "late":
+                        future.add_done_callback(lambda _: finished.set())
+                    return future
+
+                wf = Workflow.from_dict({"nodes": [quick, late]}, api_key="k", http=http)
+                with mock.patch.object(_DaemonPool, "submit", monitor), self.assertRaises(RunError) as ctx:
+                    wf.run(timeout=timeout, on_progress=progress)
+                result = ctx.exception.result
+                self.assertTrue(finished.is_set())
+                self.assertEqual(result.nodes["quick"].status, "done")
+                self.assertEqual(result.nodes["late"].status, "error")
+                self.assertIn("run timed out", result.nodes["late"].error)
+                self.assertNotIn("Late", result)
+                self.assertEqual(result.gated, [])
+                self.assertAlmostEqual(result.nodes["late"].cost_usd, 0.2)
+                self.assertAlmostEqual(result.cost_usd, 0.3)
+                self.assertTrue(result.cost_exact)
 
     def test_late_cost_cannot_mutate_returned_node_or_claim_exact_total(self):
         release = threading.Event()

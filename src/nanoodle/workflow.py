@@ -597,6 +597,9 @@ class Workflow(object):
                        node.fields.get("model"), trimmed["cap"]))
             try:
                 out = engine.run_node(node, inp, make_on_cost(nid))
+            except DecideGateClosed:
+                engine.check_cancel()
+                raise
             except NanoodleError as e:
                 # A prompt-length rejection is free (nothing was generated) and, once
                 # banked, preventable: the next run fits the prompt before sending. Say
@@ -607,6 +610,10 @@ class Workflow(object):
                         "%s — noted: nanoodle keeps this model's prompt inside that limit "
                         "from now on, so running again should succeed" % e) from e
                 raise
+            # Billing has already been recorded. A response that arrives after
+            # the deadline must not become a successful output because the
+            # scheduler was busy when the worker finished.
+            engine.check_cancel()
             return out, time.monotonic() - t0
 
         pool = _DaemonPool(max_workers=max(1, min(8, len(order))),
