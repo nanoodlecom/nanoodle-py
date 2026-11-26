@@ -468,6 +468,62 @@ class FailedRunJsonTest(MockedTest):
         self.assertIn("error: output node", err)
 
 
+class OutputSaveFailureTest(MockedTest):
+    def test_missing_hosted_output_preserves_cost_and_saves_other_media(self):
+        asset = self.mock.base_url + "/missing.png"
+        self.mock.script("POST", "/v1/images/generations", image_response(urls=[asset], cost=0.2, balance=3))
+        self.mock.script("GET", "/missing.png", {"status": 404})
+        inline = "data:image/png;base64," + PNG_B64
+        graph = {"nodes": [
+            {"id": "generated", "type": "image", "name": "Generated", "fields": {
+                "model": "fixture", "prompt": "make a thumbnail",
+            }},
+            {"id": "reference", "type": "upload", "name": "Reference", "fields": {"image": inline}},
+        ]}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            graph_path = root / "graph.json"
+            graph_path.write_text(json.dumps(graph), encoding="utf-8")
+            code, out, err = run_cli(["run", str(graph_path), "--json", "--out", str(root / "out"),
+                                      "--base-url", self.mock.base_url, "--api-key", "fixture"])
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertEqual(payload["costUsd"], 0.2)
+            self.assertTrue(payload["costExact"])
+            self.assertEqual(payload["remainingBalance"], 3)
+            self.assertEqual(payload["nodes"]["generated"]["status"], "done")
+            self.assertEqual(payload["outputs"]["Generated"], {"file": None, "mime": None, "url": asset})
+            saved = payload["outputs"]["Reference"]
+            self.assertIsNone(saved["url"])
+            self.assertEqual(Path(saved["file"]).read_bytes(), base64.b64decode(PNG_B64))
+            issue, = payload["errors"]
+            self.assertEqual((issue["node_id"], issue["name"]), ("generated", "Generated"))
+            self.assertIn("could not download media (404)", issue["message"])
+            self.assertIn(issue["message"], err)
+        self.assertEqual(len(self.mock.requests_to("/v1/images/generations")), 1)
+        self.assertEqual(len(self.mock.requests_to("/missing.png")), 1)
+
+    def test_bad_output_directory_still_returns_completed_result(self):
+        inline = "data:image/png;base64," + PNG_B64
+        graph = {"nodes": [{"id": "image", "type": "upload", "fields": {"image": inline}}]}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            graph_path = root / "graph.json"
+            graph_path.write_text(json.dumps(graph), encoding="utf-8")
+            occupied = root / "not-a-directory"
+            occupied.write_text("original", encoding="utf-8")
+            code, out, err = run_cli(["run", str(graph_path), "--out", str(occupied), "--json"])
+            self.assertEqual(occupied.read_text(encoding="utf-8"), "original")
+        self.assertEqual(code, 1)
+        self.assertIn("could not create output directory", err)
+        payload = json.loads(out)
+        self.assertEqual(payload["nodes"]["image"]["status"], "done")
+        self.assertEqual(payload["costUsd"], 0.0)
+        self.assertEqual(payload["outputs"]["Image input"], {"file": None, "mime": "image/png", "url": inline})
+        self.assertIn("could not create output directory", payload["errors"][0]["message"])
+        self.assertEqual(self.mock.requests, [])
+
+
 class PreRunFailureJsonTest(MockedTest):
     """--json must answer the failures that happen BEFORE the first node runs.
 
@@ -502,6 +558,29 @@ class PreRunFailureJsonTest(MockedTest):
                                           "--input", "Bogus=x"))
         self.assertEqual(code, 1)
         self.assertIn("Bogus", json.loads(out)["errors"][0]["message"])
+
+    def test_malformed_graph_files_return_json_without_a_traceback(self):
+        cases = [(b'{"nodes": [}', "invalid workflow JSON"),
+                 (b'{"nodes": ["\xff"]}', "workflow file must be UTF-8")]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "graph.json"
+            argv = ["run", str(path), "--api-key", "fixture", "--base-url", self.mock.base_url]
+            for body, expected in cases:
+                with self.subTest(expected=expected):
+                    path.write_bytes(body)
+                    code, out, err = run_cli(argv + ["--json"])
+                    self.assertEqual(code, 1)
+                    report = json.loads(out)
+                    self.assertEqual(report["nodes"], {})
+                    self.assertEqual(report["costUsd"], 0.0)
+                    self.assertIn(expected, report["errors"][0]["message"])
+                    self.assertIn(expected, err)
+                    self.assertNotIn("Traceback", err)
+                    code, out, err = run_cli(argv)
+                    self.assertEqual((code, out), (1, ""))
+                    self.assertIn(expected, err)
+                    self.assertNotIn("Traceback", err)
+        self.assertEqual(self.mock.requests, [])
 
     def test_a_graph_that_cannot_be_read_still_answers_json(self):
         code, out, err = run_cli(["run", os.path.join(tempfile.gettempdir(), "no-such-graph.json"),

@@ -122,20 +122,35 @@ def cmd_inspect(args):
     return 0
 
 
-def _save_outputs(result, keys, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
+def _output_save_error(output, error):
+    return {"node_id": output.node_id, "name": output.key,
+            "message": "could not save output %r — %s" % (output.key, error)}
+
+
+def _save_outputs(result, outputs, out_dir):
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except (OSError, ValueError) as error:
+        return {}, [{"node_id": None, "name": None,
+                     "message": "could not create output directory %r — %s" % (out_dir, error)}]
+    errors = []
     media = []
-    for key in keys:
-        value = result.outputs.get(key)
+    for output in outputs:
+        value = result.outputs.get(output.key)
         if isinstance(value, MediaRef):
-            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", key).strip("_") or "output"
-            media.append((key, value, safe, value.suggested_extension()))
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", output.key).strip("_") or "output"
+            try:
+                ext = value.suggested_extension()
+            except (NanoodleError, OSError, ValueError) as error:
+                errors.append(_output_save_error(output, error))
+                continue
+            media.append((output, value, safe, ext))
 
     # Reserve preferred filenames first, including for outputs saved later.
     reserved = {f"{stem}.{ext}".lower() for _, _, stem, ext in media}
     used = set()
     saved = {}
-    for key, value, stem, ext in media:
+    for output, value, stem, ext in media:
         filename = f"{stem}.{ext}"
         if filename.lower() in used:
             suffix = 2
@@ -146,9 +161,13 @@ def _save_outputs(result, keys, out_dir):
             reserved.add(filename.lower())
         used.add(filename.lower())
         path = os.path.join(out_dir, filename)
-        value.save(path)
-        saved[key] = path
-    return saved
+        try:
+            value.save(path)
+        except (NanoodleError, OSError, ValueError) as error:
+            errors.append(_output_save_error(output, error))
+            continue
+        saved[output.key] = path
+    return saved, errors
 
 
 def _pay_printer(inv):
@@ -261,12 +280,12 @@ def cmd_run(args):
         return _print_prerun_failure_json(wf, e)
 
     friendly = [o.key for o in wf.outputs]
-    saved = _save_outputs(result, friendly, args.out) if args.out else {}
+    saved, save_errors = _save_outputs(result, wf.outputs, args.out) if args.out else ({}, [])
     if args.json:
         payload = {"outputs": {}, "costUsd": result.cost_usd, "costExact": result.cost_exact,
                    "remainingBalance": result.remaining_balance,
                    "nodes": {nid: _node_json(r) for nid, r in result.nodes.items()},
-                   "errors": result.errors,
+                   "errors": result.errors + save_errors,
                    # closed ⚖️ Decide gates — a deliberate stop, not a failure (exit 0)
                    "gated": result.gated,
                    "promptTrims": result.prompt_trims,
@@ -278,14 +297,12 @@ def cmd_run(args):
         for key in friendly:
             value = result.outputs.get(key)
             if isinstance(value, MediaRef):
-                payload["outputs"][key] = {"url": value.url if not args.out else None,
-                                           "mime": value.mime, "file": saved.get(key)}
+                path = saved.get(key)
+                payload["outputs"][key] = {"url": None if path else value.url,
+                                           "mime": value.mime, "file": path}
             else:
                 payload["outputs"][key] = value
         print(json.dumps(payload, indent=2))
-        if failure is not None:
-            print("run failed: %s" % failure, file=sys.stderr)
-            return 1
     else:
         for key in friendly:
             value = result.outputs.get(key)
@@ -304,7 +321,11 @@ def cmd_run(args):
         if result.remaining_balance is not None:
             cost_line += " · balance: $%s" % result.remaining_balance
         print(cost_line, file=sys.stderr)
-    return 0
+    if failure is not None:
+        print("run failed: %s" % failure, file=sys.stderr)
+    for error in save_errors:
+        print("error: %s" % error["message"], file=sys.stderr)
+    return 1 if failure is not None or save_errors else 0
 
 
 def main(argv=None):

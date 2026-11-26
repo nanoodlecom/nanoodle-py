@@ -123,6 +123,13 @@ class LoaderSemanticsTest(unittest.TestCase):
                                 api_key="k")
         self.assertEqual(wf.graph.node("n1").fields["text"], "x")
 
+    def test_invalid_json_string_reports_line_and_column(self):
+        data = '{\n  "nodes": [}'
+        for load in (Workflow.from_dict, materialize):
+            with self.subTest(load=load.__name__), self.assertRaisesRegex(
+                    NanoodleError, r"invalid workflow JSON .*line 2 column 13"):
+                load(data)
+
     def test_display_name_resolution(self):
         wf = Workflow.from_dict({"nodes": [
             {"id": "n1", "type": "llm", "fields": {}, "name": "  Poet  "},

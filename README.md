@@ -250,6 +250,9 @@ is `0.0`, and the reason is in `errors[0].message`:
  "promptTrims": [], "payments": []}
 ```
 
+When an output cannot be saved, the CLI continues saving the other media.
+`--json` reports the save error and the unsaved output’s URL alongside the run result.
+
 ## Supported nodes
 
 | runs | node types |

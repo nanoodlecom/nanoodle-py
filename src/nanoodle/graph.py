@@ -361,6 +361,13 @@ def _scrub_media_placeholders(nid, fields, warnings, ntype=None):
             "key from inspect/wf.inputs), or inline a data: URL." % (nid, key, shown, key))
 
 
+def parse_graph_json(data):
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError as error:
+        raise NanoodleError("invalid workflow JSON — %s" % error) from error
+
+
 def materialize(data, warnings=None):
     """Build a Graph from parsed noodle-graph.json (or a minimal {nodes, links}).
 
@@ -372,7 +379,7 @@ def materialize(data, warnings=None):
     warning so they can be inspected, and run() fails fast on them.
     """
     if isinstance(data, str):
-        data = json.loads(data)
+        data = parse_graph_json(data)
     if not isinstance(data, dict):
         raise NanoodleError("workflow JSON must be an object with a 'nodes' list")
     raw_nodes = data.get("nodes", [])
