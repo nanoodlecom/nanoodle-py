@@ -154,6 +154,7 @@ A run-level timeout sets an absolute deadline on the engine. The deadline outran
 - The sleep between poll attempts is interruptible. It waits on a cancel event and never sleeps past the deadline.
 - Per-request socket timeouts are capped at the time left, so one read cannot outlive the deadline by up to `http_timeout` (120 s).
 - The x402 settle poll stops at the deadline too, and starts no NEW deposit once the run is cancelled.
+- A late successful response or closed gate reports a timeout even if the scheduler sees its completed future. Charges observed before the report closes still count toward the run total.
 This matters because a live worker can block interpreter exit, not just `run()`. `ThreadPoolExecutor` workers are non-daemon, and both the `concurrent.futures` atexit hook and `threading._shutdown()` join every non-daemon thread, so a thread still polling an abandoned run holds the whole process. The run pool is therefore `workflow._DaemonPool`, whose workers are daemon threads: deadline-aware loops shorten that window, and daemon workers close it. With no `timeout=`, no deadline exists and every loop behaves exactly as it did before.
 
 A daemon thread is frozen at interpreter finalization, which is right for a poll loop and wrong in the middle of a wallet callback. Those spans mark themselves money-critical (`engine._money_critical`) and an atexit hook waits up to `EXIT_MONEY_GRACE` (5 s) for them, then exits anyway.
