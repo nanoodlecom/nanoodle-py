@@ -559,6 +559,29 @@ class PreRunFailureJsonTest(MockedTest):
         self.assertEqual(code, 1)
         self.assertIn("Bogus", json.loads(out)["errors"][0]["message"])
 
+    def test_malformed_graph_files_return_json_without_a_traceback(self):
+        cases = [(b'{"nodes": [}', "invalid workflow JSON"),
+                 (b'{"nodes": ["\xff"]}', "workflow file must be UTF-8")]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "graph.json"
+            argv = ["run", str(path), "--api-key", "fixture", "--base-url", self.mock.base_url]
+            for body, expected in cases:
+                with self.subTest(expected=expected):
+                    path.write_bytes(body)
+                    code, out, err = run_cli(argv + ["--json"])
+                    self.assertEqual(code, 1)
+                    report = json.loads(out)
+                    self.assertEqual(report["nodes"], {})
+                    self.assertEqual(report["costUsd"], 0.0)
+                    self.assertIn(expected, report["errors"][0]["message"])
+                    self.assertIn(expected, err)
+                    self.assertNotIn("Traceback", err)
+                    code, out, err = run_cli(argv)
+                    self.assertEqual((code, out), (1, ""))
+                    self.assertIn(expected, err)
+                    self.assertNotIn("Traceback", err)
+        self.assertEqual(self.mock.requests, [])
+
     def test_a_graph_that_cannot_be_read_still_answers_json(self):
         code, out, err = run_cli(["run", os.path.join(tempfile.gettempdir(), "no-such-graph.json"),
                                   "--json", "--api-key", "k"])

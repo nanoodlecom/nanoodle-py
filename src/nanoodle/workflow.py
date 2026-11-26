@@ -16,7 +16,8 @@ from .decide import DecideGateClosed
 from .endpoint import endpoint_out_port
 from .errors import GatedOutputError, NanoodleError, RunError, UnsupportedNodeError
 from .graph import (NODE_TYPES, Node, classify_inbound, competing_input_issues,
-                    display_name, locked_node, materialize, topo_order, unconditional_competing_input_issues,
+                    display_name, locked_node, materialize, parse_graph_json,
+                    topo_order, unconditional_competing_input_issues,
                     wire_issue, wired_frames_floor)
 from .iodef import (derive_inputs, derive_outputs, derive_settings,
                     resolve_input_key, resolve_setting_key)
@@ -271,13 +272,17 @@ class Workflow(object):
                     "for a pristine version"))
             return wf
         with open(src, "r", encoding="utf-8") as f:
-            return cls(json.load(f), **opts)
+            try:
+                data = f.read()
+            except UnicodeDecodeError as error:
+                raise NanoodleError("workflow file must be UTF-8 — invalid bytes at offset %d" % error.start) from error
+        return cls(parse_graph_json(data), **opts)
 
     @classmethod
     def from_dict(cls, data, **opts):
         """Accepts a parsed dict or a JSON string."""
         if isinstance(data, str):
-            data = json.loads(data)
+            data = parse_graph_json(data)
         return cls(data, **opts)
 
     # ---- public interface ---------------------------------------------------
